@@ -81,13 +81,24 @@ Für eine neue Form (z. B. Sechseck) `shapeOf` erweitern und passende Kennzahlen
 - **Fehltreffer** durch rote/blaue/gelbe Gegenstände mit passender Form (Autos, Warnwesten, Plakate, blauer Himmel bei hoher Farbstärke). Dagegen helfen Regler und Masken-Ansicht.
 - **Verpasste Schilder** bei Gegenlicht, Dämmerung, starker Schräglage, Verdeckung, schmutzigen oder stark verblichenen Schildern.
 - **Nur frontale Sicht** ist ausgelegt. Schräg gesehene Kreise werden Ellipsen, Rechtecke Trapeze.
+  Gemessen an synthetischen Bildern: schon 15–30° Roll führen zu **falschen Typen**
+  (Gefahrzeichen → „Vorfahrt gewähren", Raute → „Ortstafel", Stopp → „Einfahrt verboten").
+  Der optionale KI-Modus (docs/TRAINING.md) behebt genau diese Fehlerklasse, weil er
+  Schräglage und Unschärfe aus den Trainingsdaten lernt.
 - **Nur deutsche Schilder.** Andere Länder nutzen teils andere Farben/Formen.
 - **Kein Ersatz für Aufmerksamkeit.** Nicht als Fahrassistenz im Straßenverkehr verwenden. Nicht während der Fahrt bedienen.
 - Der **Kamerazugriff** verlangt HTTPS oder `localhost`. Bilder werden nicht hochgeladen, alles läuft lokal im Browser.
 
 ## 8. Ausbaustufen
 
-1. **Zahlen lesen** (Tempolimit): Innenfläche eines Verbotskreises ausschneiden und mit Tesseract.js oder einem kleinen Ziffern-Modell erkennen.
-2. **Echtes ML-Modell:** Ein auf dem GTSRB-Datensatz trainiertes Netz (TensorFlow.js oder ONNX Runtime Web) klassifiziert die ausgeschnittenen Flächen. Die Farbsuche bleibt als schneller Vorfilter.
-3. **Perspektive:** Kanten/Ecken über Konturnäherung bestimmen statt Breitenprofil.
-4. **Verlauf:** erkannte Schilder mit Zeitstempel speichern.
+1. **Zahlen lesen** (Tempolimit): Innenfläche eines Verbotskreises ausschneiden und mit Tesseract.js oder einem kleinen Ziffern-Modell erkennen – **offen**.
+2. **Echtes ML-Modell:** *umgesetzt* als hybrides Netz (`tools/`, optionaler Modus in `src/model.js`).
+   Es findet **Position und Art in einem Durchlauf** (anchor-free, 9 Typen, drei Stufen) statt nur
+   ausgeschnittene Flächen zu klassifizieren – der Vorfilter ist damit nicht mehr
+   Voraussetzung. Einzelne tiefe Stufen sind Transformer-Blöcke; Kosten, Training und
+   Messwerte stehen in [`TRAINING.md`](TRAINING.md). Die Heuristik bleibt als Rückfall erhalten.
+3. **Perspektive:** Kanten/Ecken über Konturnäherung bestimmen statt Breitenprofil – **entfällt im
+   Modellmodus** (das Netz sieht Schräglage und Roll aus den Trainingsdaten), bleibt aber offen
+   für den Heuristik-Pfad.
+4. **Verlauf:** erkannte Schilder mit Zeitstempel speichern – **offen**.
+

@@ -7,17 +7,22 @@
   const D = SignDetector;
   const $ = id => document.getElementById(id);
   const view = $('view'), ctx = view.getContext('2d');           // sichtbares Bild + Rahmen
-  const work = document.createElement('canvas');                  // kleines Bild für die Analyse
+  const work = document.createElement('canvas');                  // kleines Bild für die Heuristik
   const wctx = work.getContext('2d', { willReadFrequently: true });
   const maskCv = document.createElement('canvas');                // Farbmasken-Ansicht (Debug)
+  const modelCv = document.createElement('canvas');               // Eingang des KI-Modells (Letterbox)
+  const mctx = modelCv.getContext('2d', { willReadFrequently: true });
   const video = $('video'), list = $('list'), statusEl = $('status');
 
   const VIEW_W = 640;       // Breite der Anzeige
-  const WORK_W = 240;       // Breite der Analyse: klein = schnell, groß = erkennt weiter entfernte Schilder
+  const WORK_W = 240;       // Breite der Heuristik: klein = schnell, groß = erkennt weiter entfernte Schilder
   const INTERVAL_MS = 100;  // höchstens 10 Analysen pro Sekunde
 
   let stream = null, running = false, still = null, lastRun = 0, lastKey = '', dims = '';
   let tracker = D.createTracker(), current = [], mask = null;
+  let model = null;                       // gesetzt, wenn ein ONNX-Modell geladen wurde
+  let busy = false;                       // verhindert überlappende Modellläufe
+  let srcW = 0, srcH = 0, boxScale = 1;   // Maßstab von Erkennung zu Anzeige
 
   /** Canvas-Größen an die Bildquelle anpassen (Seitenverhältnis beibehalten). */
   function setSize(sw, sh) {
@@ -27,16 +32,41 @@
     work.width = maskCv.width = WORK_W; work.height = maskCv.height = Math.round(WORK_W * sh / sw);
   }
 
-  /** Erkennung auf einer Bildquelle ausführen (Video oder Foto). */
+  /** Erkennung auf einer Bildquelle ausführen (Video oder Foto): KI-Modell oder Heuristik. */
   function analyse(source, useTracker) {
+    if (model) return analyseModel(source, useTracker);
     const t0 = performance.now();
     wctx.drawImage(source, 0, 0, work.width, work.height);
     const img = wctx.getImageData(0, 0, work.width, work.height);
     const res = D.detect(img.data, work.width, work.height, { minSaturation: +$('sat').value });
     current = useTracker ? tracker.update(res.detections) : res.detections;
     mask = res.mask;
-    statusEl.textContent = (running ? 'Kamera läuft' : 'Foto analysiert') + ' · ' + Math.round(performance.now() - t0) + ' ms pro Analyse';
+    srcW = work.width; srcH = work.height; boxScale = view.width / work.width;
+    statusEl.textContent = (running ? 'Kamera läuft' : 'Foto analysiert') + ' · Heuristik · '
+      + Math.round(performance.now() - t0) + ' ms pro Analyse';
     renderList();
+  }
+
+  /** KI-Modus: ein Netz liefert Position UND Art in einem Durchlauf (src/model.js).
+   *  Läuft asynchron – deshalb sperrt `busy` in frame() überlappende Läufe. */
+  async function analyseModel(source, useTracker) {
+    const sw = source.videoWidth || source.naturalWidth;
+    const sh = source.videoHeight || source.naturalHeight;
+    if (!sw || !sh) return;
+    const t0 = performance.now();
+    SignModel.drawLetterbox(mctx, source, sw, sh, model.size);        // Grau 114 wie im Training
+    const img = mctx.getImageData(0, 0, model.size, model.size);
+    const tPrep = performance.now() - t0;
+    const dets = await model.detect(img);
+    const lb = SignModel.math.letterboxParams(sw, sh, model.size);
+    const mapped = SignModel.math.toImageCoords(dets, lb, model.labels.classes);
+    current = useTracker ? tracker.update(mapped) : mapped;
+    mask = null;                                                     // Farbmasken gibt es nur in der Heuristik
+    srcW = sw; srcH = sh; boxScale = view.width / sw;
+    statusEl.textContent = (running ? 'Kamera läuft' : 'Foto analysiert') + ' · KI-Modell (' + model.backend
+      + ') · ' + Math.round(performance.now() - t0) + ' ms (Vorbereitung ' + Math.round(tPrep) + ' ms)';
+    renderList();
+    draw();
   }
 
   /** Liste unter dem Bild – nur neu aufbauen, wenn sich die Schildtypen ändern. */
@@ -62,9 +92,9 @@
     ctx.globalAlpha = 1; ctx.imageSmoothingEnabled = true;
   }
 
-  /** Rahmen + Beschriftung; Koordinaten vom Analysebild auf die Anzeige hochrechnen. */
+  /** Rahmen + Beschriftung; Koordinaten der Erkennung auf die Anzeige hochrechnen. */
   function drawBoxes() {
-    const k = view.width / work.width;
+    const k = boxScale;
     ctx.lineWidth = 3; ctx.textBaseline = 'top';
     ctx.font = '600 15px Bahnschrift, "DIN Alternate", system-ui, sans-serif';
     for (const t of current) {
@@ -85,7 +115,11 @@
     if (video.videoWidth) {
       setSize(video.videoWidth, video.videoHeight);
       ctx.drawImage(video, 0, 0, view.width, view.height);
-      if (now - lastRun >= INTERVAL_MS) { lastRun = now; analyse(video, true); }
+      if (!busy && now - lastRun >= INTERVAL_MS) {
+        lastRun = now;
+        busy = true;
+        Promise.resolve(analyse(video, true)).catch(() => {}).finally(() => { busy = false; });
+      }
       draw();
     }
     requestAnimationFrame(frame);
@@ -135,4 +169,19 @@
     if (still) showStill();
   }));
   renderList();
+
+  // Optionales KI-Modell: liegen models/labels.json + eine ONNX-Datei bereit und ist
+  // onnxruntime-web geladen, rechnet das Netz; sonst bleibt die Heuristik aktiv.
+  (async () => {
+    if (typeof SignModel === 'undefined') return;
+    const res = await SignModel.load();
+    if (!res.ok) {
+      statusEl.textContent = 'Heuristik-Modus (' + res.reason + ')';
+      return;
+    }
+    modelCv.width = modelCv.height = res.size;
+    model = res;
+    statusEl.textContent = 'KI-Modell bereit (' + res.backend + ', ' + res.size
+      + ' px). Kamera starten oder ein Foto wählen.';
+  })();
 })();
