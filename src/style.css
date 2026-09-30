@@ -1,0 +1,23 @@
+/* Farben: Asphalt als Grund, Schildfarben nur dort, wo sie etwas bedeuten */
+:root { --asphalt:#1e2329; --panel:#2a3138; --marking:#f1f0ea; --muted:#9aa4ad; --blue:#1467b8; }
+* { box-sizing: border-box; }
+body { margin:0; background:var(--asphalt); color:var(--marking);
+  font-family: Bahnschrift, "DIN Alternate", "Segoe UI", system-ui, sans-serif; /* DIN: Schriftfamilie der Verkehrszeichen */
+  padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom); }
+main { max-width: 680px; margin: 0 auto; padding: 16px; }
+h1 { font-size: 1.4rem; margin: 0 0 4px; }
+#status { color: var(--muted); margin: 0 0 12px; min-height: 1.4em; }
+.stage { position: relative; background: #000; border-radius: 6px; overflow: hidden; }
+.stage canvas { display: block; width: 100%; height: auto; }
+.stage video { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-top: 12px; }
+button, .btn { font: inherit; font-weight: 600; background: var(--blue); color: #fff; border: 0;
+  border-radius: 6px; padding: 12px 18px; cursor: pointer; }
+.btn input { display: none; }
+button:focus-visible, .btn:focus-within, input:focus-visible { outline: 3px solid var(--marking); outline-offset: 2px; }
+.tune { color: var(--muted); font-size: .95rem; }
+ul { list-style: none; padding: 0; margin: 16px 0 0; display: grid; gap: 8px; }
+li { background: var(--panel); border-left: 8px solid var(--c, var(--muted)); padding: 10px 14px; border-radius: 0 6px 6px 0; }
+li span { color: var(--muted); margin-left: 8px; }
+li p { margin: 4px 0 0; color: var(--muted); font-size: .9rem; }
+li.leer { border-left-color: var(--muted); color: var(--muted); }
