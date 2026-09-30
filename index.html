@@ -10,7 +10,7 @@
 <body>
 <main>
   <h1>Schilder-Scanner</h1>
-  <p id="status">Kamera starten oder ein Foto wählen.</p>
+  <p id="status" role="status" aria-live="polite">Kamera starten oder ein Foto wählen.</p>
   <div class="stage">
     <canvas id="view" width="640" height="480"></canvas>
     <!-- Das Video wird nie angezeigt, nur als Bildquelle für das Canvas genutzt -->
@@ -19,9 +19,16 @@
   <div class="row">
     <button id="camBtn" type="button">Kamera starten</button>
     <label class="btn">Foto wählen<input id="file" type="file" accept="image/*"></label>
+    <button id="saveBtn" type="button" class="ghost" disabled>Bild speichern</button>
+    <button id="resetBtn" type="button" class="ghost">Zurücksetzen</button>
   </div>
   <div class="row tune">
     <label>Farbstrenge <input id="sat" type="range" min="0.35" max="0.8" step="0.05" value="0.5"> <output id="satOut">0.50</output></label>
+    <label>Reichweite <select id="res">
+      <option value="160">nah · schnell</option>
+      <option value="240" selected>mittel</option>
+      <option value="360">fern · langsam</option>
+    </select></label>
     <label><input id="maskCb" type="checkbox"> Farbmasken zeigen</label>
   </div>
   <ul id="list"></ul>
@@ -30,4 +37,3 @@
 <script src="src/app.js"></script>
 </body>
 </html>
-

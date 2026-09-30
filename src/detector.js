@@ -7,7 +7,8 @@
  *   2. findComponents  zusammenhängende Farbflächen finden (Flood-Fill) und grob filtern
  *   3. analyzeShape    Silhouette der Fläche vermessen (Füllgrad, Breitenprofil)
  *   4. shapeOf/labelOf Form + Farbe → Schildtyp
- *   5. createTracker   Treffer über mehrere Bilder stabilisieren (gegen Flackern)
+ *   5. mergeOverlaps   doppelte Treffer desselben Typs zusammenfassen
+ *   6. createTracker   Treffer über mehrere Bilder stabilisieren (gegen Flackern)
  */
 (function (root) {
   'use strict';
@@ -16,13 +17,31 @@
 
   /** Schwellwerte. Alle Größen in Pixeln des verkleinerten Analysebilds. */
   const CONFIG = {
-    minSaturation: 0.5,  // Farbsättigung ab der ein Pixel zählt (0..1). Höher = strenger.
-    minValue: 0.22,      // Helligkeit, darunter wird ein Pixel ignoriert
-    minBox: 10,          // kleinste Kantenlänge einer Fläche
-    minArea: 40,         // kleinste Pixelanzahl einer Fläche
-    maxFrameShare: 0.9,  // Flächen, die fast das ganze Bild füllen, sind kein Schild
-    minAspect: 0.5,      // Breite/Höhe, erlaubter Bereich
-    maxAspect: 2.2
+    minSaturation: 0.5,   // Farbsättigung ab der ein Pixel zählt (0..1). Höher = strenger.
+    minValue: 0.22,       // Helligkeit, darunter wird ein Pixel ignoriert
+    minValueYellow: 0.45, // Gelb braucht mehr Helligkeit, sonst wirken braune Flächen gelb
+    redHueMax: 14,        // Rot liegt am Rand des Farbkreises → zwei Grenzen
+    redHueMin: 345,
+    yellowHueMin: 38,
+    yellowHueMax: 66,
+    blueHueMin: 200,
+    blueHueMax: 255,
+    minBox: 10,           // kleinste Kantenlänge einer Fläche
+    minArea: 40,          // kleinste Pixelanzahl einer Fläche
+    maxFrameShare: 0.9,   // Flächen, die fast das ganze Bild füllen, sind kein Schild
+    minAspect: 0.5,       // Breite/Höhe, erlaubter Bereich für jede Fläche
+    maxAspect: 2.2,
+    maxSolidityTriangle: 0.65, // darunter: Dreieck oder Raute
+    minSolidityRect: 0.92,     // darüber: Rechteck
+    minWidthNarrow: 0.35,      // oben *und* unten so schmal → Raute
+    minWidthFlat: 0.6,         // oben *und* unten so breit → Achteck
+    minSolidityOctagon: 0.8,
+    minFillFull: 0.65,         // ab hier gilt ein roter Kreis als Vollfläche (Einfahrt verboten)
+    minCircleAspect: 0.72,     // schräg gesehene Kreise werden Ellipsen → etwas Toleranz
+    maxCircleAspect: 1.38,
+    mergeIou: 0.35,            // so stark überlappende Treffer sind ein Schild
+    mergeContain: 0.8,         // so stark verschachtelte Treffer sind ein Schild
+    maxResults: 6              // höchstens so viele Schilder pro Bild melden
   };
 
   /** Katalog der erkennbaren Schilder (Zeichen-Nummern nach StVO). */
@@ -49,9 +68,9 @@
     if (max === r) h = 60 * (((g - b) / d + 6) % 6);
     else if (max === g) h = 60 * ((b - r) / d + 2);
     else h = 60 * ((r - g) / d + 4);
-    if (h <= 14 || h >= 345) return RED;          // Rot liegt am Rand des Farbkreises
-    if (h >= 38 && h <= 66 && v > 0.45) return YELLOW;
-    if (h >= 200 && h <= 255) return BLUE;
+    if (h <= cfg.redHueMax || h >= cfg.redHueMin) return RED;
+    if (h >= cfg.yellowHueMin && h <= cfg.yellowHueMax && v > cfg.minValueYellow) return YELLOW;
+    if (h >= cfg.blueHueMin && h <= cfg.blueHueMax) return BLUE;
     return NONE;
   }
 
@@ -100,6 +119,7 @@
    *   solidity = Silhouettenfläche / Rahmenfläche   (Kreis .785, Dreieck/Raute .5, Achteck .83, Rechteck 1)
    *   fill     = echte Farbpixel / Silhouettenfläche (Ring niedrig, Vollfläche hoch)
    *   wTop/wBot = mittlere Breite im oberen/unteren Viertel relativ zur Rahmenbreite
+   * Gibt null zurück, wenn keine Silhouette messbar war (dann ist die Fläche unbrauchbar).
    */
   function analyzeShape(c, queue, w) {
     const rowMin = new Int16Array(c.h).fill(32767), rowMax = new Int16Array(c.h).fill(-1);
@@ -116,29 +136,33 @@
       if (y < nq) top += width;
       if (y >= c.h - nq) bot += width;
     }
+    if (!sil) return null;                                     // keine Fläche messbar
     return { solidity: sil / (c.w * c.h), fill: c.area / sil, wTop: top / nq / c.w, wBot: bot / nq / c.w };
   }
 
   /** Schritt 4a: Form bestimmen. */
-  function shapeOf(s, aspect) {
-    if (s.solidity < 0.65) {                                   // Dreieck oder Raute (beide ≈ 0.5)
-      if (s.wTop < 0.3 && s.wBot < 0.3) return 'diamond';      // schmal oben UND unten → Raute
+  function shapeOf(s, aspect, cfg) {
+    if (s.solidity < cfg.maxSolidityTriangle) {                        // Dreieck oder Raute (beide ≈ 0.5)
+      if (s.wTop < cfg.minWidthNarrow && s.wBot < cfg.minWidthNarrow) return 'diamond';  // schmal oben und unten
+      if (Math.abs(s.wTop - s.wBot) < 0.15) return null;               // überall gleich breit → keine Spitze
       return s.wTop < s.wBot ? 'triangleUp' : 'triangleDown';
     }
-    if (s.solidity > 0.92) return 'rect';
-    if (aspect > 0.8 && aspect < 1.25) {                       // rund oder achteckig
-      return (s.wTop > 0.64 && s.solidity > 0.8 && s.fill > 0.6) ? 'octagon' : 'circle';
+    if (s.solidity > cfg.minSolidityRect) return 'rect';
+    if (aspect >= cfg.minCircleAspect && aspect <= cfg.maxCircleAspect) {   // rund oder achteckig
+      const octagon = s.wTop > cfg.minWidthFlat && s.wBot > cfg.minWidthFlat   // Achteck hat oben und unten
+        && s.solidity > cfg.minSolidityOctagon && s.fill > cfg.minFillFull;    // eine breite, flache Kante
+      return octagon ? 'octagon' : 'circle';
     }
     return null;
   }
 
   /** Schritt 4b: Farbe + Form → Schildtyp (oder null). */
-  function labelOf(color, shape, fill) {
+  function labelOf(color, shape, fill, cfg) {
     if (color === RED) {
       if (shape === 'octagon') return 'stop';
       if (shape === 'triangleDown') return 'vorfahrtGewaehren';
       if (shape === 'triangleUp') return 'warnung';
-      if (shape === 'circle') return fill > 0.65 ? 'einfahrtVerboten' : 'verbot';
+      if (shape === 'circle') return fill > cfg.minFillFull ? 'einfahrtVerboten' : 'verbot';
     } else if (color === BLUE) {
       if (shape === 'circle') return 'gebot';
       if (shape === 'rect') return 'hinweis';
@@ -158,17 +182,58 @@
     const cfg = Object.assign({}, CONFIG, options);
     const mask = buildMask(data, w, h, cfg);
     const { comps, queue } = findComponents(mask, w, h, cfg);
-    const detections = [];
+    let detections = [];
     for (const c of comps) {
       const s = analyzeShape(c, queue, w);
-      const shape = shapeOf(s, c.w / c.h);
-      const label = shape && labelOf(c.color, shape, s.fill);
+      if (!s) continue;
+      const shape = shapeOf(s, c.w / c.h, cfg);
+      const label = shape && labelOf(c.color, shape, s.fill, cfg);
       if (label) detections.push({ label, shape, x: c.x, y: c.y, w: c.w, h: c.h, conf: confidence(shape, s.solidity) });
     }
-    return { detections, mask };
+    detections = mergeOverlaps(detections, cfg);
+    detections.sort((a, b) => b.w * b.h - a.w * a.h || b.conf - a.conf);   // größte Schilder zuerst
+    return { detections: detections.slice(0, cfg.maxResults), mask, count: detections.length };
   }
 
-  /** Schritt 5: Treffer über Bilder hinweg verfolgen. Ein Schild gilt erst nach 3 Treffern als sicher. */
+  /**
+   * Schritt 5: Doppelte Treffer zusammenfassen. Ein Schild liefert manchmal zwei Flächen
+   * (z. B. weil ein Mast, ein Schatten oder eine Strebe die Farbfläche trennt, oder weil
+   * eine Fläche in einer anderen liegt). Ohne diesen Schritt stünde dasselbe Schild
+   * zweimal im Ergebnis. Verschmolzen wird nur, was denselben Typ hat.
+   */
+  function overlapRatio(a, b) {
+    const ix = Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x));
+    const iy = Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
+    const inter = ix * iy;
+    if (inter <= 0) return { iou: 0, contain: 0 };
+    const aa = a.w * a.h, ba = b.w * b.h;
+    return { iou: inter / (aa + ba - inter), contain: inter / Math.min(aa, ba) };
+  }
+
+  function mergeOverlaps(dets, cfg) {
+    const out = [], rest = dets.slice();
+    while (rest.length) {
+      const a = rest.shift();
+      for (let changed = true; changed;) {
+        changed = false;
+        for (let i = 0; i < rest.length; i++) {
+          const b = rest[i];
+          if (b.label !== a.label) continue;
+          const o = overlapRatio(a, b);
+          if (o.iou < cfg.mergeIou && o.contain < cfg.mergeContain) continue;
+          const x2 = Math.max(a.x + a.w, b.x + b.w), y2 = Math.max(a.y + a.h, b.y + b.h);
+          a.x = Math.min(a.x, b.x); a.y = Math.min(a.y, b.y);
+          a.w = x2 - a.x; a.h = y2 - a.y;
+          a.conf = Math.max(a.conf, b.conf);
+          rest.splice(i, 1); i--; changed = true;
+        }
+      }
+      out.push(a);
+    }
+    return out;
+  }
+
+  /** Schritt 6: Treffer über Bilder hinweg verfolgen. Ein Schild gilt erst nach `minHits` Treffern als sicher. */
   function iou(a, b) {
     const ix = Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x));
     const iy = Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
@@ -197,11 +262,13 @@
         tracks.forEach(t => { if (!t.matched) t.miss++; });
         tracks = tracks.filter(t => t.miss <= maxMiss);
         return tracks.filter(t => t.hits >= minHits);
-      }
+      },
+      /** Alles vergessen – z. B. nach einem Auflösungswechsel oder einem neuen Foto. */
+      reset() { tracks = []; nextId = 1; }
     };
   }
 
-  const api = { CONFIG, SIGNS, detect, createTracker, RED, BLUE, YELLOW };
+  const api = { CONFIG, SIGNS, detect, createTracker, mergeOverlaps, shapeOf, RED, BLUE, YELLOW };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.SignDetector = api;
 })(typeof window !== 'undefined' ? window : globalThis);

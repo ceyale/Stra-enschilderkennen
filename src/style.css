@@ -13,11 +13,16 @@ h1 { font-size: 1.4rem; margin: 0 0 4px; }
 .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-top: 12px; }
 button, .btn { font: inherit; font-weight: 600; background: var(--blue); color: #fff; border: 0;
   border-radius: 6px; padding: 12px 18px; cursor: pointer; }
+button.ghost { background: var(--panel); color: var(--marking); }
+button:disabled { opacity: .45; cursor: default; }
+select { font: inherit; background: var(--panel); color: var(--marking); border: 1px solid #3c454e;
+  border-radius: 6px; padding: 8px 10px; }
 .btn input { display: none; }
 button:focus-visible, .btn:focus-within, input:focus-visible { outline: 3px solid var(--marking); outline-offset: 2px; }
 .tune { color: var(--muted); font-size: .95rem; }
 ul { list-style: none; padding: 0; margin: 16px 0 0; display: grid; gap: 8px; }
 li { background: var(--panel); border-left: 8px solid var(--c, var(--muted)); padding: 10px 14px; border-radius: 0 6px 6px 0; }
 li span { color: var(--muted); margin-left: 8px; }
+li .conf { float: right; margin-left: 8px; font-variant-numeric: tabular-nums; }
 li p { margin: 4px 0 0; color: var(--muted); font-size: .9rem; }
 li.leer { border-left-color: var(--muted); color: var(--muted); }

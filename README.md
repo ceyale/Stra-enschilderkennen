@@ -19,6 +19,30 @@ Dann `http://localhost:8000` öffnen. `localhost` gilt als sicher, die Webcam fu
 
 **Ohne Kamera:** „Foto wählen“ analysiert ein einzelnes Bild.
 
+## Bedienung
+
+| Knopf / Regler | Wirkung |
+|---|---|
+| Kamera starten / stoppen | Live-Erkennung. Die Kamera läuft nur, solange der Knopf „Kamera stoppen“ heißt. |
+| Foto wählen | Ein einzelnes Bild analysieren (ohne Stabilisierung, jeder Treffer zählt sofort). Handyfotos werden anhand ihrer EXIF-Drehung aufrecht analysiert. |
+| Bild speichern | Das angezeigte Bild samt Rahmen und Sicherheit als PNG sichern. |
+| Zurücksetzen | Kamera aus, Foto weg, Trefferliste leer. |
+| Farbstrenge | Höher = strenger: weniger Fehltreffer, aber blasse Schilder fehlen. |
+| Reichweite | Analysebreite (`nah` 160 px / `mittel` 240 px / `fern` 360 px). Größer erkennt kleinere und weiter entfernte Schilder, kostet aber Rechenzeit. |
+| Farbmasken zeigen | Blendet ein, welche Pixel als rot, blau oder gelb gezählt wurden – damit sieht man, warum ein Schild (nicht) erkannt wird. |
+
+## Tests
+
+```
+node tests/detector.test.js
+```
+Ohne Node: `tests/index.html` im Browser öffnen – derselbe Test, nur mit Ergebnis im Fenster.
+Der Oberflächen-Test braucht einen lokalen Server (Dateien dürfen sonst nicht auf das Testfenster zugreifen):
+```
+python -m http.server 8000
+```
+→ `http://localhost:8000/tests/app.test.html`
+
 ## Projektstruktur
 
 | Datei | Inhalt |
@@ -27,7 +51,9 @@ Dann `http://localhost:8000` öffnen. `localhost` gilt als sicher, die Webcam fu
 | `src/detector.js` | Erkennung (ohne Browser-Abhängigkeit, auch in Node nutzbar) |
 | `src/app.js` | Kamera, Foto-Import, Anzeige |
 | `src/style.css` | Gestaltung |
-| `tests/detector.test.js` | Test mit synthetisch gezeichneten Schildern (`node tests/detector.test.js`) |
+| `tests/detector.test.js` | Tests mit synthetisch gezeichneten Schildern (`node tests/detector.test.js`) |
+| `tests/index.html` | Dieselben Tests im Browser, ohne Node |
+| `tests/app.test.html` | Oberflächen-Test: speist ein gemaltes Foto in die Seite ein (braucht den lokalen Server) |
 | `docs/DOKUMENTATION.md` | Ausführliche Doku: Algorithmus, Schwellwerte, Grenzen, Erweiterungen |
 
 Lizenz: MIT.
