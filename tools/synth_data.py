@@ -157,10 +157,16 @@ def add_occluder(img: np.ndarray, rng: random.Random) -> tuple[np.ndarray, list[
 
 
 def compose_sample(rng: random.Random, size: int = 320, n_signs: int | None = None,
-                   degrade_prob: float = 0.75, occlude_prob: float = 0.25):
-    """Ein Trainingsbild bauen: Schild(er) auf Hintergrund + Verschlechterungen."""
+                   degrade_prob: float = 0.75, occlude_prob: float = 0.25,
+                   labels: list[str] | None = None):
+    """Ein Trainingsbild bauen: Schild(er) auf Hintergrund + Verschlechterungen.
+
+    labels beschraenkt die Auswahl (z.B. auf Typen, die im echten Datensatz fehlen - siehe
+    tools/synth_missing.py); ohne Angabe wird aus allen neun Typen gezogen.
+    """
+    pool = labels or SIGN_LABELS
     n = n_signs if n_signs is not None else rng.choice([1, 1, 1, 2, 3])
-    names = rng.sample(SIGN_LABELS, n)
+    names = rng.sample(pool, min(n, len(pool)))
     img = Image.fromarray(random_background(rng, size))
     boxes, tags = [], []
     for name in names:

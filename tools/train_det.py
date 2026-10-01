@@ -74,7 +74,9 @@ class SignDataset(torch.utils.data.Dataset):
 
     def _load_real(self, i: int):
         img_path, lab_path, _ = self.items[i]
-        arr = np.asarray(Image.open(img_path).convert("RGB"), dtype=np.uint8)
+        img = Image.open(img_path).convert("RGB")
+        w0, h0 = img.size
+        arr = np.asarray(img, dtype=np.uint8)
         arr, s, px, py = dm.letterbox_array(arr, self.size)
         xyxy, labels = [], []
         if lab_path.exists():
@@ -83,11 +85,14 @@ class SignDataset(torch.utils.data.Dataset):
                 if len(parts) < 5:
                     continue
                 cls = int(float(parts[0]))
-                bw, bh = float(parts[3]), float(parts[4])
-                cx, cy = float(parts[1]) * self.size, float(parts[2]) * self.size
-                box = np.array([[cx - bw * self.size / 2, cy - bh * self.size / 2,
-                                 cx + bw * self.size / 2, cy + bh * self.size / 2]], np.float32)
-                xyxy.append(box[0])
+                cx, cy, bw, bh = (float(parts[1]), float(parts[2]),
+                                  float(parts[3]), float(parts[4]))
+                # Gespeicherte Boxen sind normalisiert auf das DATENSATZ-Bild, das Netz
+                # sieht aber das Letterbox-Ergebnis - ohne diese Umrechnung waeren die
+                # Ziele verschoben, sobald Datensatzgroesse != --size ist.
+                box = np.array([[(cx - bw / 2) * w0, (cy - bh / 2) * h0,
+                                 (cx + bw / 2) * w0, (cy + bh / 2) * h0]], np.float32)
+                xyxy.append(dm.boxes_to_letterbox(box, s, px, py)[0])
                 labels.append(cls)
         return arr, np.asarray(xyxy, np.float32).reshape(-1, 4), np.asarray(labels, np.int64)
 
@@ -174,13 +179,17 @@ class DetLoss(nn.Module):
                       "box": float(box.detach()), "n_pos": n_pos}
 
 
+METRIC_KEYS = ("precision", "recall", "f1", "tp", "fp", "fn")
+
+
 @torch.no_grad()
 def evaluate(model: nn.Module, loader, conf: float = 0.25, iou: float = 0.5) -> dict:
     """Precision/Recall bei IoU 0.5 - die Kennzahl, die im Browser zaehlt."""
     model.eval()
+    dev = next(model.parameters()).device
     tp = fp = fn = 0
     for x, _, meta in loader:
-        outs = [o.numpy() for o in model(x)]
+        outs = [o.cpu().numpy() for o in model(x.to(dev))]
         for bi in range(x.shape[0]):
             dets = dm.decode_multi([o[bi] for o in outs], dm.LEVELS, conf, iou_thres=0.45)
             boxes, labels = meta[bi]
@@ -196,6 +205,17 @@ def parse_list(value: str) -> tuple[str, ...]:
     if value.strip().lower() in ("", "-", "none", "keine"):
         return ()
     return tuple(s.strip() for s in value.split(",") if s.strip())
+
+
+def device_from_args(args) -> torch.device:
+    """Rechengeraet: 'auto' nimmt CUDA, wenn vorhanden, sonst die CPU.
+
+    Dieselbe Datei funktioniert damit auf einem Laptop ohne GPU; der Checkpoint bleibt
+    portabel, weil export_onnx.py immer mit map_location='cpu' laedt.
+    """
+    if args.device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(args.device)
 
 
 def cfg_from_args(args) -> NetCfg:
@@ -229,6 +249,8 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--steps", type=int, default=100, help="Schritte je Epoche")
     ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"],
+                    help="Rechengeraet; 'auto' = CUDA wenn vorhanden, sonst CPU")
     ap.add_argument("--workers", type=int, default=2, help="Ladeprozesse (0 = im Hauptprozess)")
     ap.add_argument("--tr-global", default="p5", help="globale Transformer-Stufen, z.B. p5 oder p4,p5 oder -")
     ap.add_argument("--tr-window", default="-", help="lokale Transformer-Stufen, z.B. p4 oder -")
@@ -256,6 +278,9 @@ def main() -> None:
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     np.random.seed(args.seed)
+    device = device_from_args(args)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
 
     cfg, start_epoch, ckpt = cfg_from_args(args), 0, None
     if args.resume and Path(args.resume).exists():
@@ -272,6 +297,12 @@ def main() -> None:
         model.load_state_dict(ckpt["model"])
         if "opt" in ckpt:
             opt.load_state_dict(ckpt["opt"])
+            # Zustand auf das aktuelle Geraet ziehen (Checkpoint von CUDA, Lauf auf CPU o. umgekehrt)
+            for st in opt.state.values():
+                for k, v in st.items():
+                    if torch.is_tensor(v):
+                        st[k] = v.to(device)
+    model.to(device)
 
     loader, train_ds = make_loader(args.data, args.size, "train", args.batch, True,
                                    args.synth_train, args.seed, args.degrade, args.workers)
@@ -282,9 +313,11 @@ def main() -> None:
         opt, T_max=total, eta_min=args.lr * 0.05, last_epoch=start_epoch * args.steps - 1)
 
     print(f"[modell] {cfg.name()}  params={n_params(model)}  daten={train_ds.manifest.get('source')} "
-          f"train={len(train_ds)} val={len(val_ds)}")
+          f"train={len(train_ds)} val={len(val_ds)} geraet={device}"
+          + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     history = list(ckpt.get("history", [])) if ckpt else []
+    last_measured = None
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
@@ -292,6 +325,8 @@ def main() -> None:
         for step, (x, tgt, meta) in enumerate(loader):
             if step >= args.steps:
                 break
+            x = x.to(device, non_blocking=True)
+            tgt = {k: [t.to(device, non_blocking=True) for t in v] for k, v in tgt.items()}
             preds = model(x)
             loss, parts = crit(preds, tgt)
             opt.zero_grad(set_to_none=True)
@@ -304,19 +339,29 @@ def main() -> None:
                 print(f"  e{epoch} {step:4d}/{args.steps} loss={float(loss.detach()):7.3f} "
                       f"obj={parts['obj']:.3f} cls={parts['cls']:.3f} box={parts['box']:.3f} "
                       f"pos={parts['n_pos']} n={len(x)} ({time.perf_counter()-t0:.0f}s)", flush=True)
-        metrics = evaluate(model, vloader, args.conf, args.iou)
-        print(f"[epoche {epoch}] P={metrics['precision']:.3f} R={metrics['recall']:.3f} "
-              f"F1={metrics['f1']:.3f} tp={metrics['tp']} fp={metrics['fp']} fn={metrics['fn']}", flush=True)
-        history.append({"epoch": epoch, "loss": None if run is None else run,
-                        **{k: metrics[k] for k in ("precision", "recall", "f1", "tp", "fp", "fn")}})
+        # Auswertung ist teuer (jede val-Bild durch das Netz + NMS in numpy): nur alle
+        # --eval-every Epochen und immer in der letzten - sonst steht im Log nichts Belastbares.
+        due = args.eval_every <= 1 or (epoch + 1) % args.eval_every == 0 or epoch + 1 == args.epochs
+        if due:
+            metrics = evaluate(model, vloader, args.conf, args.iou)
+            last_measured = metrics
+            print(f"[epoche {epoch}] P={metrics['precision']:.3f} R={metrics['recall']:.3f} "
+                  f"F1={metrics['f1']:.3f} tp={metrics['tp']} fp={metrics['fp']} fn={metrics['fn']}",
+                  flush=True)
+        else:
+            metrics = {k: None for k in METRIC_KEYS}
+            nxt = min(((epoch // args.eval_every) + 1) * args.eval_every - 1, args.epochs - 1)
+            print(f"[epoche {epoch}] ohne Auswertung (naechste in Epoche {nxt})", flush=True)
+        history.append({"epoch": epoch, "loss": None if run is None else run, "eval": due, **metrics})
         if (epoch + 1) % args.save_every == 0:
             torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "cfg": cfg.as_dict(),
                         "epoch": epoch, "size": args.size, "history": history,
-                        "classes": SIGN_LABELS, "metrics": metrics}, args.out)
+                        "classes": SIGN_LABELS, "metrics": last_measured or metrics}, args.out)
             print(f"[checkpoint] {args.out} gespeichert (Epoche {epoch})")
 
+    gemessen = [h for h in history if h.get("eval", True)]
     print(json.dumps({"cfg": cfg.name(), "params": n_params(model), "out": args.out,
-                      "letzte_metriken": history[-1] if history else None}, indent=2, ensure_ascii=False))
+                      "letzte_metriken": gemessen[-1] if gemessen else None}, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":

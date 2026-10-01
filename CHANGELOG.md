@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.0 – 2026-09-30
+- **Erstes echtes Modell trainiert** (bisher gab es nur die Kette dafür): `--preset balanced`
+  (1 287 066 Params, 731 MFLOPs) in drei Blöcken über 159 Epochen auf **23 000 Bildern**
+  aus GTSRB-Kompositionen plus 3 000 synthetischen Bildern. Gemessen auf **2 000
+  Validierungsbildern: P = 0,891 / R = 0,739 / F1 = 0,808**; Export 5,16 MB fp32,
+  Parität 1,1 · 10⁻⁴ mit 4/4 Erkennungen IoU ≥ 0,95, ONNX Runtime CPU (x86, 1 Thread,
+  320×320) 7,2 ms je Bild. Alle Zahlen und die Schwachstellen in `docs/TRAINING.md` §5.
+- **GTSRB-Lücke geschlossen:** GTSRB enthält keine blauen Hinweiszeichen (Z 3xx) und keine
+  gelbe Ortstafel (Z 310) – zwei der neun Typen hatten null Trainingsdaten. Neues
+  `tools/synth_missing.py` füllt genau diese Klassen synthetisch nach; gemessen danach
+  `hinweis` P/R = 0,840/0,781 und `ortstafel` 0,971/0,745 (vorher: nie vorhergesagt).
+- **Neu: `tools/eval_conditions.py`** – Precision/Recall je Bedingung (aus
+  `manifest.conditions`) und je Klasse, mit `--json` für die Ablage. Ersetzt den als offen
+  markierten Punkt „Auswertung nach Bedingung" und macht Verbesserungen messbar.
+- **`tools/train_det.py`:** `--device auto|cpu|cuda` (CUDA wird erkannt, Checkpoints bleiben
+  portabel), `--eval-every` wirkt jetzt wirklich (war ein toter Schalter – jede Epoche
+  kostete eine volle Auswertung), Geraetewechsel beim `--resume` berücksichtigt.
+- **`tools/gtsrb_dataset.py`:** `--gt-zip` für das Test-Set (Bilder und Labels liegen dort in
+  **zwei** Archiven; die labelose `GT-final_test.test.csv` im Bildarchiv lieferte vorher
+  stillschweigend null Zeilen), `--size`-Default 320 (Modellgröße), Boxen werden korrekt
+  durch die Letterbox gerechnet, wenn Datensatzgröße ≠ Trainingsgröße.
+- **Doku:** README (KI-Modus mit echtem Rezept und Messwerten), `docs/TRAINING.md`
+  (§4.3 Datenweg, §5.1 Trainingsläufe, §5.2 Bedingungs-/Klassentabelle, §6 Parität/int8,
+  §8 Status, §9 nächste Schritte), `models/README.md`, Changelog.
+- **int8 bleibt verworfen** – jetzt auch mit 200 echten Kalibrierbildern gemessen
+  (Abweichung 3,16 · 10¹). Das Qualitätstor greift, ausgeliefert wird fp32.
+
 ## 0.2.0 – 2026-09-30
 - **KI-Modus (optional):** hybrides Netz mit **CNN-Backbone und Transformer-Stufen**
   (`tools/hybrid_net.py`) sagt **Position und Art** in einem Durchlauf voraus – anchor-free,

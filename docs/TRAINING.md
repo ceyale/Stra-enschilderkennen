@@ -84,8 +84,9 @@ Ablesbare Erkenntnisse:
 ## 3. Echtzeit-Budget
 
 Gemessene Referenz: **ONNX Runtime CPU (x86, 1 Thread), 128×128: 1,1–1,5 ms je Bild**
-(`tools/export_onnx.py --bench`). Das ist nicht die Handy-Zahl, sondern zeigt nur, dass
-der Graph schlank ist. Für den Browser gilt:
+(`tools/export_onnx.py --bench`). Am ausgelieferten Modell in **320×320** sind es
+**7,2 ms** (x86, 1 Thread, sonst gleiche Maschine). Das ist nicht die Handy-Zahl, sondern
+zeigt nur, dass der Graph schlank ist. Für den Browser gilt:
 
 | Weg | Erwartung | Maßnahme |
 |---|---|---|
@@ -144,24 +145,51 @@ mitschreiben. Ergebnis: **echte Schilderoptik in harten Bedingungen, lizenzfrei*
 (GTSRB ist für Forschung frei).
 
 ```
-curl -L -C - -o data/gtsrb/gtsrb-train.zip \
+curl -L -C - -o data/gtsrb/GTSRB_Final_Training_Images.zip \
   https://sid.erda.dk/public/archives/daaeac0d7ce1152aea9b61d9f1e19370/GTSRB_Final_Training_Images.zip
-curl -L -C - -o data/gtsrb/gtsrb-test.zip  \
+curl -L -C - -o data/gtsrb/GTSRB_Final_Test_Images.zip \
   https://sid.erda.dk/public/archives/daaeac0d7ce1152aea9b61d9f1e19370/GTSRB_Final_Test_Images.zip
-python tools/gtsrb_dataset.py --zip data/gtsrb/gtsrb-train.zip --out data/det --n 20000 --size 256 --split train
-python tools/gtsrb_dataset.py --zip data/gtsrb/gtsrb-test.zip  --out data/det --n 600   --size 256 --split val
+curl -L -C - -o data/gtsrb/GTSRB_Final_Test_GT.zip \
+  https://sid.erda.dk/public/archives/daaeac0d7ce1152aea9b61d9f1e19370/GTSRB_Final_Test_GT.zip
+
+python tools/gtsrb_dataset.py --zip data/gtsrb/GTSRB_Final_Training_Images.zip \
+    --out data/det --n 20000 --size 320 --seed 0
+python tools/gtsrb_dataset.py --zip data/gtsrb/GTSRB_Final_Test_Images.zip \
+    --gt-zip data/gtsrb/GTSRB_Final_Test_GT.zip --out data/det --n 1800 --size 320 \
+    --split val --seed 1
 ```
+
+**`--gt-zip` ist beim Test-Set Pflicht:** die Bilder liegen in
+`GTSRB_Final_Test_Images.zip`, die Labels in einem **eigenen** Archiv
+(`GTSRB_Final_Test_GT.zip`, `GT-final_test.csv`). Die Datei
+`GT-final_test.test.csv` im Bildarchiv hat **keine** `ClassId`-Spalte und liefert
+stillschweigend null Zeilen – `read_rows()` prüft deshalb die Kopfzeile und nimmt nur
+Annotationen mit Klassen.
 
 Die 43 GTSRB-Klassen werden auf die 9 Typen abgebildet (`CLASS_MAP` in
 `tools/gtsrb_dataset.py`): Tempolimits/Überholverbote → `verbot`, Kl. 17 →
 `einfahrtVerboten`, Kl. 13/11 → `vorfahrtGewaehren`, Kl. 14 → `stop`, Kl. 18–31 →
 `warnung`, Kl. 12 → `vorfahrtstrasse`, Kl. 33–40 → `gebot`.
 **Verworfen** werden 32/41/42 („Ende von …", grau/weiß) – sie gehören nicht zu den neun
-Typen und würden die Objektivität verwässern. `hinweis` und `ortstafel` kommen aus dem
-synthetischen Erzeuger, weil GTSRB sie nicht enthält.
+Typen und würden die Objektivität verwässern.
+
+**GTSRB hat zwei der neun Typen nicht:** blaue Hinweiszeichen (Z 3xx) und gelbe Ortstafel
+(Z 310). Ohne Nachschub sagt das Netz diese Klassen nie voraus – im KI-Modus wären blaue
+und gelbe Rechtecke unerreichbar. Beide sind geometrisch einfach, deshalb füllt
+`tools/synth_missing.py` die Lücke mit denselben Kacheln, die auch `synth_data.py` nutzt,
+und hängt sie in den bestehenden Datensatz (`src = "synthetisch (Lueckenschluss)"`):
+
+```
+python tools/synth_missing.py --out data/det --n 3000              # train
+python tools/synth_missing.py --out data/det --n 200 --split val   # Messlatte dazu
+```
+
+Gemessen danach auf den beiden synthetischen Typen: `hinweis` P=0,840/R=0,781,
+`ortstafel` P=0,971/R=0,745 – der Lückenschluss wirkt.
 
 Kein Datenleck: Zug und Validierung kommen aus **verschiedenen Archiven** (Trainings-Zip
-bzw. Test-Zip), nicht aus denselben Aufnahmen.
+bzw. Test-Zip), nicht aus denselben Aufnahmen. Der Validierungssatz des Test-Archivs ist
+das letzte 15-%-Stück des Dateinamenslaufs (zusammenhängende Aufnahmen bleiben zusammen).
 
 ### 4.4 Eigene Bilder (der eigentliche Aufwand)
 
@@ -189,19 +217,92 @@ python tools/train_det.py --data synth --epochs 30 --steps 100 --batch 8   # on-
 ## 5. Training
 
 ```
-python tools/train_det.py --data data/det --epochs 60 --steps 200 --batch 16 \
-    --size 320 --lr 2e-3 --tr-global p5 --tr-window - --degrade 0.6 \
+python tools/train_det.py --data data/det --size 320 --preset balanced \
+    --batch 16 --epochs 80 --steps 100 --lr 2e-3 --degrade 0.6 \
+    --workers 4 --eval-every 5 --save-every 5 \
     --out models/signs-det.pt
 ```
 
 | Schalter | Wirkung |
 |---|---|
+| `--preset fast\|balanced\|quality` | Größe komplett aus `tools/hybrid_net.py` (überschreibt Breiten/Tiefen) |
+| `--device auto\|cpu\|cuda` | `auto` nimmt CUDA, wenn vorhanden – sonst läuft dasselbe Kommando auf der CPU |
 | `--tr-global p5,p4` | Transformer-Stufen (global). `-` schaltet ab (reines CNN) |
 | `--tr-window p4` | lokale Transformer-Stufen |
 | `--act silu\|hardswish` | Hardswish war in der Messung ~6 % schneller |
 | `--norm gn\|ln` | GroupNorm (schnell) oder LayerNorm je Token (genauer, teurer) |
-| `--degrade 0…1` | Anteil künstlich verschlechterter Bilder |
+| `--degrade 0…1` | Anteil künstlich verschlechterter Bilder (zusätzlich zur Erzeugung) |
+| `--eval-every N` | Auswertung nur alle N Epochen (die letzte Epoche wird immer gemessen) |
 | `--resume models/signs-det.pt` | weitertrainieren (Architektur + Auflösung kommen aus dem Checkpoint) |
+| `--steps`, `--epochs` | Bilddurchläufe: eine Epoche sieht `steps × batch` Bilder |
+
+### 5.1 Was hier tatsächlich gelaufen ist
+
+`--preset balanced` (1 287 066 Parameter, 731 MFLOPs), 320×320, RTX-fähige CPU/GPU der
+Klasse GTX 1060: **rund 20 s je Epoche** (100 Schritte × 16 Bilder, inkl. Nachladen),
+Auswertung über 1 800–2 000 Validierungsbilder ~40 s.
+
+| Block | Daten | Epochen | val bei Epoche | P | R | F1 |
+|---|---|---|---|---|---|---|
+| 1 | 20 000 GTSRB-Kompositionen | 0–79 | 9 → 79 | 0,680 → **0,885** | 0,154 → **0,736** | 0,251 → **0,804** |
+| 2 | dieselben Daten (Feinschliff) | 80–119 | 79 → 119 | 0,885 → 0,880 | 0,736 → 0,742 | 0,804 → 0,805 |
+| 3 | + 3 000 Bilder `hinweis`/`ortstafel` | 120–159 | 159 | **0,891** | **0,739** | **0,808** |
+
+Ablauf der Kurve aus Block 1 (jede Auswertung über die vollen 1 800 Bilder):
+R = 0,154 (Ep. 9) → 0,342 (14) → 0,594 (29) → 0,651 (39) → 0,695 (54) → 0,721 (69) →
+0,736 (79); P blieb dabei zwischen 0,84 und 0,89. **Block 2 hat nichts mehr gebracht**
+(Plateau, Daten ausgeschöpft) – die 3 000 synthetischen Bilder in Block 3 dagegen schon:
+erst mit ihnen existieren `hinweis` und `ortstafel` im Modell.
+
+### 5.2 Auswertung nach Bedingung und Klasse
+
+`tools/eval_conditions.py` (füllt den früheren Punkt 3 der nächsten Schritte) gruppiert
+die Validierungsbilder über `manifest.conditions` und zählt tp/fp/fn je Gruppe:
+
+```
+python tools/eval_conditions.py --ckpt models/signs-det.pt --data data/det --json data/eval_val.json
+```
+
+Stand des ausgelieferten Modells (2 000 val-Bilder, 2 509 Boxen, `conf` 0,25, IoU 0,5):
+
+| Bedingung | Bilder | Boxen | P | R |
+|---|---|---|---|---|
+| ohne Bedingung | 140 | 144 | 0,929 | 0,812 |
+| unschaerfe3 | 132 | 173 | 0,917 | 0,769 |
+| hell | 413 | 501 | 0,898 | 0,758 |
+| dunkel | 412 | 525 | 0,897 | 0,747 |
+| blendung | 497 | 639 | 0,895 | 0,737 |
+| rauschen | 673 | 848 | 0,890 | 0,737 |
+| verblichen | 636 | 797 | 0,882 | 0,739 |
+| roll | 1 066 | 1 436 | 0,882 | 0,717 |
+| verdeckt | 601 | 762 | 0,867 | 0,727 |
+| unschaerfe6 | 109 | 148 | 0,872 | 0,689 |
+| **mehrere** | 444 | 888 | 0,880 | **0,634** |
+
+| Klasse | Boxen | P | R | Bemerkung |
+|---|---|---|---|---|
+| ortstafel | 137 | 0,971 | 0,745 | rein synthetisch gelernt |
+| verbot | 1 115 | 0,934 | 0,801 | größte Klasse |
+| gebot | 339 | 0,928 | 0,838 | |
+| vorfahrtstrasse | 91 | 0,903 | 0,615 | wenige Beispiele |
+| vorfahrtGewaehren | 196 | 0,876 | **0,434** | Verwechslung mit `warnung` |
+| einfahrtVerboten | 62 | 0,846 | 0,532 | wenige Beispiele |
+| hinweis | 128 | 0,840 | 0,781 | rein synthetisch gelernt |
+| warnung | 395 | 0,768 | 0,704 | 84 FP – nimmt die Dreiecke an |
+| stop | 46 | 0,667 | 0,478 | nur 46 val-Boxen |
+
+Lesbare Erkenntnisse:
+
+* **`vorfahrtGewaehren` (Spitze unten) gegen `warnung` (Spitze oben) ist der Hauptfehler.**
+  Im Datensatz stecken Roll-Verdrehungen bis ±60° – dort ist „Spitze oben/unten" teilweise
+  nicht mehr entscheidbar. Wer das braucht, muss die Roll-Verteilung begrenzen oder
+  `vorfahrtGewaehren` über die Innenfläche (weißes Dreieck) unterscheiden lernen.
+* **„mehrere" ist die härteste Bedingung** (R 0,63): zwei Schilder im Bild sind meist
+  klein und liegen nah beieinander.
+* **Kleine Klassen bleiben schwach** (`stop` 46, `einfahrtVerboten` 62 Boxen) – hier
+  fehlen schlicht Beispiele; mehr Kompositionen dieser Klassen wären der billigste Schritt.
+* Unschärfe, Dunkelheit, Blendung und Rauschen brechen das Modell **nicht** mehr
+  (R 0,69–0,76) – genau die Bedingungen, an denen die Heuristik scheitert.
 
 Verlust (`DetLoss`): Objektivität als **fokale** BCE, Klasse als Cross-Entropy mit
 Label-Smoothing (nur positive Zellen), Box als L1 auf `(tx,ty,tw,th)` mit
@@ -245,18 +346,24 @@ Parität, Größen, **sha256**, Torch-Version).
 
 Der **Paritätscheck** im Export ist Pflicht, nicht Deko: PyTorch und ONNX Runtime
 rechnen dieselben Bilder, verglichen werden rohe Tensoren **und** die fertigen
-Erkennungen. Gemessen auf dieser Maschine (Beispielmodell, 128 px):
+Erkennungen. Gemessen am **ausgelieferten** Modell (`models/signs-det.onnx`, E159):
 
-* maximale Tensorabweichung **1,5 · 10⁻⁵**
-* Erkennungen: gleiche Anzahl, alle Paare mit **IoU ≥ 0,95** → Export ist korrekt
+* maximale Tensorabweichung **1,1 · 10⁻⁴**
+* Erkennungen: 4 gegen 4, **alle** Paare mit **IoU ≥ 0,95** → Export ist korrekt
+* Dateigröße **5,16 MB** (fp32), ONNX Runtime CPU (x86, 1 Thread), 320×320: **7,2 ms**
+  je Bild in der Referenzmessung des Exports (dieselbe Maschine, 4 Threads: 20–68 ms
+  unter Last – die Streuung kommt von der Auslastung, nicht vom Graphen)
 
-**int8 ist nicht automatisch gut.** Mit nur 6 synthetischen Kalibrierbildern war das
-quantisierte Modell unbrauchbar: maximale Abweichung **4,12**, **0 von 1** Erkennungen
-identisch. `tools/export_onnx.py` hat deshalb ein **Qualitätstor**: Ist die Parität
-schlechter als 0,5 bzw. gehen Erkennungen verloren, wird die int8-Datei **verworfen**
-und fp32 bleibt aktiv (mit Hinweis im Log). Rezepte für einen zweiten Versuch:
-mehr Kalibrierbilder aus echten Frames (`--calib-n 200`), `QuantFormat.QOperator`
-statt QDQ, oder fp16 statt int8.
+**int8 ist nicht automatisch gut.** Mit 6 synthetischen Kalibrierbildern war das
+quantisierte Modell unbrauchbar: maximale Abweichung **4,12**. Auch mit **200 echten**
+Kalibrierbildern aus `data/det` bleibt es falsch (Abweichung **3,16 · 10¹**,
+0 von 2 Erkennungen identisch) – gemessen am gleichen Checkpoint. `tools/export_onnx.py`
+hat deshalb ein **Qualitätstor**: Ist die Parität schlechter als 0,5 bzw. gehen
+Erkennungen verloren, wird die int8-Datei **verworfen** und fp32 bleibt aktiv (mit
+Hinweis im Log). Rezepte für einen zweiten Versuch: `QuantFormat.QOperator` statt QDQ,
+`QuantType.QUInt8`, fp16 statt int8, oder die LayerNorm-Ersatzpfade vorher
+quantisierungsfreundlich umbauen (die Warnungen des Quantisierers zeigen genau dorthin:
+`Expected bias '/p5/norm1/op/Constant_2_output_0' to be an initializer`).
 
 Warum das wichtig ist: Größe und Latenz sind verlockend (1,47 MB statt 5,16 MB), aber
 ein stillschweigend verschlechtertes Modell wäre im Feld schwer zu finden.
@@ -291,13 +398,16 @@ Nebeneffekte, die man kennen sollte:
 | Punkt | Status |
 |---|---|
 | Modell, Training, Verlust, Zuweisung | **verifiziert** (`tools/selfcheck.py`: IoU ≈ 0,90 auf einem Bild) |
+| **Training auf echten Daten** (GTSRB, 23 000 + 2 000 Bilder) | **gelaufen** – P=0,891 / R=0,739 / F1=0,808 auf den val-Bildern (§5.1) |
+| **Auswertung nach Bedingung und Klasse** | **gemessen** (`tools/eval_conditions.py`, §5.2) – schlechtester Fall `mehrere` R=0,634, beste Klasse `ortstafel` R=0,745 |
+| **Alle neun Typen im Modell** | **verifiziert** – `hinweis`/`ortstafel` rein synthetisch gelernt (§4.3) |
 | Parameter/FLOPs je Transformer-Variante | **gemessen** (`tools/bench_model.py`) |
-| ONNX-Export = PyTorch-Ausgabe | **verifiziert** (1,5 · 10⁻⁵, IoU ≥ 0,95) |
-| JavaScript-Dekodierung = Python-Dekodierung | **verifiziert** (`tests/model.test.js`, Fixture mit echten ONNX-Tensoren) |
-| Letterbox/NMS/Rückrechnung in JS | **verifiziert** (16 Checks, `node tests/model.test.js`) |
+| ONNX-Export = PyTorch-Ausgabe | **verifiziert** (1,1 · 10⁻⁴, 4/4 Erkennungen IoU ≥ 0,95) |
+| JavaScript-Dekodierung = Python-Dekodierung | **verifiziert** (`node tests/model.test.js`, Fixture aus dem **ausgelieferten** Modell) |
+| Letterbox/NMS/Rückrechnung in JS | **verifiziert** (26 Checks, `node tests/model.test.js`) |
 | Laufzeit auf **echten Handys** (WebGPU/WASM) | **nicht gemessen** – benötigt Gerätetest |
-| Erkennungsqualität auf echten Straßenbildern | **nicht gemessen** – dafür fehlen die Daten (Abschnitt 4.3) |
-| int8 brauchbar | **widerlegt** für 6 Kalibrierbilder, Tor verwirft es |
+| Erkennungsqualität auf echten **Straßenbildern** | **nicht gemessen** – der val-Satz besteht aus GTSRB-Ausschnitten auf erzeugten Hintergründen, nicht aus ganzen Szenen |
+| int8 brauchbar | **widerlegt** – 6 synthetische *und* 200 echte Kalibrierbilder, Tor verwirft es |
 
 ## 9. Grenzen und nächste Schritte
 
@@ -306,13 +416,26 @@ Nebeneffekte, die man kennen sollte:
 2. **Rechenzeit auf dem Handy** zuerst messen: 320 px auf WebGPU, 192–224 px im
    WASM-Rückfall. Die WEBGPU-Verfügbarkeit ist gut (Android 12+, iOS 26), aber
    nicht überall.
-3. **Auswertung nach Bedingung** fehlt noch: ein Skript, das `data/det` mit
-   `manifest.conditions` gruppiert und Recall/Fehltreffer je Gruppe ausgibt. Ohne das
-   ist jede Verbesserung nur ein Gefühl.
-4. **Verlust verfeinern**: CIoU statt L1 für die Box, Hard-Negative-Mining für die
-   Objektivität – beides typische +2…5 Punkte Recall bei kleinen Schildern.
-5. **Lizenzen** (Abschnitt 4.2) klären, bevor Fremddaten in ein veröffentlichtes Modell
+3. ~~**Auswertung nach Bedingung** fehlt noch~~ → **erledigt**: `tools/eval_conditions.py`
+   (Tabelle je Bedingung und je Klasse, `--json` für die Ablage in `data/`).
+4. **Dreiecks-Verwechslung senken** (`vorfahrtGewaehren` R=0,43 gegen `warnung`):
+   Roll-Verdrehung im Datensatz begrenzen (z.B. ±25°) oder die Innenfläche als
+   zusätzliches Merkmal geben. Das ist mit Abstand der größte Einzelposten (111 von
+   656 verpassten Boxen).
+5. **Kleine Klassen auffüllen** (`stop` 46, `einfahrtVerboten` 62 val-Boxen):
+   mehr Kompositionen dieser Klassen, z.B. über `--n` und gezielte Kacheln wie in
+   `tools/synth_missing.py`.
+6. **Verlust verfeinern**: CIoU statt L1 für die Box, Hard-Negative-Mining für die
+   Objektivität, mehrere positive Zellen je Objekt – typische +2…5 Punkte Recall bei
+   kleinen Schildern. Block 2 in §5.1 hat gezeigt, dass mehr Epochen allein **nichts**
+   mehr bringen.
+7. **Eigene Szenen** (§4.4) sind weiterhin der eigentliche Qualitätssprung: die val-Zahlen
+   hier stammen aus komponierten Bildern, nicht aus Kamerafahrten.
+8. **Lizenzen** (Abschnitt 4.2) klären, bevor Fremddaten in ein veröffentlichtes Modell
    einfließen.
-6. **Modellversionierung** über `models/manifest.json` (sha256 + Metriken) beibehalten:
-   ohne Trainingsdaten-Hash ist ein Modell nicht reproduzierbar.
+9. **Modellversionierung** über `models/manifest.json` (sha256 + Metriken) beibehalten:
+   ohne Trainingsdaten-Hash ist ein Modell nicht reproduzierbar. Für die Daten gehört
+   zusätzlich der GTSRB-Archiv-Hash dazu (die Archive sind unveränderlich, der Hash
+   steht auf der ERDA-Seite).
+
 

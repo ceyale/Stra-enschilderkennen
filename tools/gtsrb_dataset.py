@@ -12,8 +12,9 @@ Nicht abbildbare Klassen (Ende-Schilder) werden verworfen - das Netz soll sie ni
 lernen, sonst ziehen sie die Objektivitaet ins Falsche.
 
 Aufruf:
-    python tools/gtsrb_dataset.py --zip data/gtsrb/gtsrb-train.zip --out data/det --n 20000
-    python tools/gtsrb_dataset.py --zip data/gtsrb/gtsrb-test.zip  --out data/det --n 4000 --split val
+    python tools/gtsrb_dataset.py --zip data/gtsrb/GTSRB_Final_Training_Images.zip --out data/det --n 20000
+    python tools/gtsrb_dataset.py --zip data/gtsrb/GTSRB_Final_Test_Images.zip --out data/det --n 1800 \\
+        --split val --gt-zip data/gtsrb/GTSRB_Final_Test_GT.zip
 """
 from __future__ import annotations
 
@@ -46,11 +47,13 @@ CLASS_MAP: dict[int, str] = {
 SKIP = {32, 41, 42}
 
 
-def read_rows(zf: zipfile.ZipFile) -> list[dict]:
+def read_rows(zf: zipfile.ZipFile, gt_zf: zipfile.ZipFile | None = None) -> list[dict]:
     """Alle GT-*.csv aus dem Archiv lesen (Spalten: Filename, Roi.X1..Y2, ClassId).
 
     Beide Archivformen von GTSRB werden unterstuetzt: Trainings-Zip mit Klassenordnern
     (…/Images/00000/00000_00000.ppm) und Test-Zip ohne (…/Final_Test/Images/00000.ppm).
+    Beim offiziellen Test-Set liegen die Labels in einem SEPARATEN Archiv
+    (GTSRB_Final_Test_GT.zip -> GT-final_test.csv); dafuer gt_zf uebergeben (CLI: --gt-zip).
     """
     names = set(zf.namelist())
     rows: list[dict] = []
@@ -60,14 +63,31 @@ def read_rows(zf: zipfile.ZipFile) -> list[dict]:
                      f"{csv_dir.rsplit('/', 1)[0]}/Images/{filename}"):
             if cand in names:
                 return cand
+        # Notnagel fuer Archivformen ohne Klassenordner: irgendein Bild mit diesem Namen.
+        for cand in names:
+            if cand.endswith("/" + filename):
+                return cand
         return None
 
-    for name in zf.namelist():
-        base = name.split("/")[-1]
-        if not (base.startswith("GT-") and base.endswith(".csv")):
+    # CSV-Quellen sammeln: Bild-Archiv zuerst, dann --gt-zip. Entscheidend ist die
+    # Kopfzeile: das Test-Archiv enthaelt eine GT-final_test.test.csv OHNE Klassen
+    # (nur Dateiname + ROI) - wer sie blind nimmt, bekommt still null Zeilen.
+    sources: list[tuple[str, bytes]] = []
+    for src in (zf, gt_zf):
+        if src is None:
             continue
+        for name in src.namelist():
+            if not name.lower().endswith(".csv"):
+                continue
+            raw = src.read(name)
+            head = raw[:200].decode("utf-8", "replace")
+            if "ClassId" not in head or "Filename" not in head:
+                continue
+            sources.append((name, raw))
+
+    for name, raw in sources:
         folder = name.rsplit("/", 1)[0]
-        text = zf.read(name).decode("utf-8", "replace")
+        text = raw.decode("utf-8", "replace")
         for row in csv.DictReader(io.StringIO(text), delimiter=";"):
             if "ClassId" not in row:          # Test-Zip liefert keine Labels -> unbrauchbar
                 continue
@@ -133,13 +153,16 @@ def compose(zf: zipfile.ZipFile, picks: list[dict], rng: random.Random, size: in
 
 
 def build(zip_path: str, out_dir: str, n: int, size: int, split: str, seed: int = 0,
-          degrade_prob: float = 0.85, occlude_prob: float = 0.3, val_share: float = 0.15) -> dict:
+          degrade_prob: float = 0.85, occlude_prob: float = 0.3, val_share: float = 0.15,
+          gt_zip: str | None = None) -> dict:
     out = Path(out_dir)
     (out / "images").mkdir(parents=True, exist_ok=True)
     (out / "labels").mkdir(parents=True, exist_ok=True)
     rng = random.Random(seed)
     zf = zipfile.ZipFile(zip_path)
-    rows = read_rows(zf)
+    # Beim Test-Set liegen die Labels in einem eigenen Archiv (GTSRB_Final_Test_GT.zip).
+    gt_zf = zipfile.ZipFile(gt_zip) if gt_zip else None
+    rows = read_rows(zf, gt_zf)
     if not rows:
         raise SystemExit(f"keine verwertbaren Annotationen in {zip_path}")
     # Kein Datenleck UND keine Klassenlücke: je Klasse die letzten val_share der
@@ -185,15 +208,17 @@ def build(zip_path: str, out_dir: str, n: int, size: int, split: str, seed: int 
 def main() -> None:
     ap = argparse.ArgumentParser(description="GTSRB -> Detektor-Datensatz (echte Schilder, eigene Hintergruende)")
     ap.add_argument("--zip", required=True)
+    ap.add_argument("--gt-zip", default="", help="eigenes Label-Archiv (Test-Set: GTSRB_Final_Test_GT.zip)")
     ap.add_argument("--out", default="data/det")
     ap.add_argument("--n", type=int, default=20000)
-    ap.add_argument("--size", type=int, default=256)
+    ap.add_argument("--size", type=int, default=320, help="Bildgroesse im Datensatz (Modellgroesse, siehe train_det.py)")
     ap.add_argument("--split", default="train", choices=["train", "val"])
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--degrade", type=float, default=0.85)
     ap.add_argument("--occlude", type=float, default=0.3)
     args = ap.parse_args()
-    info = build(args.zip, args.out, args.n, args.size, args.split, args.seed, args.degrade, args.occlude)
+    info = build(args.zip, args.out, args.n, args.size, args.split, args.seed, args.degrade,
+                 args.occlude, gt_zip=args.gt_zip or None)
     print(f"[daten] {info['neu']} Bilder ({args.split}) nach {args.out} geschrieben, "
           f"{info['klassen']} GTSRB-Klassen genutzt")
     print("[daten] Bedingungen:", ", ".join(f"{k}={v}" for k, v in sorted(info["bedingungen"].items())))

@@ -2,6 +2,9 @@
 node_modules/
 *.log
 
+# Auslieferung (baut tools/build_site.py) - enthaelt Kopien, nie einchecken
+dist/
+
 # Trainingsdaten (gross, eigene Fotos, Fremddatensaetze) - nicht einchecken
 data/
 
