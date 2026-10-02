@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.1 – 2026-10-02
+- **Kaggle-Lauf Block 5 ausgewertet und übernommen** (Tesla T4, 220 Epochen × 150 Schritte,
+  29 600 Trainingsbilder mit 3 600 echten Negativen und den neuen Tafel-Szenen, 70 min):
+  auf den unveränderten 2 000 val-Bildern **P = 0,944 / R = 0,865 / F1 = 0,903**
+  (vorher 0,883 / 0,796 / 0,837) und bei 384 px Eingabe **0,934 / 0,879 / F1 = 0,906**.
+  Parität PyTorch ↔ ONNX 3,5 · 10⁻⁴ mit 23/23 Erkennungen IoU ≥ 0,95, ONNX Runtime CPU
+  (x86, 1 Thread, 320×320) 6,9 ms je Bild. Zahlen kommen mit
+  `kaggle\run.ps1 -Step pull` / `-Step install` nach `models/` und `tests/fixtures/`.
+  Die Tabellen in `docs/TRAINING.md` §5/§10 zeigen noch **den Stand der Vorfassung** –
+  das Nachziehen ist offen (PLAN.md §3.4).
+- **Ausgeliefert und im Netz geprüft:** neue Modell-Dateien in `models/`, Fixture in
+  `tests/fixtures/model-out.json` (beide Node-Tests grün), `dist/` gebaut und auf Cloudflare
+  gelegt. Der Weg ohne Konto (temporärer Wrangler-Zugang, zufälliger Name) steht mit den
+  gemessenen Eigenheiten in der README (`workers.dev`-Adresse, 60-Minuten-Claim,
+  403 für `urllib`, 307 auf `/index.html`).
+- **Bekannt und unverändert:** auf den beiden Nutzerfotos bleibt es schwach –
+  `Test/Schilder.jpg` (Poster, Schilder ~15 px) liefert **0** Treffer, `Test/Nothing.jpg`
+  **1–2** schwache Fehlalarme (0,26–0,36). Die Domänen- und Auflösungslücke aus PLAN.md §1
+  ist mit diesem Lauf **nicht** geschlossen; 1 100 Negativbilder ergeben 0,25 Fehlalarme je
+  Bild (277 Treffer auf 1 100 Bildern).
+
 ## 0.4.0 – 2026-09-30
 - **Fehlerzerlegung vor dem Umbau (neu: `tools/eval_conditions.py --diagnose`)**: von 656
   verpassten Boxen waren 334 „tief verpasst“ (46 % davon ≤ 32 px Diagonale), 212 falsch

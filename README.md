@@ -111,6 +111,32 @@ hochgeladen und nichts halb angelegt. Ohne `npx`/`wrangler` auf dem Rechner geht
 alternativ über das Cloudflare-Dashboard: *Workers & Pages → Create → Pages → Upload
 assets* und den Inhalt von `dist/` hineinziehen.
 
+### Sofort-Vorschau mit zufälliger Adresse (ohne Konto)
+
+Wer nur schnell eine Adresse braucht, lässt Wrangler einen **temporären Zugang** anlegen und
+die Seite als Worker mit statischen Dateien ausliefern:
+
+```
+python tools/build_site.py                  # dist/ bauen (muss das aktuelle Modell enthalten)
+npx --yes wrangler@4.146.0 deploy --assets dist --name schilderscanner-<zufall> `
+    --compatibility-date 2026-10-02 --temporary
+```
+
+Der Name wird zufällig gewählt, die Adresse ergibt sich als
+`https://<name>.<konto>.workers.dev` – am 02.10.2026 gemessen:
+`https://schilderscanner-hdtjal.tartan-twist.workers.dev` (Deploy 17 s nach 13 s Upload).
+
+Vier Dinge, die dabei aufgefallen sind (gemessen, nicht vermutet):
+
+* Wrangler verlangt **innerhalb von 60 Minuten** einen Klick auf die Claim-URL aus dem
+  Protokoll. Danach ist der Zugang weg und die Adresse mit ihm – dauerhaft ist es nur mit
+  eigenem Konto (`--deploy`, siehe oben).
+* `urllib` (Python) bekommt von der Adresse **403** – der Standard-User-Agent wird
+  abgewiesen, `curl` und Browser kommen durch. Für Skripte einen User-Agent mitschicken.
+* `/index.html` antwortet mit **307** auf `/`; die Startseite liefert `/`.
+* Die Adresse ist nur so gut wie `dist/`: Fehlt `models/signs-det.onnx`, läuft die Seite im
+  Heuristik-Modus (der Status unter dem Titel sagt es).
+
 Zwei Dinge, die man beim Hosten kennen sollte:
 
 * **`dist/` ist Absicht:** Cloudflare lädt den ganzen Ausgabeordner hoch. `tools/`,

@@ -50,6 +50,10 @@ Die Schilder sind im 4096 px breiten Poster ~15 px groß → bei 320 px Eingang 
    Control) die PyTorch-DLLs blockiert (`WinError 4551`). Der Kernel baut den Datensatz aus
    den Rohdaten, trainiert, exportiert ONNX und misst – mit genau den Aufrufen aus
    `docs/TRAINING.md` §4.3/§5. Rückweg der Ergebnisse: `kaggle\run.ps1 -Step pull -Step install`.
+   **Lauf vom 02.10. ist durch und übernommen** (Tesla T4, 70 min, 220 × 150, 29 600 Bilder):
+   val **P 0,944 / R 0,865 / F1 0,903**, 384 px 0,906, Fixture und beide Node-Tests grün,
+   Deploy auf Cloudflare erledigt – Zahlen in `CHANGELOG.md` 0.4.1. Offen bleibt, die
+   Tabellen in `docs/TRAINING.md` §5/§10 auf diesen Lauf nachzuziehen.
 1. **Trainingslauf Block 5** (Rezept wie `docs/TRAINING.md` §5, aber auf dem neuen
    Datensatz): 220 Epochen, ~1,3 h bei 29 600 Bildern.
    *Hinweis:* Der Vorabtest mit 600 Schritten (`data/_probe2.ps1`) zeigte val `tp=0` – das ist
