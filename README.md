@@ -137,10 +137,15 @@ Vier Dinge, die dabei aufgefallen sind (gemessen, nicht vermutet):
 * Die Adresse ist nur so gut wie `dist/`: Fehlt `models/signs-det.onnx`, läuft die Seite im
   Heuristik-Modus (der Status unter dem Titel sagt es).
 
-Zwei Dinge, die man beim Hosten kennen sollte:
+Drei Dinge, die man beim Hosten kennen sollte:
 
 * **`dist/` ist Absicht:** Cloudflare lädt den ganzen Ausgabeordner hoch. `tools/`,
   `data/` und `.git/` haben im Netz nichts zu suchen.
+* **`_headers` gehört dazu:** Die Datei setzt `Cross-Origin-Opener-Policy` und
+  `Cross-Origin-Embedder-Policy`. Erst dann meldet der Browser `crossOriginIsolated` und
+  `src/model.js` darf mehrere Rechenfäden benutzen – gemessen 18,6 ms (1 Faden) gegen
+  9,7 ms (4 Fäden) je Bild (`docs/DATENSAETZE.md` §6). Auf GitHub Pages fehlen diese
+  Header, dort läuft dieselbe Rechnung mit einem Faden weiter.
 * **Kamera braucht HTTPS** – `pages.dev` liefert HTTPS, damit funktioniert
   `getUserMedia` auch am Handy (im WLAN über die lokale IP nicht).
 
@@ -161,5 +166,6 @@ Zwei Dinge, die man beim Hosten kennen sollte:
 | `models/` | Zielort der Modell-Dateien (lokal erzeugt, nicht im Git) |
 | `docs/DOKUMENTATION.md` | Ausführliche Doku: Algorithmus, Schwellwerte, Grenzen, Erweiterungen |
 | `docs/TRAINING.md` | KI-Modus: Architektur, gemessene Kosten, Training, Export, Browser |
+| `docs/DATENSAETZE.md` | Datensatz-Recherche: Umfang, **Lizenz**, StVO-Zuordnung auf die 9 Typen, Tempo-Messung |
 
 Lizenz: MIT.

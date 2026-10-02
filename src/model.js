@@ -145,9 +145,13 @@
     }
 
     const ort = root.ort;
-    // GitHub Pages erlaubt keine COOP/COEP-Header -> kein Mehrthread-WASM.
-    // Einthreadig bleiben die Ergebnisse reproduzierbar (siehe docs/TRAINING.md).
-    ort.env.wasm.numThreads = 1;
+    // Mehrfaden-WASM braucht COOP/COEP-Header (`crossOriginIsolated`). Cloudflare liefert sie
+    // ueber `dist/_headers` aus; gemessen kostet dasselbe Bild mit 1 Faden 18,6 ms und mit
+    // 4 Faeden 9,7 ms (data/_speed.py). Fehlen die Header (GitHub Pages), bleibt es bei einem
+    // Faden - dasselbe Ergebnis, nur langsamer.
+    const kerne = (root.navigator && root.navigator.hardwareConcurrency) || 1;
+    const faeden = root.crossOriginIsolated === true ? Math.max(1, Math.min(4, kerne)) : 1;
+    ort.env.wasm.numThreads = faeden;
     if (o.wasmPaths && ort.env.wasm) ort.env.wasm.wasmPaths = o.wasmPaths;
 
     const file = labels.files.int8 || labels.files.onnx;
@@ -159,7 +163,7 @@
           executionProviders: eps,
           graphOptimizationLevel: 'all',
         });
-        backend = eps.join('→');
+        backend = eps.join('→') + (faeden > 1 ? ' ×' + faeden : '');
         break;
       } catch (err) {
         if (eps.length === 1) return { ok: false, reason: 'Modell nicht ladbar: ' + err.message };

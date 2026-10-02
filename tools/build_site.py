@@ -3,7 +3,11 @@ tools/build_site.py - Auslieferung nach dist/ sammeln und optional zu Cloudflare
 
 Warum ein Zwischenschritt? Cloudflare Pages laedt den GANZEN Ausgabeordner hoch. Das Repo
 enthaelt aber tools/, data/, tests/ und .git/ - das gehoert nicht ins Netz. dist/ enthaelt
-deshalb nur: index.html, src/, models/ (nur die noetigen Modelldateien).
+deshalb nur: index.html, _headers, src/, models/ (nur die noetigen Modelldateien).
+
+Die Datei `_headers` setzt COOP/COEP. Erst damit ist `crossOriginIsolated` wahr und
+src/model.js darf mehrere Rechenfaeden benutzen - gemessen 18,6 ms (1 Faden) gegen 9,7 ms
+(4 Faeden) je Bild, siehe docs/DATENSAETZE.md §6.
 
     python tools/build_site.py                      # nur dist/ bauen (Groesse anzeigen)
     python tools/build_site.py --check              # zusaetzlich pruefen, ob ein Modell dabei ist
@@ -35,7 +39,7 @@ def collect(dist: Path) -> list[tuple[Path, int]]:
     dist.mkdir(parents=True)
     copied: list[tuple[Path, int]] = []
 
-    for name in ("index.html",):
+    for name in ("index.html", "_headers"):
         src = ROOT / name
         if src.exists():
             shutil.copy2(src, dist / name)

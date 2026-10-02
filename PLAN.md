@@ -112,6 +112,19 @@ ist klein, nicht die Dateizahl.
      `python tools/real_negatives.py --out data/det --n 3000 --split train --real-train <70 % der Fotos> --montage data/m.png`
      und `--n 600 --split neg --real-test <die übrigen 30 %>` – **getrennte Fotos** für
      Training und Messlatte, sonst betrügt man sich selbst (je Foto ~33 Ausschnitte).
+1b. **Daten ausserhalb GTSRB** – Recherche steht in [`docs/DATENSAETZE.md`](docs/DATENSAETZE.md)
+   (Umfang, Lizenz, Zuordnung auf die 9 Typen). Kurzfassung: **Mapillary MTSD** (105 000 Bilder,
+   400 Klassen) ist fachlich der beste, aber seine Research-Use-Lizenz verbietet den Einbau in
+   ein öffentliches Produkt – für diese App also **draußen**; TT100K und BDD100K sind NC.
+   Nutzbar sind **GTSDB** (545–900 deutsche Szenen mit Boxen, CC BY 4.0 → endlich eine ehrliche
+   Messlatte), **GTSIGN-220** (75 541 Crops, 220 StVO-Klassen, CC BY-SA 4.0),
+   **Synset Signset Germany** (211 000 synthetische Bilder, 211 Klassen, CC BY 4.0) und
+   **Open Images** (Klasse „Traffic sign", CC BY 2.0 → Szenen und harte Negative).
+1c. **Tempo**: `data/_speed.py` misst, `dist/_headers` + `crossOriginIsolated` in
+   `src/model.js` sind gebaut (COOP/COEP live geprüft). Gemessen: 1 Faden 18,6 ms → 4 Fäden
+   9,7 ms je Bild; feste Eingabegröße bringt weitere 18 %. Offen: entscheiden, ob eine zweite
+   statische Datei (384 px fürs Foto) dazukommt.
+
 2. **Kachelmodus in die App**: `src/model.js` + `src/app.js` – Foto in N×N überlappende
    Kacheln, Treffer verschieben, NMS über die Kachelgrenzen, **höhere Schwelle** im Kachelmodus
    (Messung: conf 0,3 → 40 statt 115 Treffer auf dem Poster, aber 5 statt 22 FP auf `Nothing`).
