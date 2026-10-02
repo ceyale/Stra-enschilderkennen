@@ -56,7 +56,13 @@ mehrere Schwellen).
 |---|---|---|---|---|
 | `Test/Schilder.jpg` (~80 Schilder am Monitor) | **0** | 15 | **53** (beste 0,907) | 0,166 / 0,907 |
 | `Test/Nothing.jpg` | 1 | 2 | 8 | 0,259 / 0,685 |
-| `negative-images/` (15 Bilder) | **35** auf 8 Bildern | 143 auf 14 | 281 auf 15 | 0,596 (ISO-7010-Poster) |
+| `negative-images/` Stand 20:58 (**mit** ISO-7010-Poster) | **35** auf 8 Bildern | 143 auf 14 | 281 auf 15 | 0,596 (Poster) |
+| `negative-images/` Stand 21:20 (Poster entfernt, 15 Bilder) | **16** auf 6 Bildern | 36 auf 10 | 91 auf 11 | 0,573 (`images11`) |
+
+Dieselben 15 Bilder bei anderen Schwellen (320 px, ganzes Bild): 0,35 → **6** (4 Bilder),
+0,45 → **1** (1 Bild, `images11` mit 0,573). Mit Kacheln wächst die Zahl der Fehlalarme
+wieder (3×3: 36 / 14 / 5, 6×6: 91 / 33 / 10 für 0,25 / 0,35 / 0,45) – Kacheln helfen nur
+gegen kleine Schilder, sie erzeugen sie nicht umsonst.
 
 Schwellen (val 1 000 Bilder, unveränderte Messlatte; neg = 1 000 echte Negative):
 
@@ -68,7 +74,8 @@ Schwellen (val 1 000 Bilder, unveränderte Messlatte; neg = 1 000 echte Negative
 | 0,50 | 0,830 | 0,724 | 0,027 | 0,027 |
 
 ⇒ **0,35 halbiert die Fehlalarme ohne F1-Verlust** (kostet 2,4 Punkte Recall); auf den
-Nutzerfotos 35 → 11 Fehlalarme, `Nothing.jpg` 1 → 0. `Schilder.jpg` bleibt bei **jeder**
+Nutzerfotos 35 → 11 Fehlalarme (Satz mit Poster) bzw. 16 → 6 (aktueller Satz),
+`Nothing.jpg` 1 → 0. `Schilder.jpg` bleibt bei **jeder**
 Schwelle 0 – das ist **kein** Schwellenproblem, sondern Auflösung: die Schilder sind im
 4 096 px breiten Foto ~15 px groß, bei 320 px Eingang also 1,2 px. Kacheln finden sie
 (6×6: 53 Treffer, bester Score 0,907), kosten aber Fehlalarme auf den Negativen.
