@@ -8,11 +8,6 @@ dist/
 # Trainingsdaten (gross, eigene Fotos, Fremddatensaetze) - nicht einchecken
 data/
 
-# Modell-Artefakte: lokal erzeugen mit tools/train_det.py + tools/export_onnx.py
-models/*.onnx
-models/*.pt
-models/*.json
-models/examples/
 
 # Python-Werkzeuge
 __pycache__/

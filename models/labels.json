@@ -1,0 +1,29 @@
+{
+  "format": "signs-det/1",
+  "classes": [
+    "stop",
+    "vorfahrtGewaehren",
+    "warnung",
+    "verbot",
+    "einfahrtVerboten",
+    "gebot",
+    "hinweis",
+    "vorfahrtstrasse",
+    "ortstafel"
+  ],
+  "size": 320,
+  "levels": [
+    4,
+    8,
+    16,
+    32
+  ],
+  "channels": 14,
+  "layout": "tx,ty,tw,th,obj,cls0..cls8",
+  "score": "sigmoid(obj)*max(sigmoid(cls))",
+  "dynamic": true,
+  "files": {
+    "onnx": "signs-det.onnx",
+    "fp32_bytes": 5226262
+  }
+}

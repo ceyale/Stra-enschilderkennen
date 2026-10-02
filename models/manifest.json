@@ -1,0 +1,107 @@
+{
+  "arch": {
+    "width": [
+      32,
+      64,
+      128,
+      256
+    ],
+    "depth": [
+      1,
+      2,
+      2,
+      2
+    ],
+    "act": "silu",
+    "tr_global": [
+      "p5"
+    ],
+    "tr_window": [],
+    "tr_heads": 4,
+    "tr_ffn": 2.0,
+    "tr_norm": "gn",
+    "win": 5,
+    "levels": [
+      4,
+      8,
+      16,
+      32
+    ],
+    "mid": [
+      32,
+      32,
+      64,
+      128
+    ],
+    "name": "hybridnano_gP5_w-_silu"
+  },
+  "params": 1300360,
+  "size": 320,
+  "classes": [
+    "stop",
+    "vorfahrtGewaehren",
+    "warnung",
+    "verbot",
+    "einfahrtVerboten",
+    "gebot",
+    "hinweis",
+    "vorfahrtstrasse",
+    "ortstafel"
+  ],
+  "trained_epoch": 219,
+  "train_metrics": {
+    "precision": 0.8831858407079646,
+    "recall": 0.7955360701474691,
+    "tp": 1996,
+    "fp": 264,
+    "fn": 513,
+    "fp_bild": 0.132,
+    "f1": 0.837072761585238
+  },
+  "parity": {
+    "max_tensor_diff": 0.000213623046875,
+    "det_ref": 9,
+    "det_onnx": 9,
+    "matched_iou95": 9
+  },
+  "dynamic": {
+    "size": 384,
+    "shapes": [
+      [
+        1,
+        14,
+        96,
+        96
+      ],
+      [
+        1,
+        14,
+        48,
+        48
+      ],
+      [
+        1,
+        14,
+        24,
+        24
+      ],
+      [
+        1,
+        14,
+        12,
+        12
+      ]
+    ],
+    "max_diff": 9.5367431640625e-06,
+    "forme_ok": true
+  },
+  "ort_cpu_ms": 10.55,
+  "files": {
+    "onnx": "signs-det.onnx",
+    "fp32_bytes": 5226262
+  },
+  "sha256": {
+    "onnx": "5d04c0952fb8d4c3a18be9707ab2d4dbc2f5dd51974dde177c4b7cd262473383"
+  },
+  "torch": "2.14.0+cu126"
+}
