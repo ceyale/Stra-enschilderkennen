@@ -43,6 +43,42 @@ Die Schilder sind im 4096 px breiten Poster ~15 px groß → bei 320 px Eingang 
   **echte Negative 3 600**. Split `neg` 1 100. **`val` 2 000 unverändert** (Messlatte).
 * `data/_test_bilder.py --tile N`, `data/_check_synth.py` (`data/_commit5.txt` entfernt).
 
+### Messung 02.10.2026 (Zielvorgabe des Nutzers: `Schilder.jpg` alles, Negative nichts)
+
+Werkzeuge (neu, nur Diagnose, nicht ausgeliefert): `data/_fp_messung.py` (rechnet mit der
+**ausgelieferten** `models/signs-det.onnx` und der Mathematik aus `tools/detmath.py` – die
+PyTorch-DLLs waren hier zeitweise blockiert, inzwischen laufen sie wieder: gemessen
+`torch 2.14.0+cu126`, `cuda verfuegbar: True`, **GTX 1060 6 GB**, also ist Training auch lokal
+möglich), `data/_dubletten.py` (Duplikate und Leakage), `data/_schwellen.py` (ein Modelllauf,
+mehrere Schwellen).
+
+| Bild | 320 px ganz | 3×3 Kacheln | 6×6 Kacheln | höchster Roh-Score |
+|---|---|---|---|---|
+| `Test/Schilder.jpg` (~80 Schilder am Monitor) | **0** | 15 | **53** (beste 0,907) | 0,166 / 0,907 |
+| `Test/Nothing.jpg` | 1 | 2 | 8 | 0,259 / 0,685 |
+| `negative-images/` (15 Bilder) | **35** auf 8 Bildern | 143 auf 14 | 281 auf 15 | 0,596 (ISO-7010-Poster) |
+
+Schwellen (val 1 000 Bilder, unveränderte Messlatte; neg = 1 000 echte Negative):
+
+| conf | F1 val | R val | FP/Bild neg | FP/Bild val |
+|---|---|---|---|---|
+| **0,25 (App-Stand)** | 0,841 | 0,801 | 0,282 | 0,128 |
+| **0,35** | **0,844** | 0,777 | 0,133 | 0,080 |
+| 0,40 | 0,843 | 0,764 | 0,096 | 0,059 |
+| 0,50 | 0,830 | 0,724 | 0,027 | 0,027 |
+
+⇒ **0,35 halbiert die Fehlalarme ohne F1-Verlust** (kostet 2,4 Punkte Recall); auf den
+Nutzerfotos 35 → 11 Fehlalarme, `Nothing.jpg` 1 → 0. `Schilder.jpg` bleibt bei **jeder**
+Schwelle 0 – das ist **kein** Schwellenproblem, sondern Auflösung: die Schilder sind im
+4 096 px breiten Foto ~15 px groß, bei 320 px Eingang also 1,2 px. Kacheln finden sie
+(6×6: 53 Treffer, bester Score 0,907), kosten aber Fehlalarme auf den Negativen.
+
+Duplikate (32 700 Bilder): byte-gleich 4 Paare, **alle innerhalb `train`**, keine über
+Splitgrenzen; inhaltlich (dhash ≤ 2 Bit) 378 Gruppen / 1 622 Bilder, darunter 339 fast leere
+Negative (dhash 0) – die tragen nichts bei. Kein Testbild ähnelt einem Trainingsbild. Die
+4 200 echten Negative stammen aber aus nur **127 Fotos** (je ~33 Ausschnitte): die Vielfalt
+ist klein, nicht die Dateizahl.
+
 ## 3. Nächste Schritte
 
 0. **Training läuft auf Kaggle** (`kaggle/`, siehe [`kaggle/README.md`](kaggle/README.md)): der
@@ -54,10 +90,21 @@ Die Schilder sind im 4096 px breiten Poster ~15 px groß → bei 320 px Eingang 
    val **P 0,944 / R 0,865 / F1 0,903**, 384 px 0,906, Fixture und beide Node-Tests grün,
    Deploy auf Cloudflare erledigt – Zahlen in `CHANGELOG.md` 0.4.1. Offen bleibt, die
    Tabellen in `docs/TRAINING.md` §5/§10 auf diesen Lauf nachzuziehen.
-1. **Trainingslauf Block 5** (Rezept wie `docs/TRAINING.md` §5, aber auf dem neuen
-   Datensatz): 220 Epochen, ~1,3 h bei 29 600 Bildern.
-   *Hinweis:* Der Vorabtest mit 600 Schritten (`data/_probe2.ps1`) zeigte val `tp=0` – das ist
-   normal für so wenige Schritte (der Vorlauf hatte bei Epoche 9 R = 0,029) und **kein Urteil**.
+1. **Trainingslauf Block 5 ist gelaufen** (02.10.). Offen dazu:
+   * Datensatz aufräumen: **339 fast leere Negative** (dhash 0) und 4 byte-gleiche Paare –
+     sie kosten Rechenzeit und bringen nichts.
+   * Die **Val-Messlatte ist GTSRB-Material** (Crops mit großem Schild). Deshalb steht dort
+     0,90, während dieselbe Datei auf echten Szenen 0,00 (Poster) liefert. Für eine ehrliche
+     Zahl gehört eine Szene-Messlatte dazu (die Nutzerfotos sind der Anfang).
+   * **Schwelle entscheiden:** 0,25 → **0,35** in `src/model.js` halbiert die Fehlalarme
+     **ohne F1-Verlust** (Messung oben). Eine Zeile, sofort wirksam.
+   * **Negative sammeln** – ja, aber nach **Art**, nicht nach Menge: Anzeigen/Poster mit
+     Piktogrammen (die härteste Klasse: rote Kreise, blaue Kreise, gelbe Dreiecke sind genau
+     die gesuchten Formen), Produktfotos auf Weiß, Nachtaufnahmen, Büro/Zimmer/Werkstatt.
+     Rezeptur mit dem bestehenden Werkzeug (bewiesen, 6 Bilder in 2 s):
+     `python tools/real_negatives.py --out data/det --n 3000 --split train --real-train <70 % der Fotos> --montage data/m.png`
+     und `--n 600 --split neg --real-test <die übrigen 30 %>` – **getrennte Fotos** für
+     Training und Messlatte, sonst betrügt man sich selbst (je Foto ~33 Ausschnitte).
 2. **Kachelmodus in die App**: `src/model.js` + `src/app.js` – Foto in N×N überlappende
    Kacheln, Treffer verschieben, NMS über die Kachelgrenzen, **höhere Schwelle** im Kachelmodus
    (Messung: conf 0,3 → 40 statt 115 Treffer auf dem Poster, aber 5 statt 22 FP auf `Nothing`).
