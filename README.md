@@ -2,7 +2,7 @@
 
 Erkennt einfache deutsche Verkehrszeichen live mit der Handykamera – direkt im Browser, ohne Server, ohne Installation, ohne Bibliotheken.
 
-Erkannt werden Schilder an **Farbe + Form**: Stopp, Vorfahrt gewähren, Gefahrzeichen, Verbotszeichen, Einfahrt verboten, Gebotszeichen, Hinweiszeichen, Vorfahrtstraße, Ortstafel. Zahlen und Symbole (z. B. „30“) werden **nicht** gelesen.
+Erkannt werden Schilder an **Farbe + Form**: unter anderem Stopp, Vorfahrt gewähren, Gefahrzeichen, Verbotszeichen, Einfahrt verboten, Gebotszeichen, Hinweiszeichen, Vorfahrtstraße, Ortstafel und grüne Wegweiser. Ziffern und Großbuchstaben im Schildinneren werden zusätzlich offline ausgelesen und neben dem Erkennungskasten angezeigt. Die Zeichenerkennung ist bewusst zurückhaltend; bei kleinen, schrägen, verdeckten oder unscharfen Schildern kann Text fehlen oder falsch gelesen werden. Für verlässliche Ergebnisse Schild möglichst frontal und groß aufnehmen.
 
 ## Schnellstart
 

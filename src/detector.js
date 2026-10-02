@@ -13,7 +13,7 @@
 (function (root) {
   'use strict';
 
-  const NONE = 0, RED = 1, BLUE = 2, YELLOW = 3;
+  const NONE = 0, RED = 1, BLUE = 2, YELLOW = 3, GREEN = 4, WHITE = 5;
 
   /** Schwellwerte. Alle Größen in Pixeln des verkleinerten Analysebilds. */
   const CONFIG = {
@@ -26,6 +26,8 @@
     yellowHueMax: 66,
     blueHueMin: 200,
     blueHueMax: 255,
+    greenHueMin: 80,
+    greenHueMax: 165,
     minBox: 10,           // kleinste Kantenlänge einer Fläche
     minArea: 40,          // kleinste Pixelanzahl einer Fläche
     maxFrameShare: 0.9,   // Flächen, die fast das ganze Bild füllen, sind kein Schild
@@ -55,6 +57,10 @@
     hinweis:           { name: 'Hinweiszeichen',    zeichen: 'Z 3xx',     hex: '#1467b8', text: '#fff',    note: 'Blaues Rechteck, z. B. Parkplatz (Z 314).' },
     vorfahrtstrasse:   { name: 'Vorfahrtstraße',    zeichen: 'Z 306',     hex: '#f2c200', text: '#1e2329', note: 'Gelbe Raute mit weißem Rand.' },
     ortstafel:         { name: 'Ortstafel',         zeichen: 'Z 310',     hex: '#f2c200', text: '#1e2329', note: 'Gelbes Rechteck am Ortseingang.' }
+    ,wegweiser:        { name: 'Wegweiser',         zeichen: 'Z 4xx',     hex: '#1467b8', text: '#fff',    note: 'Richtungs- oder Wegweiserschild.' }
+    ,vorfahrt:         { name: 'Vorfahrt an der nächsten Kreuzung', zeichen: 'Z 301', hex: '#d3232f', text: '#fff', note: 'Vorfahrt an der nächsten Kreuzung.' }
+    ,parkverbot:       { name: 'Halt-/Parkverbot', zeichen: 'Z 2xx', hex: '#d3232f', text: '#fff', note: 'Rundes Verbotsschild mit blauem Feld.' }
+    ,gruenHinweis:     { name: 'Grünes Wegweiserschild', zeichen: 'Z 4xx', hex: '#16834a', text: '#fff', note: 'Grünes rechteckiges Wegweiserschild.' }
   };
 
   /** Schritt 1: RGB → Farbklasse. h in Grad (0..360), s und v in 0..1. */
@@ -71,6 +77,7 @@
     if (h <= cfg.redHueMax || h >= cfg.redHueMin) return RED;
     if (h >= cfg.yellowHueMin && h <= cfg.yellowHueMax && v > cfg.minValueYellow) return YELLOW;
     if (h >= cfg.blueHueMin && h <= cfg.blueHueMax) return BLUE;
+    if (h >= cfg.greenHueMin && h <= cfg.greenHueMax) return GREEN;
     return NONE;
   }
 
@@ -163,6 +170,7 @@
       if (shape === 'triangleDown') return 'vorfahrtGewaehren';
       if (shape === 'triangleUp') return 'warnung';
       if (shape === 'circle') return fill > cfg.minFillFull ? 'einfahrtVerboten' : 'verbot';
+      if (shape === 'diamond') return 'vorfahrt';
     } else if (color === BLUE) {
       if (shape === 'circle') return 'gebot';
       if (shape === 'rect') return 'hinweis';
@@ -170,7 +178,57 @@
       if (shape === 'diamond') return 'vorfahrtstrasse';
       if (shape === 'rect') return 'ortstafel';
     }
+    if (color === GREEN && shape === 'rect') return 'gruenHinweis';
     return null;
+  }
+
+  // 5x7-Fontmuster für eine robuste, offlinefähige OCR auf Schildtext.
+  const GLYPHS = {
+    '0':'01110100011001110101110011000101110','1':'00100011000010000100001000010001110',
+    '2':'01110100010000100010001000100011111','3':'11110000010000101110000010000111110',
+    '4':'00010001100101010010111110001000010','5':'11111100001000011110000010000111110',
+    '6':'00110010001000011110100011000101110','7':'11111000010001000100010000100001000',
+    '8':'01110100011000101110100011000101110','9':'01110100011000101111000010001001100',
+    'A':'01110100011000111111100011000110001','B':'11110100011000111110100011000111110',
+    'C':'01111100001000010000100001000001111','D':'11110100011000110001100011000111110',
+    'E':'11111100001000011110100001000011111','F':'11111100001000011110100001000010000',
+    'G':'01111100001000010111100011000101111','H':'10001100011000111111100011000110001',
+    'I':'01110001000010000100001000010001110','J':'00111000100001000010100101001001100',
+    'K':'10001100101010011000101001001010001','L':'10000100001000010000100001000011111',
+    'M':'10001110111010110101100011000110001','N':'10001110011010110011100011000110001',
+    'O':'01110100011000110001100011000101110','P':'11110100011000111110100001000010000',
+    'Q':'01110100011000110001101011001001101','R':'11110100011000111110101001001010001',
+    'S':'01111100001000001110000010000111110','T':'11111001000010000100001000010000100',
+    'U':'10001100011000110001100011000101110','V':'10001100011000110001100010101000100',
+    'W':'10001100011000110101101011101110001','X':'10001100010101000100010101000110001',
+    'Y':'10001100010101000100001000010000100','Z':'11111000010001000100010001000011111'
+  };
+
+  function readText(data, iw, ih, box) {
+    const x0 = Math.max(0, box.x + Math.round(box.w * 0.13)), x1 = Math.min(iw, box.x + box.w - Math.round(box.w * 0.13));
+    const y0 = Math.max(0, box.y + Math.round(box.h * 0.18)), y1 = Math.min(ih, box.y + box.h - Math.round(box.h * 0.18));
+    if (x1 - x0 < 12 || y1 - y0 < 12) return { text: '', textConf: 0 };
+    // Vordergrund ist die seltenere helle/dunkle Pixelgruppe; farbige Grundflächen werden ignoriert.
+    const lum = new Uint8Array((x1-x0)*(y1-y0)); let bright=0;
+    for(let y=y0;y<y1;y++) for(let x=x0;x<x1;x++) { const p=(y*iw+x)*4, l=.299*data[p]+.587*data[p+1]+.114*data[p+2]; lum[(y-y0)*(x1-x0)+x-x0]=l; if(l>150) bright++; }
+    const threshold=bright < lum.length*.5 ? 150 : 95, mask=new Uint8Array(lum.length);
+    for(let i=0;i<lum.length;i++) mask[i]=bright < lum.length*.5 ? +(lum[i]>threshold) : +(lum[i]<threshold);
+    const ww=x1-x0, hh=y1-y0, seen=new Uint8Array(mask.length), glyphs=[];
+    for(let i=0;i<mask.length;i++) if(mask[i]&&!seen[i]) {
+      const q=[i]; seen[i]=1; let minx=ww,maxx=0,miny=hh,maxy=0;
+      for(let j=0;j<q.length;j++){const p=q[j],x=p%ww,y=(p/ww)|0; minx=Math.min(minx,x);maxx=Math.max(maxx,x);miny=Math.min(miny,y);maxy=Math.max(maxy,y);
+        for(const n of [x? p-1:-1,x<ww-1?p+1:-1,y?p-ww:-1,y<hh-1?p+ww:-1]) if(n>=0&&mask[n]&&!seen[n]){seen[n]=1;q.push(n);}}
+      if(q.length>=3 && maxy-miny>=Math.max(5,hh*.18)) glyphs.push({minx,maxx,miny,maxy});
+    }
+    glyphs.sort((a,b)=>a.minx-b.minx); if(glyphs.length>18) return {text:'',textConf:0};
+    let out='', scores=[];
+    for(const g of glyphs){const gw=g.maxx-g.minx+1, gh=g.maxy-g.miny+1; let best='?', bs=0;
+      for(const [ch,pat] of Object.entries(GLYPHS)){let hit=0,total=35;
+        for(let yy=0;yy<7;yy++)for(let xx=0;xx<5;xx++){const sx=g.minx+Math.min(gw-1,Math.floor((xx+.5)*gw/5)),sy=g.miny+Math.min(gh-1,Math.floor((yy+.5)*gh/7)); if(mask[sy*ww+sx]===+(pat[yy*5+xx]==='1'))hit++;}
+        const score=hit/total;if(score>bs){bs=score;best=ch;}}
+      if(bs>=.56){out+=best;scores.push(bs);} else if(out) out+=' ';
+    }
+    out=out.trim(); return {text:out,textConf:scores.length?scores.reduce((a,b)=>a+b,0)/scores.length:0};
   }
 
   /** Sicherheit 0..1: wie nah liegt die gemessene Füllung am Idealwert der Form? */
@@ -188,7 +246,7 @@
       if (!s) continue;
       const shape = shapeOf(s, c.w / c.h, cfg);
       const label = shape && labelOf(c.color, shape, s.fill, cfg);
-      if (label) detections.push({ label, shape, x: c.x, y: c.y, w: c.w, h: c.h, conf: confidence(shape, s.solidity) });
+      if (label) detections.push(Object.assign({ label, shape, x: c.x, y: c.y, w: c.w, h: c.h, conf: confidence(shape, s.solidity) }, readText(data,w,h,c)));
     }
     detections = mergeOverlaps(detections, cfg);
     detections.sort((a, b) => b.w * b.h - a.w * a.h || b.conf - a.conf);   // größte Schilder zuerst
@@ -268,7 +326,7 @@
     };
   }
 
-  const api = { CONFIG, SIGNS, detect, createTracker, mergeOverlaps, shapeOf, RED, BLUE, YELLOW };
+  const api = { CONFIG, SIGNS, detect, createTracker, mergeOverlaps, shapeOf, RED, BLUE, YELLOW, GREEN, readText };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.SignDetector = api;
 })(typeof window !== 'undefined' ? window : globalThis);

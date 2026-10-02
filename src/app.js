@@ -78,7 +78,7 @@
     list.innerHTML = items.length
       ? items.map(g => { const s = D.SIGNS[g.label];
           return `<li style="--c:${s.hex}"><b>${s.name}</b><span>${s.zeichen}${g.n > 1 ? ' · ' + g.n + '×' : ''}</span>`
-            + `<span class="conf">${Math.round(g.conf * 100)} %</span><p>${s.note}</p></li>`; }).join('')
+          + `<span class="conf">${Math.round(g.conf * 100)} %</span><p>${s.note}</p></li>`; }).join('')
       : '<li class="leer">Noch kein Schild erkannt. Halte ein Schild ruhig und frontal ins Bild.</li>';
   }
 
@@ -108,11 +108,11 @@
     ctx.font = '600 15px Bahnschrift, "DIN Alternate", system-ui, sans-serif';
     for (const t of current) {
       const s = D.SIGNS[t.label], x = t.x * k, y = t.y * k, w = t.w * k, h = t.h * k;
-      const txt = s.name + ' ' + Math.round(t.conf * 100) + ' %', tw = ctx.measureText(txt).width + 10;
+      const txt = s.name + (t.text ? ' · ' + t.text : '') + ' ' + Math.round(t.conf * 100) + ' %', tw = Math.min(view.width - x, ctx.measureText(txt).width + 10);
       const ty = y > 22 ? y - 22 : y + h + 2;
       ctx.strokeStyle = s.hex; ctx.strokeRect(x, y, w, h);
       ctx.fillStyle = s.hex; ctx.fillRect(x, ty, tw, 20);
-      ctx.fillStyle = s.text; ctx.fillText(txt, x + 5, ty + 3);
+      ctx.fillStyle = s.text; ctx.fillText(txt, x + 5, ty + 3, Math.max(0, tw - 10));
     }
   }
 
