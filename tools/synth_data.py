@@ -204,20 +204,150 @@ def add_occluder(img: np.ndarray, rng: random.Random) -> tuple[np.ndarray, list[
     return a, ["verdeckt"]
 
 
+def place_sign(img: Image.Image, name: str, rng: random.Random, side: int,
+               center: tuple[float, float] | None = None,
+               tags: list[str] | None = None) -> dict | None:
+    """Eine Schildkachel einpassen und die Box dazu zurueckgeben (None = nichts sichtbar).
+
+    Gemeinsam genutzt von compose_sample (wenige, grosse Schilder) und screen_panel (viele,
+    kleine). Die Boxrechnung darf nur an EINER Stelle stehen - sonst driften Bild und Label
+    auseinander, sobald eine der beiden Szenen angepasst wird.
+    """
+    w_img, h_img = img.size
+    side = max(10, int(side))
+    t = sign_patch(name).resize((side, side), Image.LANCZOS)
+    angle = roll_angle(rng, name)
+    t = t.rotate(angle, resample=Image.BICUBIC, expand=True)
+    if tags is not None and abs(angle) >= 20:
+        tags.append("roll")          # Roll-Verdrehung: Bruchstelle der Heuristik
+    fg = np.asarray(t)[..., 3] > 40
+    if not fg.any():
+        return None
+    ys, xs = np.nonzero(fg)
+    bh, bw = int(ys.max() - ys.min() + 1), int(xs.max() - xs.min() + 1)
+    if bw >= w_img or bh >= h_img:
+        return None
+    if center is None:
+        px, py = rng.randrange(w_img - bw), rng.randrange(h_img - bh)
+    else:
+        px = min(max(0, int(round(center[0] - (xs.min() + bw / 2)))), w_img - bw)
+        py = min(max(0, int(round(center[1] - (ys.min() + bh / 2)))), h_img - bh)
+    img.paste(t, (px, py), t)
+    return {"label": name, "cx": (px + xs.min() + bw / 2) / w_img,
+            "cy": (py + ys.min() + bh / 2) / h_img, "w": bw / w_img, "h": bh / h_img}
+
+
+def screen_artifacts(arr: np.ndarray, rng: random.Random) -> tuple[np.ndarray, list[str]]:
+    """Artefakte einer abfotografierten Anzeige: Moire, Gammaschlag, Kanalversatz, Wackeln.
+
+    Gemessen (data/_test_bilder.py): ein Foto eines Schilderposters ergab NULL Treffer und
+    ein Foto eines Monitors Fehlalarme mit Boxen von halber Bildgroesse. Beide Eingaben
+    sahen im Training nie so aus - Moire und Anzeigen-Gamma kannte das Netz nicht.
+    """
+    a = np.asarray(arr, dtype=np.float32)
+    h, w = a.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    tags: list[str] = []
+    if rng.random() < 0.75:                            # Moire: zwei ueberlagerte Gitter
+        p = rng.uniform(2.5, 9.0)
+        for _ in range(2):
+            th = rng.uniform(0, math.pi)
+            wave = 0.5 + 0.5 * np.sin(2 * math.pi * (xx * np.cos(th) + yy * np.sin(th)) / p
+                                      + rng.uniform(0, 6.283))
+            a = a * (1.0 - rng.uniform(0.06, 0.22) * wave[..., None])
+        tags.append("moire")
+    if rng.random() < 0.5:                             # Gammaschlag der Anzeige
+        a = 255.0 * np.power(np.clip(a, 0, 255) / 255.0, rng.uniform(0.75, 1.35))
+        tags.append("gammaschlag")
+    if rng.random() < 0.4:                             # Farbkanal-Versatz (Subpixel)
+        sh = rng.randrange(1, 3)
+        a[..., 0] = np.roll(a[..., 0], sh, axis=1)
+        a[..., 2] = np.roll(a[..., 2], -sh, axis=1)
+    if rng.random() < 0.5:                             # Wackler / Fokus daneben
+        r = rng.uniform(0.4, 1.3)
+        a = np.asarray(Image.fromarray(np.clip(a, 0, 255).astype(np.uint8))
+                       .filter(ImageFilter.GaussianBlur(r))).astype(np.float32)
+        tags.append("unschaerfe")
+    if rng.random() < 0.35:                            # Vignette (Kamera auf Anzeige)
+        rad = np.hypot(xx - w / 2.0, yy - h / 2.0) / (0.5 * math.hypot(w, h))
+        a = a * (1.0 - 0.4 * np.clip(rad, 0, 1)[..., None] ** 2)
+    return np.clip(a, 0, 255).astype(np.uint8), tags
+
+
+def screen_panel(rng: random.Random, size: int = 320, labels: list[str] | None = None,
+                 degrade_prob: float = 0.8, occlude_prob: float = 0.1,
+                 ) -> tuple[np.ndarray, list[dict], list[str]]:
+    """Schildertafel / abfotografierter Bildschirm: viele kleine Schilder auf heller Flaeche.
+
+    Warum diese Szene: ein Poster mit rund 80 Schildern ergab im Test NULL Treffer, weil das
+    Training nur ein bis drei grosse Schilder je Bild kannte (GTSRB-Ausschnitte, 11-192 px,
+    immer scharf und freigestellt). Hier stehen 6 bis 30 Schilder in einem Raster mit etwa
+    15 bis 70 px Kantenlaenge - mit den Anzeige-Artefakten ist das die Bruecke zwischen
+    "scharfer Ausschnitt" und "abfotografierte Tafel".
+    """
+    pool = labels or SIGN_LABELS
+    canvas = Image.fromarray(random_background(rng, size))
+    rand = int(rng.uniform(0.02, 0.2) * size)
+    grau = int(rng.uniform(185, 252))
+    ton = rng.choice([(1.0, 1.0, 0.96), (0.96, 1.0, 1.0), (1.0, 0.98, 0.92)])
+    d = ImageDraw.Draw(canvas)
+    x0, y0 = rand, rand
+    x1 = size - int(rng.uniform(0, rand + 1))
+    y1 = size - int(rng.uniform(0, rand + 1))
+    d.rectangle([x0, y0, x1, y1], fill=tuple(int(grau * f) for f in ton))
+    cols, rows = rng.randrange(3, 8), rng.randrange(2, 6)
+    cw, ch = (x1 - x0) / cols, (y1 - y0) / rows
+    boxes: list[dict] = []
+    tags: list[str] = []
+    for r in range(rows):
+        for c in range(cols):
+            if rng.random() < 0.15:                     # Luecke im Raster
+                continue
+            side = int(min(cw, ch) * rng.uniform(0.5, 0.95))
+            b = place_sign(canvas, rng.choice(pool), rng, side, tags=tags, center=(
+                x0 + (c + 0.5) * cw + rng.uniform(-0.1, 0.1) * cw,
+                y0 + (r + 0.5) * ch + rng.uniform(-0.1, 0.1) * ch))
+            if b:
+                boxes.append(b)
+    if len(boxes) < 3:                                  # zu wenig sichtbar -> normale Szene
+        return compose_sample(rng, size, labels=labels, degrade_prob=degrade_prob,
+                              occlude_prob=occlude_prob, scene_prob=0.0)
+    arr = np.asarray(canvas)[..., :3].copy()
+    arr, t2 = screen_artifacts(arr, rng)
+    tags += t2
+    tags.append("tafel")
+    tags.append("mehrere" if len(boxes) >= 4 else "wenige")
+    if min(min(b["w"], b["h"]) for b in boxes) * size < 34:
+        tags.append("klein")
+    if rng.random() < degrade_prob:
+        arr, t2 = degrade(arr, rng)
+        tags += t2
+    if rng.random() < occlude_prob:
+        arr, t2 = add_occluder(arr, rng)
+        tags += t2
+    return arr, boxes, sorted(set(tags))
+
+
 # Stoerer, die KEINE Schilder sind, aber wie welche aussehen. Die gemessenen Fehlalarme
 # des Netzes entstehen auf rot/rund/leuchtend - ohne solche Bilder kennt es sie nicht.
 HARD_KINDS = ("rueckleuchten", "ampel", "bake", "werbung", "rueckseite", "flagge",
-              "pfeiltafel", "kreise")
+              "pfeiltafel", "kreise", "bildschirm", "tastatur")
+
+# Arten, die eine abfotografierte Anzeige nachbilden - dort kommen die Anzeige-Artefakte
+# (Moire, Gammaschlag) dazu.
+SCREEN_KINDS = ("bildschirm", "tastatur")
 
 
-def hard_negative_sample(rng: random.Random, size: int, degrade_prob: float = 0.6
-                         ) -> tuple[np.ndarray, list[str]]:
+def hard_negative_sample(rng: random.Random, size: int, degrade_prob: float = 0.6,
+                         kind: str | None = None) -> tuple[np.ndarray, list[str]]:
     """Ein Bild OHNE Schild, aber mit schildaehnlichem Stoerer (leeres Label).
 
     Beispiele: Rueckleuchten, Ampel, Baustellenbake, Leuchtreklame, graue Schildrueckseite,
-    rote Flagge (Wimpel/Dreieck), gelbe Richtungstafel, farbige Kreise.
+    rote Flagge (Wimpel/Dreieck), gelbe Richtungstafel, farbige Kreise, Bildschirm, Tastatur.
+    `kind` macht die Art waehlbar - fuer Messungen an einer einzelnen Art (data/_check_synth.py)
+    und damit die Sichtpruefung zeigt, was sie behauptet.
     """
-    kind = rng.choice(HARD_KINDS)
+    kind = kind or rng.choice(HARD_KINDS)
     layer = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(layer)
 
@@ -288,7 +418,38 @@ def hard_negative_sample(rng: random.Random, size: int, degrade_prob: float = 0.
                fill=(30, 30, 30), width=max(3, h // 6))
         d.polygon([(x + w - w // 8, y + h // 2 - h // 4), (x + w - w // 12, y + h // 2),
                    (x + w - w // 8, y + h // 2 + h // 4)], fill=(30, 30, 30))
-    else:                                             # Kreise in Schildfarben (Baelle, Lichter)
+    elif kind == "bildschirm":                        # Anzeige: dunkles UI mit hellen Flaechen
+        # Gemessen mit Test/Nothing.jpg: das Netz baute auf einem Monitorfoto Fehlalarme mit
+        # Boxen von halber Bildgroesse. Genau diese Struktur (dunkler Grund, helle Textzeilen,
+        # Fensterflaechen) fehlte im Training.
+        rect(0, 0, size, size, tuple(int(rng.uniform(16, 46)) for _ in range(3)))
+        for _ in range(rng.randrange(3, 7)):
+            w, h = rng.randrange(size // 4, int(size * 0.9)), rng.randrange(size // 20, size // 6)
+            x, y = place(w, h)
+            rect(x, y, w, h, tuple(int(rng.uniform(28, 74)) for _ in range(3)), rad=3)
+        for _ in range(rng.randrange(6, 16)):
+            w, h = rng.randrange(size // 12, size // 3), max(2, rng.randrange(2, 6))
+            x, y = place(w, h)
+            rect(x, y, w, h, rng.choice([(205, 212, 218), (150, 200, 120), (90, 160, 230),
+                                         (225, 130, 90), (240, 240, 235)]))
+        if rng.random() < 0.6:                        # Leuchtfleck (Anzeige/Deckenlicht)
+            w, h = rng.randrange(size // 5, size // 2), rng.randrange(size // 5, size // 2)
+            x, y = place(w, h)
+            circle(x + w // 2, y + h // 2, w // 2, rng.choice([(235, 200, 150), (120, 190, 235),
+                                                               (235, 235, 225)]))
+    elif kind == "tastatur":                          # Tastatur: Raster dunkler Tasten
+        rect(0, 0, size, size, rng.choice([(28, 28, 30), (66, 62, 58), (40, 40, 46)]))
+        cols, rows = rng.randrange(6, 13), rng.randrange(3, 6)
+        cw, ch = size / cols, size / rows
+        for r in range(rows):
+            for c in range(cols):
+                if rng.random() < 0.08:
+                    continue
+                w, h = cw * 0.84, ch * 0.72
+                rect(c * cw + cw * 0.08, r * ch + ch * 0.12, w, h,
+                     tuple(int(rng.uniform(24, 78)) for _ in range(3)),
+                     rad=max(2, int(min(w, h) * 0.2)))
+    elif kind == "kreise":                            # Kreise in Schildfarben (Baelle, Lichter)
         for _ in range(rng.randrange(2, 6)):
             r = max(3, rng.randrange(max(4, size // 14), max(6, size // 6)))
             x, y = place(2 * r, 2 * r)
@@ -302,6 +463,10 @@ def hard_negative_sample(rng: random.Random, size: int, degrade_prob: float = 0.
     canvas.alpha_composite(layer)
     arr = np.asarray(canvas.convert("RGB")).copy()
     tags = ["negativ", "hart:" + kind]
+    if kind in SCREEN_KINDS and rng.random() < 0.65:
+        # Eine Anzeige/Tastatur wird meist mit dem Handy abfotografiert -> Moire dazu.
+        arr, t2 = screen_artifacts(arr, rng)
+        tags += t2
     if rng.random() < degrade_prob:
         arr, t2 = degrade(arr, rng)
         tags += t2
@@ -331,35 +496,31 @@ def compose_negative(rng: random.Random, size: int = 320, hard_prob: float = 0.4
 
 def compose_sample(rng: random.Random, size: int = 320, n_signs: int | None = None,
                    degrade_prob: float = 0.75, occlude_prob: float = 0.25,
-                   labels: list[str] | None = None):
+                   labels: list[str] | None = None, scene_prob: float = 0.35):
     """Ein Trainingsbild bauen: Schild(er) auf Hintergrund + Verschlechterungen.
 
     labels beschraenkt die Auswahl (z.B. auf Typen, die im echten Datensatz fehlen - siehe
     tools/synth_missing.py); ohne Angabe wird aus allen neun Typen gezogen.
+
+    scene_prob: Anteil der Bilder als Schildertafel/Anzeige (screen_panel) - viele kleine
+    Schilder statt ein bis drei grosser. Gemessen war das der Fall, an dem ein echtes
+    Posterfoto komplett scheiterte (data/_test_bilder.py).
     """
+    if scene_prob > 0 and rng.random() < scene_prob:
+        arr, boxes, tags = screen_panel(rng, size, labels=labels, degrade_prob=degrade_prob,
+                                        occlude_prob=occlude_prob)
+        if boxes:                      # Rueckfall von screen_panel liefert schon Boxen
+            return arr, boxes, tags
     pool = labels or SIGN_LABELS
     n = n_signs if n_signs is not None else rng.choice([1, 1, 1, 2, 3])
     names = rng.sample(pool, min(n, len(pool)))
     img = Image.fromarray(random_background(rng, size))
     boxes, tags = [], []
     for name in names:
-        tile = sign_patch(name)
         scale = rng.uniform(0.14, 0.75) if rng.random() < 0.75 else rng.uniform(0.07, 0.16)
-        side = max(12, int(size * scale))
-        t = tile.resize((side, side), Image.LANCZOS)
-        angle = roll_angle(rng, name)
-        t = t.rotate(angle, resample=Image.BICUBIC, expand=True)
-        if abs(angle) >= 20:
-            tags.append("roll")          # Roll-Verdrehung: Bruchstelle der Heuristik
-        fg = np.asarray(t)[..., 3] > 40
-        if not fg.any():
-            continue
-        ys, xs = np.nonzero(fg)
-        bh, bw = int(ys.max() - ys.min() + 1), int(xs.max() - xs.min() + 1)
-        px, py = rng.randrange(max(1, size - bw)), rng.randrange(max(1, size - bh))
-        img.paste(t, (px, py), t)
-        boxes.append({"label": name, "cx": (px + xs.min() + bw / 2) / size,
-                      "cy": (py + ys.min() + bh / 2) / size, "w": bw / size, "h": bh / size})
+        b = place_sign(img, name, rng, int(max(12, size * scale)), tags=tags)
+        if b:
+            boxes.append(b)
     arr = np.asarray(img)[..., :3].copy()
     if rng.random() < degrade_prob:
         arr, t2 = degrade(arr, rng)

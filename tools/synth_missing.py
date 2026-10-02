@@ -45,6 +45,8 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--degrade", type=float, default=0.85)
     ap.add_argument("--occlude", type=float, default=0.3)
+    ap.add_argument("--scene-prob", type=float, default=0.4,
+                    help="Anteil Schildertafel/Anzeige (viele kleine Schilder, Anzeige-Artefakte)")
     args = ap.parse_args()
 
     fehlend = missing_labels()
@@ -58,7 +60,8 @@ def main() -> None:
     entries = []
     for i in range(args.n):
         arr, boxes, tags = sd.compose_sample(rng, args.size, degrade_prob=args.degrade,
-                                            occlude_prob=args.occlude, labels=fehlend)
+                                            occlude_prob=args.occlude, labels=fehlend,
+                                            scene_prob=args.scene_prob)
         stem = f"{args.split}_m{i:06d}"
         Image.fromarray(arr).save(out / "images" / f"{stem}.jpg", quality=86)
         (out / "labels" / f"{stem}.txt").write_text("\n".join(

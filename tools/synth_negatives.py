@@ -10,7 +10,13 @@ Zwei Sorten, beide aus derselben Hintergrundverteilung wie die Positivbilder
 (tools/synth_data.py), damit das Netz nicht "Hintergrund" statt "Schild" lernt:
   * leer  - nur Hintergrund (Asphalt, Himmel, Wand, Gruen, Nacht, Stoererflaeche)
   * hart  - schildaehnliche Stoerer: Rueckleuchten, Ampel, Baustelle, Leuchtreklame,
-            graue Schildrueckseite, rote Flagge, gelbe Richtungstafel, farbige Kreise
+            graue Schildrueckseite, rote Flagge, gelbe Richtungstafel, farbige Kreise,
+            Bildschirm (dunkles UI mit hellen Textzeilen), Tastatur (Tastenraster)
+
+Warum Bildschirm und Tastatur dazu kamen: gemessen mit data/_test_bilder.py erzeugte ein
+echtes Monitorfoto (Test/Nothing.jpg) Fehlalarme mit Boxen von halber Bildgroesse - die
+Struktur "dunkler Grund + helle Zeilen/Fenster" kannte das Netz nicht. Synthetische
+Negative bleiben trotzdem nur die halbe Miete: echte Fotos liefert tools/real_negatives.py.
 
 Die Bilder landen in einen BESTEHENDEN Datensatzordner (images/, labels/, manifest.json).
 Wiederholte Aufrufe ersetzen die zuvor von diesem Skript erzeugten Eintraege.
