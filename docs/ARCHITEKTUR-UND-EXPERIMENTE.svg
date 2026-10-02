@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="2700" viewBox="0 0 1800 2700" role="img" aria-labelledby="title desc">
+  <title id="title">Schilder-Scanner: Modellarchitektur, Trainingsdaten und Experimentplan</title>
+  <desc id="desc">Technische Übersicht des einstufigen HybridNano-Detektors: Trainingspipeline, CNN-Backbone, vierstufige Fusion, Transformer, getrennter Box- und Klassenkopf, Dekodierung, ONNX-Browserpfad und geplante Qualitäts- und Latenzexperimente.</desc>
+  <defs>
+    <style>
+      text{font-family:Inter,Segoe UI,Arial,sans-serif;fill:#202b36} .title{font-size:48px;font-weight:750}.sub{font-size:23px;fill:#526170}
+      .h{font-size:30px;font-weight:700}.sh{font-size:22px;font-weight:700}.body{font-size:19px}.small{font-size:16px}.tiny{font-size:14px}
+      .panel{fill:#fff;stroke:#cbd5df;stroke-width:2}.soft{fill:#f4f7fa;stroke:#b9c6d2;stroke-width:2}.blue{fill:#e8f2ff;stroke:#4383c4;stroke-width:2}
+      .green{fill:#e8f6ef;stroke:#45966c;stroke-width:2}.amber{fill:#fff3dc;stroke:#cb8a1a;stroke-width:2}.purple{fill:#f1eaff;stroke:#8862bd;stroke-width:2}
+      .red{fill:#fff0ee;stroke:#cf6a5b;stroke-width:2}.dark{fill:#263746;stroke:#263746;stroke-width:2}.lightText{fill:#fff}
+      .line{stroke:#586a79;stroke-width:3;fill:none;marker-end:url(#arrow)}.dash{stroke-dasharray:9 8}.rule{stroke:#d7dfe6;stroke-width:2}
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#586a79"/></marker>
+  </defs>
+  <rect width="1800" height="2700" fill="#edf1f4"/>
+  <text x="70" y="82" class="title">Schilder-Scanner · Architektur &amp; Studien</text>
+  <text x="72" y="122" class="sub">HybridNano · neun Schildtypen · Box und Klasse in einem Vorwärtslauf · Stand: Code plus Kaggle-Retry</text>
+
+  <!-- 1 data and training -->
+  <rect x="55" y="160" width="1690" height="405" rx="22" class="panel"/>
+  <text x="90" y="210" class="h">1 · Daten und Trainingspfad</text>
+  <rect x="90" y="245" width="355" height="120" rx="14" class="blue"/>
+  <text x="112" y="280" class="sh">GTSRB · echte Schilder</text><text x="112" y="313" class="body">20.000 Kompositionen, 9 Typen</text><text x="112" y="341" class="small">Ausgeschnitten, auf Szenenhintergründe gesetzt</text>
+  <rect x="470" y="245" width="355" height="120" rx="14" class="purple"/>
+  <text x="492" y="280" class="sh">Synthetische Ergänzungen</text><text x="492" y="313" class="body">3.000 Schildertafeln + 3.000 Negative</text><text x="492" y="341" class="small">Moiré, Beleuchtung, Unschärfe, Verdeckung</text>
+  <rect x="850" y="245" width="355" height="120" rx="14" class="amber"/>
+  <text x="872" y="280" class="sh">Echte Negativfotos</text><text x="872" y="313" class="body">3.600 Training · COCO + Nutzerfoto</text><text x="872" y="341" class="small">Hard negatives ohne Schildbeschriftung</text>
+  <rect x="1230" y="245" width="470" height="120" rx="14" class="green"/>
+  <text x="1252" y="280" class="sh">Training · 29.600 Bilder</text><text x="1252" y="313" class="body">Balanced, 320 px, 150 × 16 Bilder/Epoche</text><text x="1252" y="341" class="small">Zufällige Degradierung + Zoom 0,7–1,5</text>
+  <path d="M445 305H465 M825 305H845 M1205 305H1225" class="line"/>
+  <rect x="90" y="405" width="715" height="112" rx="14" class="soft"/>
+  <text x="112" y="440" class="sh">Validierung · 2.000 Bilder</text><text x="112" y="472" class="body">1.800 GTSRB-Testbilder + 200 synthetische fehlende Typen</text><text x="112" y="498" class="small">Vergleich mit früheren Läufen nur bei gleichem Split, Maßstab und Konfidenzschwelle</text>
+  <rect x="840" y="405" width="860" height="112" rx="14" class="red"/>
+  <text x="862" y="440" class="sh">Negativprüfung · 1.100 Bilder</text><text x="862" y="472" class="body">500 synthetische + 600 echte Fotos ohne Schild</text><text x="862" y="498" class="small">Wichtig für Fehlalarme; ein zusätzliches, unabhängiges Straßenset fehlt noch</text>
+
+  <!-- 2 network -->
+  <rect x="55" y="590" width="1690" height="960" rx="22" class="panel"/>
+  <text x="90" y="642" class="h">2 · HybridNano · vom Pixel zu vier Detektionsskalen</text>
+  <text x="92" y="679" class="sub">Ausgelieferter Balanced-Stand: etwa 1,30 Mio. Parameter · 878 MFLOPs bei 320 × 320 · vier Ausgänge</text>
+  <rect x="90" y="725" width="190" height="90" rx="13" class="dark"/><text x="117" y="762" class="sh lightText">RGB-Eingang</text><text x="126" y="791" class="body lightText">1 × 3 × 320²</text>
+  <rect x="325" y="725" width="190" height="90" rx="13" class="soft"/><text x="380" y="762" class="sh">Stem</text><text x="359" y="791" class="body">3×3 Conv · /2</text>
+  <path d="M280 770H320 M515 770H550" class="line"/>
+  <rect x="560" y="710" width="1060" height="360" rx="18" fill="#f8fafb" stroke="#d5dde5" stroke-width="2"/>
+  <text x="585" y="748" class="sh">CNN-Backbone · Inverted Residual / MobileNet-Stil</text>
+  <rect x="590" y="785" width="215" height="125" rx="14" class="blue"/><text x="610" y="820" class="sh">p2 · stride 4</text><text x="610" y="852" class="body">32 Kanäle · 80 × 80</text><text x="610" y="883" class="small">1 IR-Block · Detail / kleine Schilder</text>
+  <rect x="840" y="785" width="215" height="125" rx="14" class="blue"/><text x="860" y="820" class="sh">p3 · stride 8</text><text x="860" y="852" class="body">64 Kanäle · 40 × 40</text><text x="860" y="883" class="small">2 IR-Blöcke</text>
+  <rect x="1090" y="785" width="215" height="125" rx="14" class="blue"/><text x="1110" y="820" class="sh">p4 · stride 16</text><text x="1110" y="852" class="body">128 Kanäle · 20 × 20</text><text x="1110" y="883" class="small">2 IR-Blöcke</text>
+  <rect x="1340" y="785" width="245" height="125" rx="14" class="blue"/><text x="1360" y="820" class="sh">p5 · stride 32</text><text x="1360" y="852" class="body">256 Kanäle · 10 × 10</text><text x="1360" y="883" class="small">2 IR-Blöcke</text>
+  <path d="M805 847H835 M1055 847H1085 M1305 847H1335" class="line"/>
+  <path d="M1200 920V957" class="line"/>
+  <rect x="590" y="965" width="490" height="78" rx="13" class="purple"/><text x="615" y="998" class="sh">Optionaler Kontextblock · p5 global</text><text x="615" y="1028" class="small">Self-attention auf 100 Tokens · globaler Bildkontext</text>
+  <rect x="1100" y="965" width="485" height="78" rx="13" class="purple"/><text x="1125" y="998" class="sh">Quality-Variante: p4 windowed</text><text x="1125" y="1028" class="small">Zusätzlicher Kontext auf 20×20 in lokalen Fenstern</text>
+  <text x="592" y="1060" class="tiny">Aktueller Balanced-Lauf: p5 global; kein p4-Attention-Block. Quality-Preset ist ein Experiment, keine belegte Verbesserung.</text>
+
+  <text x="100" y="1125" class="sh">FPN-lite · grob → fein (laterale 1×1-Projektion, Nearest-Upsample, Addition, 3×3-Fusion)</text>
+  <rect x="135" y="1160" width="270" height="78" rx="13" class="green"/><text x="170" y="1194" class="sh">p5 · Kontext</text><text x="170" y="1222" class="small">Ausgang stride 32</text>
+  <rect x="500" y="1160" width="270" height="78" rx="13" class="green"/><text x="535" y="1194" class="sh">p4 + up(p5)</text><text x="535" y="1222" class="small">Fusion stride 16</text>
+  <rect x="865" y="1160" width="270" height="78" rx="13" class="green"/><text x="900" y="1194" class="sh">p3 + up(p4)</text><text x="900" y="1222" class="small">Fusion stride 8</text>
+  <rect x="1230" y="1160" width="270" height="78" rx="13" class="green"/><text x="1265" y="1194" class="sh">p2 + up(p3)</text><text x="1265" y="1222" class="small">Fusion stride 4</text>
+  <path d="M405 1199H495 M770 1199H860 M1135 1199H1225" class="line"/>
+  <path d="M270 1245V1290 M635 1245V1290 M1000 1245V1290 M1365 1245V1290" class="line"/>
+  <rect x="110" y="1300" width="320" height="105" rx="14" class="amber"/><text x="132" y="1337" class="sh">Kopf · stride 4</text><text x="132" y="1368" class="body">80×80 Zellen · kleine Objekte</text><text x="132" y="1392" class="small">bis 16 px Seitenlänge zugeordnet</text>
+  <rect x="475" y="1300" width="320" height="105" rx="14" class="amber"/><text x="497" y="1337" class="sh">Kopf · stride 8</text><text x="497" y="1368" class="body">40×40 Zellen</text><text x="497" y="1392" class="small">bis 40 px Seitenlänge</text>
+  <rect x="840" y="1300" width="320" height="105" rx="14" class="amber"/><text x="862" y="1337" class="sh">Kopf · stride 16</text><text x="862" y="1368" class="body">20×20 Zellen</text><text x="862" y="1392" class="small">bis 96 px Seitenlänge</text>
+  <rect x="1205" y="1300" width="320" height="105" rx="14" class="amber"/><text x="1227" y="1337" class="sh">Kopf · stride 32</text><text x="1227" y="1368" class="body">10×10 Zellen</text><text x="1227" y="1392" class="small">größere Objekte</text>
+  <rect x="1555" y="1300" width="150" height="105" rx="14" class="soft"/><text x="1572" y="1337" class="sh">Kopf</text><text x="1572" y="1368" class="small">4 + 8 + 16</text><text x="1572" y="1392" class="small">× 14 Werte</text>
+  <path d="M430 1352H470 M795 1352H835 M1160 1352H1200 M1525 1352H1550" class="line"/>
+  <text x="110" y="1460" class="body">Jeder Kopf: Depthwise-3×3 + 1×1-Stamm → getrennte Zweige: 5 Box/Objectness-Kanäle und 9 Klassenkanäle</text>
+  <text x="110" y="1493" class="small">Getrennte Aufgaben reduzieren Konkurrenz zwischen Lokalisierung und Klassifikation; die vierte Skala hilft kleinen Schildern.</text>
+
+  <!-- 3 output and inference -->
+  <rect x="55" y="1575" width="1690" height="400" rx="22" class="panel"/>
+  <text x="90" y="1628" class="h">3 · Ausgabe, Training und Browser-Inferenz</text>
+  <rect x="90" y="1670" width="480" height="125" rx="14" class="amber"/>
+  <text x="115" y="1708" class="sh">14 Werte je Rasterzelle</text><text x="115" y="1740" class="body">tx, ty, tw, th · obj · 9 Klassen</text><text x="115" y="1771" class="small">Focal Objectness · CE + Label-Smoothing · L1-Box</text>
+  <rect x="630" y="1670" width="500" height="125" rx="14" class="soft"/>
+  <text x="655" y="1708" class="sh">Dekodierung und NMS</text><text x="655" y="1740" class="body">sigmoid(obj) × max(sigmoid(cls))</text><text x="655" y="1771" class="small">Box-Decoding je stride · klassenweise NMS · conf 0,25</text>
+  <rect x="1190" y="1670" width="510" height="125" rx="14" class="green"/>
+  <text x="1215" y="1708" class="sh">PyTorch → dynamisches ONNX → Web</text><text x="1215" y="1740" class="body">ONNX Runtime Web · WebGPU → WASM</text><text x="1215" y="1771" class="small">RGB-Canvas · Letterbox · Tensor · Ergebnis zurück aufs Foto</text>
+  <path d="M570 1732H625 M1130 1732H1185" class="line"/>
+  <rect x="90" y="1830" width="1610" height="95" rx="14" class="blue"/>
+  <text x="115" y="1868" class="sh">Latenzhebel, bereits in der Oberfläche vorhanden</text><text x="115" y="1901" class="body">256 px: schnell · 320 px: Standard · Foto 384 px: genauer · 448 px: höchste Kosten. Rechenlast wächst ungefähr mit der Bildfläche.</text>
+  <text x="115" y="1952" class="small">Dokumentierte frühere Messung auf anderem Checkpoint: F1 0,796 / 0,837 / 0,854 bei 256 / 320 / 384 px. Auf dem neuen Modell erneut messen.</text>
+
+  <!-- 4 status -->
+  <rect x="55" y="2000" width="1690" height="205" rx="22" class="panel"/>
+  <text x="90" y="2050" class="h">4 · Was belegt ist und was noch offen ist</text>
+  <rect x="90" y="2080" width="760" height="92" rx="13" class="green"/>
+  <text x="112" y="2116" class="sh">Voriger Kaggle-Versuch · Training vollständig</text><text x="112" y="2147" class="body">320 px · 220×100 Schritte · P 0,932 · R 0,851 · F1 0,890</text><text x="112" y="2169" class="small">Checkpoint gespeichert; Lauf scheiterte erst am fehlenden onnxruntime beim Export.</text>
+  <rect x="885" y="2080" width="815" height="92" rx="13" class="red"/>
+  <text x="907" y="2116" class="sh">Retry · Kaggle-Status RUNNING (noch ohne Endmessung)</text><text x="907" y="2147" class="body">onnxruntime-Installationsschutz aktiv · 150 Schritte/Epoche</text><text x="907" y="2169" class="small">Qualitätsgewinn und Laufzeit erst nach Validierung behaupten.</text>
+
+  <!-- 5 experiments -->
+  <rect x="55" y="2230" width="1690" height="410" rx="22" class="panel"/>
+  <text x="90" y="2280" class="h">5 · Experimentplan · Qualität × Latenz</text>
+  <rect x="90" y="2310" width="500" height="275" rx="14" class="soft"/>
+  <text x="115" y="2348" class="sh">Ablationen · ein Faktor je Lauf</text>
+  <text x="115" y="2385" class="body">A · balanced 100 vs 150 Schritte</text><text x="115" y="2417" class="small">Gleicher Seed, Daten, 320 px, Checkpoint-Auswahl.</text>
+  <text x="115" y="2455" class="body">B · fast / balanced / quality</text><text x="115" y="2487" class="small">Gleiche Iterationszahl; Qualität gegen FLOPs/Params.</text>
+  <text x="115" y="2525" class="body">C · 320 vs 384 px</text><text x="115" y="2557" class="small">Recall kleiner Schilder gegen Gesamtlatenz.</text>
+  <rect x="620" y="2310" width="500" height="275" rx="14" class="blue"/>
+  <text x="645" y="2348" class="sh">Datenstudien · externe Validität</text>
+  <text x="645" y="2385" class="body">D · Hard-negative mining</text><text x="645" y="2417" class="small">Fehlalarme aus getrenntem Negativpool nachtrainieren.</text>
+  <text x="645" y="2455" class="body">E · echte Straßenszenen ergänzen</text><text x="645" y="2487" class="small">Kamera, Wetter, Distanz, Nacht; Split nach Szene.</text>
+  <text x="645" y="2525" class="body">F · synthetische Domäne abgleichen</text><text x="645" y="2557" class="small">Größe, Perspektive, Hintergrund und Kompression variieren.</text>
+  <rect x="1150" y="2310" width="550" height="275" rx="14" class="purple"/>
+  <text x="1175" y="2348" class="sh">Messprotokoll und Entscheidung</text>
+  <text x="1175" y="2385" class="body">Qualität: mAP50, F1, Recall je Größe/Klasse</text><text x="1175" y="2417" class="small">Zusätzlich FP/Bild auf Negativen und Kalibrierung.</text>
+  <text x="1175" y="2455" class="body">Tempo: End-to-End p50/p95 je Gerät</text><text x="1175" y="2487" class="small">Vorbereitung, Netz, Decode/NMS separat messen.</text>
+  <text x="1175" y="2525" class="body">Mindestens 3 Seeds; Mittelwert + Streuung</text><text x="1175" y="2557" class="small">Ein unabhängiger Straßentest bleibt unangetastet.</text>
+  <text x="90" y="2610" class="small">Vorschlag für Auswahl: Pareto-Front statt „bestes“ Einzelmodell. Freigabe nur bei besserem Qualitäts-Latenz-Paar ohne Negativ-FP-Regression.</text>
+</svg>

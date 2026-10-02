@@ -76,6 +76,13 @@ python tools/train_det.py --data synth --epochs 30 --steps 100 --batch 8
 python tools/export_onnx.py --ckpt models/signs-det.pt --int8 --calib-n 200
 ```
 
+> **Auf diesem Rechner rechnet Kaggle.** Die Windows-Anwendungssteuerung (*Smart App
+> Control*) blockiert hier die PyTorch-DLLs (`WinError 4551`), deshalb läuft der Trainingslauf
+> als Kaggle-Kernel: [`kaggle/README.md`](kaggle/README.md). Die Aufrufe sind dieselben wie
+> oben – der Kernel baut den Datensatz, trainiert, exportiert und wertet aus; die Ergebnisse
+> kommen mit `kaggle\run.ps1 -Step pull` und `-Step install` zurück nach `models/` und
+> `tests/fixtures/`.
+
 Danach liegen `models/signs-det.onnx`, `models/labels.json` und `models/manifest.json`
 bereit und die App nutzt den Modellpfad. Fehlen sie, läuft alles wie vorher (Heuristik) –
 das steht dann im Status unter dem Titel. int8 wird vom Qualitätstor **verworfen**
@@ -124,6 +131,7 @@ Zwei Dinge, die man beim Hosten kennen sollte:
 | `tests/model.test.js` | Test der Modell-Mathematik inkl. Gegenprobe gegen die Python-Seite |
 | `tests/fixtures/` | Fixture mit echten ONNX-Ausgaben für diese Gegenprobe |
 | `tools/` | Python-Werkzeuge: Modell, Training (`train_det.py`), Daten (`gtsrb_dataset.py`, `synth_data.py`, `synth_missing.py`), Auswertung (`eval_conditions.py`), Export, Doku-Hilfen (nicht ausgeliefert) |
+| `kaggle/` | Trainingslauf auf Kaggle (Datensatz bauen + trainieren + exportieren), siehe [`kaggle/README.md`](kaggle/README.md) – nötig, weil die Windows-Anwendungssteuerung PyTorch lokal blockiert |
 | `models/` | Zielort der Modell-Dateien (lokal erzeugt, nicht im Git) |
 | `docs/DOKUMENTATION.md` | Ausführliche Doku: Algorithmus, Schwellwerte, Grenzen, Erweiterungen |
 | `docs/TRAINING.md` | KI-Modus: Architektur, gemessene Kosten, Training, Export, Browser |

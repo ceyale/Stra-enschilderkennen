@@ -1,0 +1,18 @@
+{
+  "id": "raphbre/schilder-scanner-detektor-trainieren-gtsrb",
+  "title": "Schilder-Scanner: Detektor trainieren (GTSRB)",
+  "code_file": "train_kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_tpu": "false",
+  "enable_internet": "true",
+  "machine_shape": "",
+  "dataset_sources": [
+    "raphbre/schilder-det-raw"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

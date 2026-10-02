@@ -45,7 +45,12 @@ Die Schilder sind im 4096 px breiten Poster ~15 px groß → bei 320 px Eingang 
 
 ## 3. Nächste Schritte
 
-1. **Trainingslauf Block 5** (Rezept wie `data/train_signs4.ps1`, aber auf dem neuen
+0. **Training läuft auf Kaggle** (`kaggle/`, siehe [`kaggle/README.md`](kaggle/README.md)): der
+   Entwicklungsrechner kann nicht rechnen, weil die Windows-Anwendungssteuerung (Smart App
+   Control) die PyTorch-DLLs blockiert (`WinError 4551`). Der Kernel baut den Datensatz aus
+   den Rohdaten, trainiert, exportiert ONNX und misst – mit genau den Aufrufen aus
+   `docs/TRAINING.md` §4.3/§5. Rückweg der Ergebnisse: `kaggle\run.ps1 -Step pull -Step install`.
+1. **Trainingslauf Block 5** (Rezept wie `docs/TRAINING.md` §5, aber auf dem neuen
    Datensatz): 220 Epochen, ~1,3 h bei 29 600 Bildern.
    *Hinweis:* Der Vorabtest mit 600 Schritten (`data/_probe2.ps1`) zeigte val `tp=0` – das ist
    normal für so wenige Schritte (der Vorlauf hatte bei Epoche 9 R = 0,029) und **kein Urteil**.

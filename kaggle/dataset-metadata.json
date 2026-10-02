@@ -1,0 +1,10 @@
+{
+  "title": "Schilder-Scanner: Rohdaten fuer das Training",
+  "id": "raphbre/schilder-det-raw",
+  "licenses": [
+    {
+      "name": "other"
+    }
+  ],
+  "description": "Rohmaterial fuer das Training des Schilder-Detektors (Projekt Schilder-Scanner). Enthaelt: GTSRB Final Training Images / Final Test Images / Final Test GT (German Traffic Sign Recognition Benchmark, frei fuer Forschung, https://benchmark.ini.rub.de), coco128 (128 echte Fotos, CC BY 4.0, https://github.com/ultralytics/ultralytics) fuer echte Negative, ein eigenes Foto ohne Schild und den Werkzeugkasten des Projekts (tools/). Gebaut von kaggle/run.ps1 -Step stage."
+}

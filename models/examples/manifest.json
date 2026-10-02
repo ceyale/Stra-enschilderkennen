@@ -1,0 +1,73 @@
+{
+  "arch": {
+    "width": [
+      32,
+      64,
+      128,
+      256
+    ],
+    "depth": [
+      1,
+      2,
+      2,
+      2
+    ],
+    "act": "silu",
+    "tr_global": [
+      "p5"
+    ],
+    "tr_window": [],
+    "tr_heads": 4,
+    "tr_ffn": 2.0,
+    "tr_norm": "gn",
+    "win": 5,
+    "levels": [
+      8,
+      16,
+      32
+    ],
+    "mid": [
+      32,
+      64,
+      128
+    ],
+    "name": "hybridnano_gP5_w-_silu"
+  },
+  "params": 1287066,
+  "size": 128,
+  "classes": [
+    "stop",
+    "vorfahrtGewaehren",
+    "warnung",
+    "verbot",
+    "einfahrtVerboten",
+    "gebot",
+    "hinweis",
+    "vorfahrtstrasse",
+    "ortstafel"
+  ],
+  "trained_epoch": 5,
+  "train_metrics": {
+    "precision": 0.0,
+    "recall": 0.0,
+    "tp": 0,
+    "fp": 10,
+    "fn": 19,
+    "f1": 0.0
+  },
+  "parity": {
+    "max_tensor_diff": 1.52587890625e-05,
+    "det_ref": 3,
+    "det_onnx": 3,
+    "matched_iou95": 3
+  },
+  "ort_cpu_ms": 1.51,
+  "files": {
+    "onnx": "smoke-det.onnx",
+    "fp32_bytes": 5159337
+  },
+  "sha256": {
+    "onnx": "c73b178ccbb0e4d68f61d6ba100d0c53e4f79428511cd2bbcb0d0798ba4ed4cd"
+  },
+  "torch": "2.13.0+cpu"
+}
