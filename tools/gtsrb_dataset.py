@@ -131,7 +131,7 @@ def compose(zf: zipfile.ZipFile, picks: list[dict], rng: random.Random, size: in
         side = max(8, int(size * rng.uniform(0.035, 0.6)))        # Anteil am Bild: klein bis gross
         ratio = sign.height / max(1, sign.width)
         sign = sign.resize((side, max(6, int(side * ratio))), Image.LANCZOS)
-        angle = rng.uniform(-25, 25) if rng.random() < 0.8 else rng.uniform(-60, 60)
+        angle = sd.roll_angle(rng, row["label"])
         sign = sign.rotate(angle, resample=Image.BICUBIC, expand=True)
         if abs(angle) > 15:
             tags.append("roll")                                   # Roll: Bruchstelle der Heuristik
@@ -152,9 +152,23 @@ def compose(zf: zipfile.ZipFile, picks: list[dict], rng: random.Random, size: in
     return arr, boxes, sorted(set(tags))
 
 
+def class_weights(rows: list[dict]) -> list[float]:
+    """Je Projekt-Typ gleiches Gesamtgewicht (1/Haeufigkeit des Typs).
+
+    GTSRB besteht zur Haelfte aus Tempolimits - alle bildet CLASS_MAP auf "verbot" ab.
+    Gemessen: `verbot` stellt 50 % aller val-Boxen, waehrend `vorfahrtGewaehren` nur
+    Recall 0,43 erreicht. Ohne Ausgleich lernt der Kopf die Verteilung statt der
+    Unterscheidung. Der val-Split bleibt bewusst unausgeglichen (gleiche Messlatte).
+    """
+    counts: dict[str, int] = {}
+    for r in rows:
+        counts[r["label"]] = counts.get(r["label"], 0) + 1
+    return [1.0 / counts[r["label"]] for r in rows]
+
+
 def build(zip_path: str, out_dir: str, n: int, size: int, split: str, seed: int = 0,
           degrade_prob: float = 0.85, occlude_prob: float = 0.3, val_share: float = 0.15,
-          gt_zip: str | None = None) -> dict:
+          gt_zip: str | None = None, balance: bool = False) -> dict:
     out = Path(out_dir)
     (out / "images").mkdir(parents=True, exist_ok=True)
     (out / "labels").mkdir(parents=True, exist_ok=True)
@@ -180,10 +194,16 @@ def build(zip_path: str, out_dir: str, n: int, size: int, split: str, seed: int 
         rows = val_rows
     if not rows:
         raise SystemExit(f"keine verwertbaren Zeilen in {zip_path}")
+    # Ausgleich nur im Training - der val-Split bleibt absichtlich wie in GTSRB (Messlatte).
+    weights = class_weights(rows) if (balance and split == "train") else None
     bgs = background_pool(rng, size)
     entries, tags_all = [], {}
     for i in range(n):
-        picks = [rows[rng.randrange(len(rows))] for _ in range(2 if rng.random() < 0.25 else 1)]
+        if weights:
+            picks = [rng.choices(rows, weights=weights)[0]
+                     for _ in range(2 if rng.random() < 0.25 else 1)]
+        else:
+            picks = [rows[rng.randrange(len(rows))] for _ in range(2 if rng.random() < 0.25 else 1)]
         arr, boxes, tags = compose(zf, picks, rng, size, bgs, degrade_prob, occlude_prob)
         stem = f"{split}_{i:06d}"
         Image.fromarray(arr).save(out / "images" / f"{stem}.jpg", quality=86)
@@ -195,14 +215,16 @@ def build(zip_path: str, out_dir: str, n: int, size: int, split: str, seed: int 
         entries.append({"id": stem, "src": "GTSRB", "license": "frei fuer Forschung",
                         "scene": picks[0]["path"].rsplit("/", 2)[-2], "conditions": tags,
                         "split": split, "width": size, "height": size,
-                        "boxes": len(boxes), "gtsrb_class": picks[0]["cls"]})
+                        "boxes": len(boxes), "gtsrb_class": picks[0]["cls"],
+                        "balanced": bool(weights)})
     manifest_path = out / "manifest.json"
     old = json.loads(manifest_path.read_text(encoding="utf-8"))["images"] if manifest_path.exists() else []
     merged = [e for e in old if e.get("split") != split] + entries
     manifest_path.write_text(json.dumps(
         {"format": "yolo-txt", "classes": SIGN_LABELS, "source": "tools/gtsrb_dataset.py",
          "images": merged}, indent=2, ensure_ascii=False), encoding="utf-8")
-    return {"neu": len(entries), "klassen": len({r["cls"] for r in rows}), "bedingungen": tags_all}
+    return {"neu": len(entries), "klassen": len({r["cls"] for r in rows}),
+            "bedingungen": tags_all, "ausgleich": bool(weights)}
 
 
 def main() -> None:
@@ -216,11 +238,13 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--degrade", type=float, default=0.85)
     ap.add_argument("--occlude", type=float, default=0.3)
+    ap.add_argument("--balance", action="store_true",
+                    help="Klassen ausgleichen (nur Training): jeder der 9 Typen gleich haeufig")
     args = ap.parse_args()
     info = build(args.zip, args.out, args.n, args.size, args.split, args.seed, args.degrade,
-                 args.occlude, gt_zip=args.gt_zip or None)
+                 args.occlude, gt_zip=args.gt_zip or None, balance=args.balance)
     print(f"[daten] {info['neu']} Bilder ({args.split}) nach {args.out} geschrieben, "
-          f"{info['klassen']} GTSRB-Klassen genutzt")
+          f"{info['klassen']} GTSRB-Klassen genutzt, Ausgleich={'an' if info['ausgleich'] else 'aus'}")
     print("[daten] Bedingungen:", ", ".join(f"{k}={v}" for k, v in sorted(info["bedingungen"].items())))
 
 

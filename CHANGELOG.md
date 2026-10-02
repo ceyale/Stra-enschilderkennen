@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.4.0 – 2026-09-30
+- **Fehlerzerlegung vor dem Umbau (neu: `tools/eval_conditions.py --diagnose`)**: von 656
+  verpassten Boxen waren 334 „tief verpasst“ (46 % davon ≤ 32 px Diagonale), 212 falsch
+  klassifiziert und 110 falsch lokalisiert; von 226 Fehlalarmen lagen 195 auf echten
+  Schildern und nur 31 auf freier Fläche. Die Treffer hatten schon IoU 0,938. Damit war
+  klar, wo die Arbeit hingeht – und wo nicht (ein CIoU-Verlust wäre wirkungslos, weil die
+  Treffer schon sitzen; eine Klassen-Arbitrierung nach der NMS brachte gemessen nur
+  +0,7 % Precision).
+- **Vier Erkennungsstufen statt drei** (`stride 4/8/16/32`, `tools/detmath.py`).
+  Zusätzlich geändert: die Stufe wird nach der **längsten Objektseite** gewählt
+  (`ASSIGN_MAX_SIDE`) statt nach `log2` der Diagonale – die alte Regel schickte ein
+  30-px-Schild auf `stride 32` mit nur 10×10 Zellen. Und bei Randlage lernt die
+  **Nachbarzelle** mit (`dual`), weil der Offset vorher auf 0,999 festgeklemmt war.
+  Kosten: 731 → 878 MFLOPs.
+- **Getrennter Kopf (Box/Objektivität gegen Art)** in `tools/hybrid_net.py`: der Kopf
+  verwechselte Arten (rotes Dreieck Spitze oben gegen unten 32×). Kostet ~4 MFLOPs.
+- **Daten: Klassenausgleich, Roll-Politik, Negative.**
+  `tools/gtsrb_dataset.py --balance` (jeder Typ ~3 600 Boxen statt `verbot` 50 %),
+  `roll_angle()` dreht **Dreiecke nur ±35°** (stark gedrehte Dreiecke sind widersprüchliche
+  Ziele: `warnung` verlor dadurch 18 Recall-Punkte), neu
+  **`tools/synth_negatives.py`** für Bilder ohne Schild (3000 train + 500 im neuen Split
+  `neg` als Messlatte) und mehr Hintergrundarten.
+- **Mehrskaliges Training** (`--zoom`, Bereich 0,7–1,5) und `--obj-norm` in
+  `tools/train_det.py`; `--val-split neg` misst während des Trainings Fehlalarme.
+- **Ergebnis (2 000 val-Bilder)**: P 0,891 → **0,883**, R 0,739 → **0,796**,
+  F1 0,808 → **0,837**; verpasste Boxen 656 → **513**, Fehlalarme 226 → 264. Der Zugewinn
+  liegt bei den Typen mit wenigen Beispielen (`stop` R 0,478 → 0,717, `vorfahrtGewaehren`
+  0,434 → 0,689, `einfahrtVerboten` 0,532 → 0,806), der Preis bei `verbot` (0,801 → 0,779).
+  Alle Tabellen in `docs/TRAINING.md` §5 und §10.
+- **Neu: Größe wählbar** – `tools/export_onnx.py --dynamic` (eine Datei für 256/320/384/448 px),
+  `src/model.js` nimmt die Größe entgegen, die App bekommt ein Auswahlfeld
+  (automatisch: Video 320 px, Foto 384 px). Gemessen: 256 px F1 0,796 / 320 px 0,837 /
+  **384 px 0,854 bei 21 % weniger Fehlalarmen**.
+- **`models/labels.json`** trägt jetzt `dynamic`; `tools/export_onnx.py --size` erlaubt
+  zusätzlich einen statischen Export in einer festen Größe (auf x86 rund 59 % schneller
+  als mit offenen Achsen).
+- **Checkpoints der Vorfassung sind nicht mehr ladbar** (Kopfzweige umbenannt).
+
 ## 0.3.0 – 2026-09-30
 - **Erstes echtes Modell trainiert** (bisher gab es nur die Kette dafür): `--preset balanced`
   (1 287 066 Params, 731 MFLOPs) in drei Blöcken über 159 Epochen auf **23 000 Bildern**

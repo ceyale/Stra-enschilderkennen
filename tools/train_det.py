@@ -37,12 +37,22 @@ from hybrid_net import N_CH, N_CLASSES, SIGN_LABELS, NetCfg, build_model, n_para
 
 
 class SignDataset(torch.utils.data.Dataset):
-    """Echte Bilder (images/ + labels/ + manifest.json) oder synthetisch on-the-fly."""
+    """Echte Bilder (images/ + labels/ + manifest.json) oder synthetisch on-the-fly.
+
+    `zoom` schaltet die Mehrskaligkeit ein: ein zufaelliger Ausschnitt (oder eine mit Grau
+    114 erweiterte Flaeche) wird auf `size` gezogen. Gemessen war der Recall fuer Schilder
+    unter 32 px Diagonale nur etwa 0,29; ausserdem waeren ohne Mehrskaligkeit 256/320/448 px
+    im Browser drei verschiedene Modelle statt einer Einstellung.
+    """
 
     def __init__(self, root: str, size: int = 320, split: str = "train",
-                 synth_len: int = 200, seed: int = 0, degrade_prob: float = 0.6):
+                 synth_len: int = 200, seed: int = 0, degrade_prob: float = 0.6,
+                 zoom: float = 0.0, zoom_lo: float = 0.7, zoom_hi: float = 1.5):
         self.size, self.split, self.seed = size, split, seed
         self.degrade_prob = degrade_prob
+        # Mehrskaligkeit nur im Training - die Validierung soll dieselbe Messlatte bleiben.
+        self.zoom = zoom if split == "train" else 0.0
+        self.zoom_lo, self.zoom_hi = zoom_lo, zoom_hi
         self.items: list[tuple[Path, Path, dict]] = []
         self.manifest: dict = {}
         self.synth_len = synth_len
@@ -96,14 +106,64 @@ class SignDataset(torch.utils.data.Dataset):
                 labels.append(cls)
         return arr, np.asarray(xyxy, np.float32).reshape(-1, 4), np.asarray(labels, np.int64)
 
+    def _zoom_sample(self, arr, xyxy, labels, rng):
+        """Zufaelliger Ausschnitt (oder graue Erweiterung) und zurueck auf `size`.
+
+        z > 1 zoomt hinein (Schild wird groesser, Ausschnitt wandert), z < 1 heraus
+        (Rand in Letterbox-Grau 114 - dieselbe Farbe, die im Datensatz ohnehin vorkommt).
+        Anschliessend werden die Boxen mitgezogen; beschnittene Schilder behalten ihren
+        sichtbaren Teil, fast unsichtbare fliegen raus.
+        """
+        size = self.size
+        z = rng.uniform(self.zoom_lo, self.zoom_hi)
+        xyxy = np.asarray(xyxy, np.float32).reshape(-1, 4)
+        win = size / z                                   # Fenstergroesse in Originalpixeln
+        if win > size:                                   # herauszoomen -> grauer Rand
+            pad = int(round(win))
+            canvas = np.full((pad, pad, 3), dm.LETTERBOX_GREY, dtype=np.uint8)
+            off = (pad - size) // 2
+            canvas[off:off + size, off:off + size] = arr
+            arr, xyxy, src = canvas, xyxy + off, pad
+        else:
+            src = size
+        win_px = max(8, min(src, int(round(win))))
+        x0 = int(round(rng.uniform(0, max(0.0, src - win_px))))
+        y0 = int(round(rng.uniform(0, max(0.0, src - win_px))))
+        crop = np.ascontiguousarray(arr[y0:y0 + win_px, x0:x0 + win_px])
+        out = np.asarray(Image.fromarray(crop).resize((size, size), Image.BILINEAR))
+        if len(xyxy) == 0:
+            return out, xyxy, np.asarray(labels, np.int64)
+        scale = size / float(win_px)
+        boxes = (xyxy - np.array([x0, y0, x0, y0], np.float32)) * scale
+        keep_b, keep_l = [], []
+        for box, lab in zip(boxes, labels):
+            vw = min(float(box[2]), size) - max(float(box[0]), 0.0)
+            vh = min(float(box[3]), size) - max(float(box[1]), 0.0)
+            if vw < 6 or vh < 6:                         # Rest zu klein fuer ein Ziel
+                continue
+            area = max((float(box[2]) - float(box[0])) * (float(box[3]) - float(box[1])), 1.0)
+            if vw * vh / area < 0.3:                     # fast ganz ausserhalb: verwerfen
+                continue
+            keep_b.append([max(float(box[0]), 0.0), max(float(box[1]), 0.0),
+                           min(float(box[2]), size), min(float(box[3]), size)])
+            keep_l.append(lab)
+        return out, np.asarray(keep_b, np.float32).reshape(-1, 4), np.asarray(keep_l, np.int64)
+
     def __getitem__(self, i: int):
         if self.items:
             arr, xyxy, labels = self._load_real(i)
         else:
             arr, xyxy, labels = self._load_synth(i)
-        # Zielbedingungen auch bei echten Bildern nachbilden (siehe synth_data.degrade)
-        if self.split == "train" and self.items and random.random() < self.degrade_prob:
-            arr, _ = sd.degrade(arr, random.Random(self.seed + i), strength=0.8)
+        if self.split == "train":
+            # Augmentationen bei JEDEM Aufruf neu ziehen, nicht je Bildindex: sonst saehe
+            # dasselbe Bild in jeder Epoche genau dieselbe Verzerrung (der Sampler mischt
+            # die Reihenfolge, der Seed bleibt trotzdem reproduzierbar).
+            rng = random.Random(random.randrange(1 << 30))
+            # Zielbedingungen auch bei echten Bildern nachbilden (siehe synth_data.degrade)
+            if self.items and rng.random() < self.degrade_prob:
+                arr, _ = sd.degrade(arr, rng, strength=0.8)
+            if self.zoom and rng.random() < self.zoom:
+                arr, xyxy, labels = self._zoom_sample(arr, xyxy, labels, rng)
         x = torch.from_numpy(np.ascontiguousarray(arr.transpose(2, 0, 1))).float().div_(255.0)
         return x, torch.from_numpy(np.asarray(xyxy, np.float32)), torch.from_numpy(np.asarray(labels, np.int64))
 
@@ -133,15 +193,24 @@ def collate(batch, size: int):
 class DetLoss(nn.Module):
     """Verlust: Objektivitaet (fokal), Art (CE mit Label-Smoothing), Box (L1, groessengewichtet).
 
-    Bewusst ohne IoU/DFL-Verlust: klein, stabil, exportfreundlich. Ein CIoU-Verlust
-    waere der naechste Genauigkeitsschritt, kostet aber Trainings- und Exportaufwand.
+    Bewusst ohne IoU/DFL-Verlust. Der Kommentar "CIoU waere der naechste Genauigkeitsschritt"
+    war eine Vermutung - gemessen wurde sie widerlegt: die 1853 Treffer auf 2000 val-Bildern
+    haben im Mittel IoU 0.938 (84 % ueber 0.9). Der Verlust ist also nicht die Baustelle;
+    die Fehler liegen in der Klassentrennung (32 % der FN) und bei kleinen Schildern.
+
+    obj_norm steuert die Normierung des Objektivitaetsverlusts: "pos" teilt durch die Zahl
+    der positiven Zellen (RetinaNet-Rezept), "sqrt" durch deren Wurzel. Mit vielen
+    Negativbildern im Batch waechst der Objektivitaetsanteil stark - dann kann "sqrt"
+    ruhiger trainieren.
     """
 
     def __init__(self, size: int = 320, alpha: float = 0.25, gamma: float = 2.0,
-                 w_obj: float = 1.0, w_cls: float = 1.0, w_box: float = 5.0, smooth: float = 0.05):
+                 w_obj: float = 1.0, w_cls: float = 1.0, w_box: float = 5.0, smooth: float = 0.05,
+                 obj_norm: str = "pos"):
         super().__init__()
         self.size, self.alpha, self.gamma = size, alpha, gamma
         self.w_obj, self.w_cls, self.w_box, self.smooth = w_obj, w_cls, w_box, smooth
+        self.obj_norm = obj_norm
 
     def forward(self, preds: list[torch.Tensor], targets: dict) -> tuple[torch.Tensor, dict]:
         zero = torch.zeros((), dtype=torch.float32)
@@ -170,7 +239,10 @@ class DetLoss(nn.Module):
             wh_px = torch.exp(tb[:, 2:]) * dm.LEVELS[lvl]
             gain = (2.0 - (wh_px[:, 0] * wh_px[:, 1]) / (self.size * self.size)).clamp(0.5, 2.0)
             box_t = box_t + (F.l1_loss(pred, tb, reduction="none").sum(-1) * gain).sum()
-        n = max(n_pos, 1)
+        n = float(n_pos)
+        if self.obj_norm == "sqrt":
+            n = math.sqrt(max(n, 1.0))
+        n = max(n, 1.0)
         # Normierung wie in RetinaNet: durch die Anzahl positiver Zellen teilen, nicht
         # durch alle Zellen. Sonst waeren die wenigen Schilder im Lernschritt verdunnt.
         obj, cls, box = obj_t / n, cls_t / n, box_t / n
@@ -179,7 +251,7 @@ class DetLoss(nn.Module):
                       "box": float(box.detach()), "n_pos": n_pos}
 
 
-METRIC_KEYS = ("precision", "recall", "f1", "tp", "fp", "fn")
+METRIC_KEYS = ("precision", "recall", "f1", "tp", "fp", "fn", "fp_bild")
 
 
 @torch.no_grad()
@@ -197,7 +269,10 @@ def evaluate(model: nn.Module, loader, conf: float = 0.25, iou: float = 0.5) -> 
             tp, fp, fn = tp + a, fp + b, fn + c
     prec = tp / max(tp + fp, 1)
     rec = tp / max(tp + fn, 1)
+    # Fehlalarme je Bild: die Kennzahl, die im Alltag stoert - auf dem negativen Split
+    # (nur Hintergrund, kein Schild) ist sie die einzige sinnvolle Zahl.
     return {"precision": prec, "recall": rec, "tp": tp, "fp": fp, "fn": fn,
+            "fp_bild": fp / max(int(len(loader.dataset)), 1),
             "f1": 2 * prec * rec / max(prec + rec, 1e-9)}
 
 
@@ -229,8 +304,10 @@ def cfg_from_args(args) -> NetCfg:
 
 
 def make_loader(root: str, size: int, split: str, batch: int, shuffle: bool,
-                n_synth: int, seed: int, degrade: float, workers: int = 0):
-    ds = SignDataset(root, size, split, synth_len=n_synth, seed=seed, degrade_prob=degrade)
+                n_synth: int, seed: int, degrade: float, workers: int = 0,
+                zoom: float = 0.0, zoom_lo: float = 0.7, zoom_hi: float = 1.5):
+    ds = SignDataset(root, size, split, synth_len=n_synth, seed=seed, degrade_prob=degrade,
+                     zoom=zoom, zoom_lo=zoom_lo, zoom_hi=zoom_hi)
     # functools.partial statt lambda: Lambdas sind unter Windows nicht picklebar und
     # lassen den Worker-Start mit EOFError abbrechen.
     return torch.utils.data.DataLoader(
@@ -261,6 +338,14 @@ def main() -> None:
     ap.add_argument("--norm", default="gn", choices=["gn", "ln"])
     ap.add_argument("--heads", type=int, default=4)
     ap.add_argument("--degrade", type=float, default=0.6, help="Anteil kuenstlich verschlechterter Bilder")
+    ap.add_argument("--zoom", type=float, default=0.0,
+                    help="Anteil Trainingsbilder mit Skalenschnitt (Mehrskaligkeit, z.B. 0.5)")
+    ap.add_argument("--zoom-lo", type=float, default=0.7, help="kleinster Zoomfaktor (unter 1 = heraus)")
+    ap.add_argument("--zoom-hi", type=float, default=1.5, help="groesster Zoomfaktor")
+    ap.add_argument("--obj-norm", default="pos", choices=["pos", "sqrt"],
+                    help="Normierung des Objektivitaetsverlusts (bei vielen Negativen: sqrt)")
+    ap.add_argument("--val-split", default="val", choices=["val", "neg"],
+                    help="Split fuer die Auswertung; 'neg' ist die Gegenprobe auf Fehlalarme")
     ap.add_argument("--synth-train", type=int, default=400)
     ap.add_argument("--synth-val", type=int, default=60)
     ap.add_argument("--conf", type=float, default=0.25)
@@ -291,7 +376,7 @@ def main() -> None:
         print(f"[resume] {args.resume} -> Epoche {start_epoch}, Konfiguration aus Checkpoint, "
               f"size={args.size}")
     model = build_model(cfg)
-    crit = DetLoss(size=args.size, w_box=args.box_w)
+    crit = DetLoss(size=args.size, w_box=args.box_w, obj_norm=args.obj_norm)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     if ckpt:
         model.load_state_dict(ckpt["model"])
@@ -305,15 +390,17 @@ def main() -> None:
     model.to(device)
 
     loader, train_ds = make_loader(args.data, args.size, "train", args.batch, True,
-                                   args.synth_train, args.seed, args.degrade, args.workers)
-    vloader, val_ds = make_loader(args.data, args.size, "val", args.batch, False,
+                                   args.synth_train, args.seed, args.degrade, args.workers,
+                                   args.zoom, args.zoom_lo, args.zoom_hi)
+    vloader, val_ds = make_loader(args.data, args.size, args.val_split, args.batch, False,
                                   args.synth_val, args.seed + 999, 0.0, args.workers)
     total = max(1, args.epochs * args.steps)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=total, eta_min=args.lr * 0.05, last_epoch=start_epoch * args.steps - 1)
 
     print(f"[modell] {cfg.name()}  params={n_params(model)}  daten={train_ds.manifest.get('source')} "
-          f"train={len(train_ds)} val={len(val_ds)} geraet={device}"
+          f"train={len(train_ds)} {args.val_split}={len(val_ds)} geraet={device} "
+          f"zoom={args.zoom} obj_norm={args.obj_norm}"
           + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     history = list(ckpt.get("history", [])) if ckpt else []
@@ -346,7 +433,8 @@ def main() -> None:
             metrics = evaluate(model, vloader, args.conf, args.iou)
             last_measured = metrics
             print(f"[epoche {epoch}] P={metrics['precision']:.3f} R={metrics['recall']:.3f} "
-                  f"F1={metrics['f1']:.3f} tp={metrics['tp']} fp={metrics['fp']} fn={metrics['fn']}",
+                  f"F1={metrics['f1']:.3f} tp={metrics['tp']} fp={metrics['fp']} fn={metrics['fn']} "
+                  f"fp/Bild={metrics['fp_bild']:.3f}",
                   flush=True)
         else:
             metrics = {k: None for k in METRIC_KEYS}

@@ -2,8 +2,10 @@
  * model.js – optionaler KI-Modus: hybrides CNN+Transformer-Netz über ONNX Runtime Web.
  *
  * Das Netz sagt in EINEM Durchlauf Position (Box) UND Art (9 Schildtypen) voraus
- * (anchor-free, drei Stufen stride 8/16/32, 14 Kanäle je Zelle). Trainiert wird es mit
- * tools/train_det.py, exportiert mit tools/export_onnx.py.
+ * (anchor-free, vier Stufen stride 4/8/16/32, 14 Kanäle je Zelle). Die Stufenliste steht
+ * in `models/labels.json` (`levels`) – dieses Skript hier ist absichtlich generisch
+ * darüber, damit eine geänderte Stufenzahl keine JS-Änderung erfordert. Trainiert wird es
+ * mit tools/train_det.py, exportiert mit tools/export_onnx.py.
  *
  * Aufbau dieser Datei:
  *   1. Reine Mathematik: letterbox, decode, NMS – KEINE Laufzeit-Abhängigkeit,
@@ -88,7 +90,7 @@
     return keep.sort((a, b) => b.score - a.score);
   }
 
-  /** Alle Stufen auswerten und unterdrücken. `tensors` = [os8, os16, os32] mit {data, dims}. */
+  /** Alle Stufen auswerten und unterdrücken. `tensors` = je Stufe ein Tensor {data, dims}. */
   function decodeAll(tensors, levels, nCls, conf, iouThres) {
     let dets = [];
     for (let i = 0; i < tensors.length; i++) {
@@ -167,19 +169,30 @@
     const size = labels.size;
     const nCls = labels.classes.length;
     const conf = o.conf, iouThres = o.iou;
-    const plane = () => size * size;
-    const chw = new Float32Array(3 * size * size);
+    // Eingabepuffer je Größe einmal anlegen. Das Modell wird mit offener Höhe/Breite
+    // exportiert (tools/export_onnx.py --dynamic), deshalb darf der Aufrufer die Größe
+    // wählen. Gemessen auf 2000 val-Bildern: 256 px F1 0,796 / 320 px 0,837 / 384 px 0,854
+    // – größer ist genauer, kleiner schneller (docs/TRAINING.md §3).
+    const bufs = new Map();
+    const chwFor = sz => {
+      let b = bufs.get(sz);
+      if (!b) { b = new Float32Array(3 * sz * sz); bufs.set(sz, b); }
+      return b;
+    };
 
-    /** Bilddaten eines size×size-Letterbox-Canvas auswerten. */
-    async function detect(imageData) {
-      const d = imageData.data, p0 = plane();
+    /** Bilddaten eines sz×sz-Letterbox-Canvas auswerten. `inputSize` ist optional. */
+    async function detect(imageData, inputSize) {
+      const sz = inputSize || size;
+      const p0 = sz * sz;
+      const chw = chwFor(sz);
+      const d = imageData.data;
       for (let i = 0, p = 0; i < p0; i++, p += 4) {
         chw[i] = d[p] / 255;
         chw[p0 + i] = d[p + 1] / 255;
         chw[2 * p0 + i] = d[p + 2] / 255;
       }
       const feeds = {};
-      feeds[labels.input || 'images'] = new ort.Tensor('float32', chw, [1, 3, size, size]);
+      feeds[labels.input || 'images'] = new ort.Tensor('float32', chw, [1, 3, sz, sz]);
       const out = await session.run(feeds);
       const tensors = labels.levels.map(s => out['os' + s]);
       return decodeAll(tensors, labels.levels, nCls, conf, iouThres);

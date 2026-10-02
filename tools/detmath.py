@@ -16,10 +16,17 @@ import math
 
 import numpy as np
 
-LEVELS = (8, 16, 32)          # stride der drei Erkennungsstufen
+LEVELS = (4, 8, 16, 32)       # stride der vier Erkennungsstufen (fein -> grob)
 N_CLASSES = 9
 N_CH = 4 + 1 + N_CLASSES
 LETTERBOX_GREY = 114          # Randfarbe beim Einpassen (muss in JS identisch sein)
+
+# Zuordnung der Objekte zu den Stufen, nach laengster Objektseite (FCOS-Idee, auf die
+# 320-px-Eingabe gerechnet): Stufe i bekommt Objekte bis zu dieser Seitenlaenge.
+# Die frueher benutzte Regel "naechste Stufe in log2(diagonale)" schickte ein 30-px-Schild
+# auf stride 32 - dort stehen nur 10x10 Zellen zur Verfuegung. Gemessen lag der Recall fuer
+# Schilder unter 32 px Diagonale bei etwa 0.29 gegen 0.74 im Mittel (docs/TRAINING.md 10).
+ASSIGN_MAX_SIDE = (16.0, 40.0, 96.0, float("inf"))
 
 
 def letterbox_params(w: int, h: int, size: int) -> tuple[float, float, float]:
@@ -100,12 +107,16 @@ def sigmoid(x: np.ndarray) -> np.ndarray:
 
 
 def assign_targets(boxes_xyxy: np.ndarray, labels: np.ndarray, size: int,
-                   levels: tuple = LEVELS) -> list[dict]:
-    """Zielwerte fuer den Verlust: je Objekt genau eine Zelle auf der passenden Stufe.
+                   levels: tuple = LEVELS, max_side: tuple = ASSIGN_MAX_SIDE,
+                   dual: bool = True) -> list[dict]:
+    """Zielwerte fuer den Verlust: je Objekt eine Zelle, bei Randlage die Nachbarzelle mit.
 
-    Die Stufe wird ueber die Objektgroesse gewaehlt (log2 naechster Treffer) - grosse
-    Schilder landen auf stride 32, kleine auf stride 8. Durch die Ein-Zellen-Zuweisung
-    bleibt der Offset tx,ty in [0,1) und passt exakt zur Decode-Formel.
+    Zwei Aenderungen gegenueber der ersten Fassung, beide aus Messungen begruendet:
+      * Stufe nach laengster Seite statt nach log2 der Diagonale (siehe ASSIGN_MAX_SIDE).
+      * `dual`: liegt der Objektmittelpunkt im aeusseren Viertel seiner Zelle, lernt die
+        Nachbarzelle dasselbe Objekt mit. Die alte Ein-Zellen-Regel presste den Offset auf
+        0.999 fest - bei grossen Schildern (Median der Lokalisierungsfehler: 125 px) musste
+        die Box also aus einer einzigen Zelle heraus mehrere Zellen weit regressiert werden.
     """
     boxes = np.asarray(boxes_xyxy, dtype=np.float32).reshape(-1, 4)
     labels = np.asarray(labels, dtype=np.int64).reshape(-1)
@@ -122,18 +133,37 @@ def assign_targets(boxes_xyxy: np.ndarray, labels: np.ndarray, size: int,
     for (x0, y0, x1, y1), lab in zip(boxes, labels):
         w, h = float(x1 - x0), float(y1 - y0)
         cx, cy = float((x0 + x1) / 2), float((y0 + y1) / 2)
-        diag = math.sqrt(max(w * h, 1.0))
-        idx = int(np.argmin([abs(math.log2(diag / s)) for s in levels]))
+        side = max(w, h)
+        idx = len(levels) - 1                      # groebste Stufe als Rueckfall
+        for i, lim in enumerate(tuple(max_side)[:len(levels)]):
+            if side < lim:
+                idx = i                            # kleinste passende Stufe zuerst
+                break
         s = levels[idx]
         g = size // s
         gx = int(min(g - 1, max(0, math.floor(cx / s))))
         gy = int(min(g - 1, max(0, math.floor(cy / s))))
+        xs, ys = [gx], [gy]
+        if dual:
+            fx, fy = cx / s - gx, cy / s - gy
+            if fx < 0.25 and gx > 0:
+                xs.append(gx - 1)
+            elif fx > 0.75 and gx < g - 1:
+                xs.append(gx + 1)
+            if fy < 0.25 and gy > 0:
+                ys.append(gy - 1)
+            elif fy > 0.75 and gy < g - 1:
+                ys.append(gy + 1)
         t = out[idx]
-        t["pos"][gy, gx] = True
-        t["obj"][gy, gx] = 1.0
-        t["cls"][gy, gx] = lab
-        t["box"][gy, gx] = [np.clip(cx / s - gx, 0.0, 0.999), np.clip(cy / s - gy, 0.0, 0.999),
-                            math.log(max(w / s, 1e-3)), math.log(max(h / s, 1e-3))]
+        for cell_x in xs:
+            for cell_y in ys:
+                t["pos"][cell_y, cell_x] = True
+                t["obj"][cell_y, cell_x] = 1.0
+                t["cls"][cell_y, cell_x] = lab
+                t["box"][cell_y, cell_x] = [
+                    np.clip(cx / s - cell_x, 0.0, 0.999), np.clip(cy / s - cell_y, 0.0, 0.999),
+                    math.log(max(w / s, 1e-3)), math.log(max(h / s, 1e-3)),
+                ]
     return out
 
 

@@ -12,20 +12,22 @@ Fehlt das Modell oder kann die Laufzeit es nicht laden, arbeitet die App wie bis
 ## 1. Architektur
 
 `tools/hybrid_net.py`, Klasse `HybridNano`. Eingang fest **1 × 3 × 320 × 320**
-(Letterbox, Grau 114), Ausgang **drei** Tensoren `os8`, `os16`, `os32`.
+(Letterbox, Grau 114), Ausgang **vier** Tensoren `os4`, `os8`, `os16`, `os32`
+(ein Ausgang je Erkennungsstufe, fein → grob).
 
 | Teil | Aufbau |
 |---|---|
 | Stem | 3×3 Conv stride 2 → 16 Kanäle (auf /2) |
-| Stufe /4 | Inverted-Residual-Block (MobileNet-Stil), 32 Kanäle |
+| Stufe /4 → `p2` | Inverted-Residual-Block (MobileNet-Stil), 32 Kanäle |
 | Stufe /8 → `p3` | 2 × IR-Block, 64 Kanäle |
 | Stufe /16 → `p4` | 2 × IR-Block, 128 Kanäle |
 | Stufe /32 → `p5` | 2 × IR-Block, 256 Kanäle |
 | **Transformer** | `p5` global (10×10 = 100 Tokens), optional `p4` (20×20 = 400) lokal/windowed oder global |
-| Fusion | FPN-lite: 1×1 lateral + Nearest-Upsample + Add + 3×3 Fuse |
-| Köpfe | je Stufe: 3×3 Depthwise → 1×1 → 1×1 auf **14 Kanäle** |
+| Fusion | FPN-lite: 1×1 lateral + Nearest-Upsample + Add + 3×3 Fuse, von grob nach fein über alle Stufen |
+| Köpfe | je Stufe: 3×3 Depthwise → 1×1 (gemeinsamer Stamm), dann **zwei 1×1-Zweige** – 5 Kanäle (`tx,ty,tw,th,obj`) und 9 Kanäle (`cls0..cls8`) |
 
-Kopf-Layout je Zelle: `[tx, ty, tw, th, obj, cls0..cls8]`, Dekodierung (Python wie JS):
+Kopf-Layout je Zelle: `[tx, ty, tw, th, obj, cls0..cls8]` (14 Kanäle), Dekodierung
+(Python wie JS):
 
 ```
 cx = (gx + sigmoid(tx)) * stride        cy = (gy + sigmoid(ty)) * stride
@@ -33,11 +35,29 @@ w  = exp(clip(tw, ±8)) * stride         h  = exp(clip(th, ±8)) * stride
 score = sigmoid(obj) * max_j sigmoid(cls_j)
 ```
 
+**Warum vier Stufen und warum ein getrennter Kopf?** Beides kam aus der Messung, nicht aus
+dem Gefühl (Zahlen in §10). Von 656 verpassten Boxen waren 334 „tief verpasst“, davon
+46 % kleiner als 32 px Diagonale – der Recall für kleine Schilder lag bei etwa **0,29**
+gegen 0,74 im Mittel. Eine Ursache war die alte Zuordnungsregel (nächste Stufe in `log2`
+der Diagonale): sie schickte ein 30-px-Schild auf `stride 32`, wo nur 10×10 Zellen zur
+Verfügung stehen. Dazu kamen **212 falsch klassifizierte Boxen** (32 % aller FN) und 195
+der 226 Fehlalarme auf echten Schildern – der Kopf verwechselte Arten (rotes Dreieck
+Spitze oben gegen Spitze unten: 32×). Deshalb: `stride 4` dazu und der Kopf in zwei
+getrennte Zweige (Ort/Objekt gegen Art).
+
+Die Zuordnung der Objekte zu den Stufen läuft über die **längste Objektseite**
+(`ASSIGN_MAX_SIDE = (16, 40, 96, ∞)` px für stride 4/8/16/32, siehe `tools/detmath.py`);
+außerdem lernt bei Randlage die Nachbarzelle dasselbe Objekt mit (`dual`). Die alte
+Ein-Zellen-Regel presste den Offset auf 0,999 fest – bei großen Schildern (Median der
+Lokalisierungsfehler: 125 px Diagonale) musste also eine einzige Zelle die Box mehrere
+Zellen weit regressieren.
+
 **Warum Transformer nur in den tiefen Stufen?** Attention kostet O(N²) in der Tokenzahl
 N = (H/stride)·(W/stride). Bei 320×320 ergibt das:
 
 | Stufe | Raster | Tokens | Nachbarschaft bei globaler Attention |
 |---|---|---|---|
+| /4 (`p2`) | 80×80 | 6400 | 40 960 000 Paare → unbezahlbar |
 | /8 (`p3`) | 40×40 | 1600 | 2 560 000 Paare → unbezahlbar |
 | /16 (`p4`) | 20×20 | 400 | 160 000 Paare → nur lokal sinnvoll |
 | /32 (`p5`) | 10×10 | 100 | 10 000 Paare → praktisch gratis |
@@ -54,45 +74,87 @@ FFN als 1×1 → Depthwise 3×3 → 1×1, LayerScale (γ = 0,01) und Restverbind
 
 ## 2. Gemessene Kosten je Variante
 
-`python tools/bench_model.py --iters 3` auf dieser Maschine (CPU, PyTorch 2.13, 320×320).
-Params und MFLOPs sind exakt, die Millisekunden streuen auf dieser CPU um bis zu ±30 %
-(Auslastung), sie sind eine Größenordnung, kein Messprotokoll.
+`python tools/bench_model.py --iters 4` auf dieser Maschine (CPU, PyTorch 2.14, 320×320).
+Params und MFLOPs sind exakt, die Millisekunden streuen auf dieser CPU stark
+(Auslastung) – sie sind eine Größenordnung, kein Messprotokoll.
+
+Fertige Größen (`--preset`), alle mit **vier** Stufen (stride 4/8/16/32):
+
+| Preset | Params | int8-Datei | MFLOPs | ms (1 Thread) |
+|---|---|---|---|---|
+| `fast` | 537 k | ~0,54 MB | 433 | 24 |
+| **`balanced`** (ausgeliefert) | 1 300 k | ~1,30 MB | **878** | 34–60 |
+| `quality` | 1 575 k | ~1,57 MB | 1 180 | 66–169 |
+
+Transformer-Varianten (Basis = vier Stufen, sonst `balanced`):
 
 | Variante | Params | int8-Datei | MFLOPs | ms (4 Threads) | ms (1 Thread) |
 |---|---|---|---|---|---|
-| cnn-only | 750 k | ~0,75 MB | **615** | 16–25 | 22–27 |
-| **p5-global** (Standard) | 1 287 k | ~1,29 MB | **731** | 22–28 | 25–29 |
-| p5g + p4 windowed | 1 424 k | ~1,42 MB | 844 | 34 | 31 |
-| p4 global + p5 global | 1 424 k | ~1,42 MB | 921 | 24 | 29 |
-| p5g + p4w, TokenNorm=LayerNorm | 1 424 k | ~1,42 MB | 844 | 25 | 33 |
-| p5g + p4w + p3w | 1 460 k | ~1,46 MB | 965 | 44 | 43 |
-| p5g + Hardswish | 1 287 k | ~1,29 MB | 731 | 21 | 22 |
+| cnn-only | 764 k | ~0,76 MB | **762** | 37 | 36 |
+| **p5-global** (Standard) | 1 300 k | ~1,30 MB | **878** | 35 | 35–57 |
+| p5g + p4 windowed | 1 438 k | ~1,44 MB | 991 | 54 | 55–96 |
+| p4 global + p5 global | 1 438 k | ~1,44 MB | 1 068 | 51 | 70 |
+| p5g + p4w, TokenNorm=LayerNorm | 1 438 k | ~1,44 MB | 991 | 65 | 55 |
+| p5g + p4w + p3w | 1 473 k | ~1,47 MB | 1 112 | 56 | 52 |
+| p5g + Hardswish | 1 300 k | ~1,30 MB | 878 | 34 | 34 |
 
 Ablesbare Erkenntnisse:
 
-* Der **`p5`-Transformer kostet ~19 % Mehrrechnung** (615 → 731 MFLOPs) und liegt bei
-  den Parametern in derselben Größenordnung wie ein „Nano"-Detektor (1,3 M).
+* Der **`p5`-Transformer kostet ~15 % Mehrrechnung** (762 → 878 MFLOPs) und liegt bei den
+  Parametern in derselben Größenordnung wie ein „Nano“-Detektor (1,3 M).
+* **Die vierte Stufe (stride 4) ist der eigentliche Zuwachs:** sie hob die Rechnung von
+  731 auf 878 MFLOPs (+20 %) und den kleinen-Schilder-Recall deutlich – siehe §10.
 * **Windowed ist in FLOPs billiger, aber auf dieser CPU nicht schneller** — die
-  Fenster-Reshapes kosten mehr als die reine Attention (844 MFLOPs, aber 34 ms statt 24 ms
-  für `p4` global). Auf WebGPU/WASM neu messen, bevor man sich festlegt.
-* **`p3` windowed ist der Kostentreiber** (1600 Tokens): +43 % Rechenzeit für den
-  kleinsten erwartbaren Nutzen → nicht verwenden.
+  Fenster-Reshapes kosten mehr als die reine Attention. Auf WebGPU/WASM neu messen,
+  bevor man sich festlegt.
+* **`p3` windowed ist der Kostentreiber** (1600 Tokens): +27 % FLOPs für den kleinsten
+  erwartbaren Nutzen → nicht verwenden.
 * **Hardswish** spart hier ~6 % Zeit bei identischen FLOPs (auf ARM meist mehr).
-* Auflösung schlägt alles andere: 192² statt 320² ist rund **⅓ der Rechnung**
-  (Attention-Skalierung: 192 px → 36 Tokens auf p5, 320 px → 100, 416 px → 169).
+* Auflösung schlägt alles andere: **256 px sind 64 % der Rechnung von 320 px**, 384 px
+  sind 144 %, 448 px 196 %. Weil mit `--zoom` trainiert wurde, sind das reine
+  Einstellungen am ausgelieferten Modell (§3).
 
 ## 3. Echtzeit-Budget
 
-Gemessene Referenz: **ONNX Runtime CPU (x86, 1 Thread), 128×128: 1,1–1,5 ms je Bild**
-(`tools/export_onnx.py --bench`). Am ausgelieferten Modell in **320×320** sind es
-**7,2 ms** (x86, 1 Thread, sonst gleiche Maschine). Das ist nicht die Handy-Zahl, sondern
-zeigt nur, dass der Graph schlank ist. Für den Browser gilt:
+Zwei Messpunkte, die zusammen das Budget ergeben:
+
+* **Im Browser, `wasm` (Einfachthread), am echten Gerät: 122 ms** je Bild bei 320 px für
+  die Vorfassung mit 731 MFLOPs – also **~0,167 ms je MFLOP** (Vorbereitung Letterbox:
+  2 ms). Das ist die belastbare Zahl, alles andere hier ist Umrechnung.
+* **ONNX Runtime CPU (x86, 1 Thread)** als Referenz für den Graphen: 7,2 ms bei 320 px
+  (Vorfassung, 731 MFLOPs), 10–18 ms für das ausgelieferte Modell (878 MFLOPs).
+
+Was die Eingabegröße auf den val-Bildern kostet und bringt (2 000 Bilder, conf 0,25):
+
+| Eingabe | MFLOPs | P | R | F1 | fp/Bild | Browser (grob) |
+|---|---|---|---|---|---|---|
+| 256 px | 562 | 0,859 | 0,742 | 0,796 | 0,152 | ~110 ms |
+| **320 px** (Standard) | 878 | 0,883 | 0,796 | 0,837 | 0,132 | ~150–230 ms |
+| **384 px** | 1 264 | **0,907** | **0,808** | **0,854** | **0,104** | ~210–330 ms |
+| 448 px | 1 721 | – | – | – | – | ~290–450 ms |
+
+Die Spanne kommt von der Frage, wie stark offene Höhe/Breite (dynamischer Export) im WASM
+kosten: auf x86 gemessen **+59 %** (17,7 ms statisch gegen 28,2 ms dynamisch bei 320 px),
+im WASM unbekannt. Ausgeliefert wird deshalb die **dynamische** Datei (eine Datei für alle
+Größen, die App kann umschalten) – wenn Live-Video zu langsam ist, gibt es zwei Wege:
+in der App **256 px** wählen, oder statisch neu exportieren:
+
+```
+python tools/export_onnx.py --ckpt models/signs-det.pt --size 384   # ohne --dynamic
+```
+
+Statisch 384 px kostete auf x86 **16,7 ms** – also so viel wie statisch 320 px, aber mit
+der besseren Qualität. Die App zeigt die gemessene Zeit im Status an
+(`KI-Modell (wasm, 384 px) · 213 ms (Vorbereitung 2 ms)`).
 
 | Weg | Erwartung | Maßnahme |
 |---|---|---|
 | WebGPU (Chrome/Android 12+, Safari/iOS 26+) | deutlich unter 10 ms | 320 px fahren, `enableGraphCapture` möglich |
-| WASM einthreadig (GitHub Pages, kein COOP/COEP) | Größenordnung 10² ms | Eingabe auf 192–224 px, Analyse alle 200 ms |
+| WASM einthreadig (GitHub Pages, kein COOP/COEP) | 10² ms | Größe wählen: 256 px = Sparmodus, 384 px = Foto |
 | kein WebGPU, Modell fehlt, offline | – | Heuristik (5–15 ms bei 240 px) bleibt aktiv |
+
+**Offen:** warum die App auf `wasm` zurückfällt, obwohl `webgpu` zuerst versucht wird.
+Wenn WebGPU trägt, ist deutlich mehr Rechnung bezahlbar.
 
 Wichtig, gemessen in der Doku von ONNX Runtime Web: **Mehrthread-WASM gibt es nur mit
 `crossOriginIsolated`** (COOP/COEP-Header), und GitHub Pages erlaubt keine eigenen
@@ -153,11 +215,26 @@ curl -L -C - -o data/gtsrb/GTSRB_Final_Test_GT.zip \
   https://sid.erda.dk/public/archives/daaeac0d7ce1152aea9b61d9f1e19370/GTSRB_Final_Test_GT.zip
 
 python tools/gtsrb_dataset.py --zip data/gtsrb/GTSRB_Final_Training_Images.zip \
-    --out data/det --n 20000 --size 320 --seed 0
+    --out data/det --n 20000 --size 320 --seed 0 --balance
 python tools/gtsrb_dataset.py --zip data/gtsrb/GTSRB_Final_Test_Images.zip \
     --gt-zip data/gtsrb/GTSRB_Final_Test_GT.zip --out data/det --n 1800 --size 320 \
     --split val --seed 1
 ```
+
+**`--balance` (nur für `--split train`)** zieht die Schilder je Typ gleich häufig, weil
+GTSRB zur Hälfte aus Tempolimits besteht (alle → `verbot`). Gemessen vor dem Umbau: `verbot`
+stellte **50 % aller Validierungsboxen**, während `vorfahrtGewaehren` nur **R = 0,43** und
+`stop` nur **R = 0,48** erreichten. Nach dem Ausgleich hat jeder Typ ~3 600 Boxen
+(`stop` 3 625, `verbot` 3 591 statt ~200 bzw. ~15 000). Die **Validierung bleibt absichtlich
+unausgeglichen** – sie ist die Messlatte und soll GTSRB widerspiegeln, nicht das Training.
+
+**Roll-Verdrehung ist formabhängig** (`roll_angle()` in `tools/synth_data.py`): Kreise,
+Rechtecke und Rauten werden weiterhin bis ±70° gedreht (dort bricht die Heuristik), rote
+**Dreiecke nur bis ±35°**. Grund: ein Dreieck bei ~65° ist von seinem Gegenstück („Vorfahrt
+gewähren“ gegen „Gefahrzeichen“) nicht mehr zu unterscheiden – solche Bilder sind
+widersprüchliche Lernziele. Messung dazu: `warnung` verlor **18 Recall-Punkte** auf den
+stark gedrehten Bildern (0,832 → 0,655), und die Verwechslung `vorfahrtGewaehren → warnung`
+war mit 32 Fällen der häufigste Fehler überhaupt.
 
 **`--gt-zip` ist beim Test-Set Pflicht:** die Bilder liegen in
 `GTSRB_Final_Test_Images.zip`, die Labels in einem **eigenen** Archiv
@@ -187,6 +264,26 @@ python tools/synth_missing.py --out data/det --n 200 --split val   # Messlatte d
 Gemessen danach auf den beiden synthetischen Typen: `hinweis` P=0,840/R=0,781,
 `ortstafel` P=0,971/R=0,745 – der Lückenschluss wirkt.
 
+**Bilder ohne Schild** erzeugt `tools/synth_negatives.py` – zwei Sorten aus derselben
+Hintergrundverteilung wie die Positivbilder (sonst lernt das Netz „Hintergrund“ statt
+„Schild“): reiner Hintergrund (`leer`) und **harte Negative** (`hart:*`), also
+schildähnliche Störer: Rückleuchten, Ampel, Baustelle, Leuchtreklame, graue
+Schildrückseite, rote Flagge, gelbe Richtungstafel, farbige Kreise. Labels sind bewusst
+leer (0 Byte).
+
+```
+python tools/synth_negatives.py --out data/det --n 3000 --split train
+python tools/synth_negatives.py --out data/det --n 500  --split neg    # Messlatte
+```
+
+Der Split **`neg`** ist die Gegenprobe: nur Bilder ohne Schild. Dort ist **`fp/Bild`** die
+Kennzahl (`--split neg` in `tools/eval_conditions.py`). Ohne diesen Split wäre „keine
+Fehlalarme auf freier Fläche“ nicht messbar, weil jedes Validierungsbild ein Schild enthält.
+Ehrlich dazugesagt: gemessen lagen nur **31 der 226 Fehlalarme auf freiem Hintergrund**
+(14 %), **195 dagegen auf echten Schildern** – die Negative sind also eine Absicherung
+gegen Rückleuchten, Ampel & Co., aber nicht das Hauptproblem (das war die Klassentrennung,
+siehe §1 und §9.4).
+
 Kein Datenleck: Zug und Validierung kommen aus **verschiedenen Archiven** (Trainings-Zip
 bzw. Test-Zip), nicht aus denselben Aufnahmen. Der Validierungssatz des Test-Archivs ist
 das letzte 15-%-Stück des Dateinamenslaufs (zusammenhängende Aufnahmen bleiben zusammen).
@@ -209,6 +306,15 @@ nachweislich brechen (siehe `docs/DOKUMENTATION.md`, Abschnitt „Grenzen"): Dun
 Entsättigung, Bewegungsunschärfe, Roll-Verdrehung, Verdeckung, Blendung, Rauschen,
 bunte Störer. Zweck: Trainings-/Exportkette und Tests ohne echten Datensatz prüfbar.
 
+Drei Bausteine kamen beim Umbau dazu:
+
+* **`compose_negative()` / `hard_negative_sample()`** – Bilder ganz ohne Schild
+  (siehe §4.3), inklusive schildähnlicher Störer und weicher Kanten, damit sie nicht
+  trivial zu trennen sind.
+* **mehr Hintergrundarten** (`random_background`: asphalt, sky, busy, **wand, gruen,
+  nacht**) – Positiv- und Negativbilder ziehen aus derselben Verteilung.
+* **`roll_angle()`** – formabhängige Roll-Verdrehung (Dreiecke nur ±35°, siehe §4.3).
+
 ```
 python tools/synth_data.py --out data/synth --n 200
 python tools/train_det.py --data synth --epochs 30 --steps 100 --batch 8   # on-the-fly
@@ -218,9 +324,9 @@ python tools/train_det.py --data synth --epochs 30 --steps 100 --batch 8   # on-
 
 ```
 python tools/train_det.py --data data/det --size 320 --preset balanced \
-    --batch 16 --epochs 80 --steps 100 --lr 2e-3 --degrade 0.6 \
-    --workers 4 --eval-every 5 --save-every 5 \
-    --out models/signs-det.pt
+    --batch 16 --epochs 220 --steps 100 --lr 1.5e-3 --degrade 0.6 --zoom 0.5 \
+    --workers 6 --eval-every 10 --save-every 10 \
+    --out models/signs-det.pt --seed 7
 ```
 
 | Schalter | Wirkung |
@@ -232,15 +338,31 @@ python tools/train_det.py --data data/det --size 320 --preset balanced \
 | `--act silu\|hardswish` | Hardswish war in der Messung ~6 % schneller |
 | `--norm gn\|ln` | GroupNorm (schnell) oder LayerNorm je Token (genauer, teurer) |
 | `--degrade 0…1` | Anteil künstlich verschlechterter Bilder (zusätzlich zur Erzeugung) |
+| **`--zoom 0…1`** | Anteil Trainingsbilder mit **Skalenschnitt** (Mehrskaligkeit), Bereich `--zoom-lo`/`--zoom-hi` (Standard 0,7–1,5) |
+| **`--obj-norm pos\|sqrt`** | Normierung des Objektivitätsverlusts. `pos` = RetinaNet-Rezept (durch die Zahl positiver Zellen); `sqrt` ist ruhiger, wenn viele Negative im Batch liegen |
+| **`--val-split val\|neg`** | worauf während des Trainings gemessen wird (`neg` = nur Hintergrund, dann ist `fp/Bild` die Kennzahl) |
 | `--eval-every N` | Auswertung nur alle N Epochen (die letzte Epoche wird immer gemessen) |
 | `--resume models/signs-det.pt` | weitertrainieren (Architektur + Auflösung kommen aus dem Checkpoint) |
 | `--steps`, `--epochs` | Bilddurchläufe: eine Epoche sieht `steps × batch` Bilder |
 
+**`--zoom` ist der Grund, warum die Eingabegröße im Browser frei bleibt.** Ohne
+Skalenschnitt ist das Netz auf genau die Skalen festgelegt, die im Datensatz vorkommen;
+mit ihm lernt es dieselben Gewichte bei anderen Größen – 256 px (schnell), 320 px
+(Standard) oder 448 px (Standbild) sind damit eine Einstellung statt drei Modelle.
+
+> **Alte Checkpoints sind nicht mehr ladbar.** Der Umbau auf vier Stufen und zwei
+> Kopfzweige hat die Parameternamen im Kopf geändert (`pred` → `obj` + `cls`). Ein
+> Trainingslauf muss von Grund auf neu starten; `--resume` funktioniert nur noch für
+> Checkpoints ab diesem Umbau. Die Zahlen der Vorfassung (drei Stufen, ein Kopfzweig)
+> stehen in §5.1 und §9 als Vergleich, das neue Werkzeug kann sie nicht neu berechnen.
+
 ### 5.1 Was hier tatsächlich gelaufen ist
 
-`--preset balanced` (1 287 066 Parameter, 731 MFLOPs), 320×320, RTX-fähige CPU/GPU der
-Klasse GTX 1060: **rund 20 s je Epoche** (100 Schritte × 16 Bilder, inkl. Nachladen),
-Auswertung über 1 800–2 000 Validierungsbilder ~40 s.
+`--preset balanced`, 320×320, GPU der Klasse GTX 1060: **rund 20 s je Epoche**
+(100 Schritte × 16 Bilder, inkl. Nachladen und Augmentation in 6 Ladeprozessen),
+Auswertung über 2 000 Validierungsbilder ~40 s.
+
+**Vorfassung** (drei Stufen, ein Kopfzweig, 1 287 066 Parameter, 731 MFLOPs):
 
 | Block | Daten | Epochen | val bei Epoche | P | R | F1 |
 |---|---|---|---|---|---|---|
@@ -254,30 +376,93 @@ R = 0,154 (Ep. 9) → 0,342 (14) → 0,594 (29) → 0,651 (39) → 0,695 (54) �
 (Plateau, Daten ausgeschöpft) – die 3 000 synthetischen Bilder in Block 3 dagegen schon:
 erst mit ihnen existieren `hinweis` und `ortstafel` im Modell.
 
+**Aktuelle Fassung** (vier Stufen, getrennter Kopf, 1 300 360 Parameter, 878 MFLOPs) –
+ein Lauf von Grund auf, 220 Epochen in 1 h 15 min:
+
+| Block | Daten | Epochen | val bei Epoche | P | R | F1 |
+|---|---|---|---|---|---|---|
+| 4 | 26 000 Bilder (20 000 ausgeglichene GTSRB + 3 000 Lückenschluss + 3 000 Negative) | 0–219 | 9 → 219 | 0,811 → **0,883** | 0,029 → **0,796** | 0,056 → **0,837** |
+
+Der Verlauf zeigt, warum Geduld nötig war – die ausgeglichenen Klassen und die
+Mehrskaligkeit brauchen länger, holen aber weiter aus:
+
+| Epoche | 9 | 19 | 29 | 39 | 49 | 59 | 79 | 99 | 149 | 189 | 219 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| **neu** R | 0,029 | 0,183 | 0,329 | 0,483 | 0,588 | 0,669 | 0,692 | 0,752 | 0,780 | 0,793 | **0,796** |
+| Vorfassung R | 0,154 | 0,447 | 0,594 | 0,651 | 0,684 | 0,712 | 0,736 | 0,742 | 0,738 | – | 0,739 |
+
+**Ergebnis:** Recall **+5,7 Punkte** (0,739 → 0,796), F1 **+2,9 Punkte** (0,808 → 0,837),
+Precision −0,8 Punkte (0,891 → 0,883). Verpasste Boxen: 656 → **513** (−22 %),
+Fehlalarme 226 → 264 (+17 %). Der Zugewinn liegt genau dort, wo er geplant war
+(Klassen mit wenigen Beispielen, §5.2), der Preis bei `verbot` – der Klasse, die vorher
+die Hälfte aller Boxen stellte.
+
 ### 5.2 Auswertung nach Bedingung und Klasse
 
-`tools/eval_conditions.py` (füllt den früheren Punkt 3 der nächsten Schritte) gruppiert
-die Validierungsbilder über `manifest.conditions` und zählt tp/fp/fn je Gruppe:
+`tools/eval_conditions.py` gruppiert die Validierungsbilder über `manifest.conditions`
+und zählt tp/fp/fn je Gruppe:
 
 ```
-python tools/eval_conditions.py --ckpt models/signs-det.pt --data data/det --json data/eval_val.json
+python tools/eval_conditions.py --ckpt models/signs-det.pt --data data/det --diagnose --json data/eval_val4.json
 ```
 
 Stand des ausgelieferten Modells (2 000 val-Bilder, 2 509 Boxen, `conf` 0,25, IoU 0,5):
+P 0,883 / R 0,796 / F1 0,837.
 
 | Bedingung | Bilder | Boxen | P | R |
 |---|---|---|---|---|
-| ohne Bedingung | 140 | 144 | 0,929 | 0,812 |
-| unschaerfe3 | 132 | 173 | 0,917 | 0,769 |
-| hell | 413 | 501 | 0,898 | 0,758 |
-| dunkel | 412 | 525 | 0,897 | 0,747 |
-| blendung | 497 | 639 | 0,895 | 0,737 |
-| rauschen | 673 | 848 | 0,890 | 0,737 |
-| verblichen | 636 | 797 | 0,882 | 0,739 |
-| roll | 1 066 | 1 436 | 0,882 | 0,717 |
-| verdeckt | 601 | 762 | 0,867 | 0,727 |
-| unschaerfe6 | 109 | 148 | 0,872 | 0,689 |
-| **mehrere** | 444 | 888 | 0,880 | **0,634** |
+| ohne Bedingung | 140 | 144 | 0,906 | 0,868 |
+| dunkel | 412 | 525 | 0,903 | 0,798 |
+| rauschen | 673 | 848 | 0,881 | 0,800 |
+| roll | 1 066 | 1 436 | 0,879 | 0,792 |
+| unschaerfe5 | 132 | 159 | 0,855 | 0,818 |
+| verblichen | 636 | 797 | 0,886 | 0,793 |
+| hell | 413 | 501 | 0,864 | 0,798 |
+| verdeckt | 601 | 762 | 0,862 | 0,790 |
+| blendung | 497 | 639 | 0,865 | 0,773 |
+| unschaerfe3 | 132 | 173 | 0,840 | 0,792 |
+| unschaerfe2 | 113 | 140 | 0,851 | 0,814 |
+| unschaerfe4 | 112 | 132 | 0,835 | 0,765 |
+| unschaerfe6 | 109 | 148 | 0,877 | 0,723 |
+| **mehrere** | 444 | 888 | 0,860 | **0,682** |
+
+Vergleich zur Vorfassung (dieselben Bilder): Unschärfe war dort 0,69–0,72, Blendung 0,71,
+Rauschen 0,72, „mehrere“ 0,634. **Alles besser, „mehrere“ bleibt die härteste Bedingung**
+(zwei Schilder im Bild sind meist klein und liegen nah beieinander).
+
+Je Klasse (dieselbe Messung) – hier liegt der eigentliche Umbaugewinn:
+
+| Klasse | Boxen | P | R | R Vorfassung |
+|---|---|---|---|---|
+| ortstafel | 137 | 0,956 | **0,942** | 0,745 |
+| hinweis | 128 | 0,622 | **0,938** | 0,781 |
+| gebot | 339 | 0,863 | 0,891 | 0,838 |
+| vorfahrtstrasse | 91 | 0,902 | **0,813** | 0,615 |
+| einfahrtVerboten | 62 | 0,758 | **0,806** | 0,532 |
+| verbot | 1 115 | 0,981 | 0,779 | 0,801 |
+| warnung | 395 | 0,863 | 0,719 | 0,704 |
+| stop | 46 | 0,805 | **0,717** | 0,478 |
+| vorfahrtGewaehren | 196 | 0,758 | **0,689** | 0,434 |
+
+Lesbare Erkenntnisse:
+
+* **Alle Klassen mit wenigen Beispielen haben massiv zugelegt**: `stop` +24 Punkte,
+  `einfahrtVerboten` +27, `vorfahrtGewaehren` +26, `vorfahrtstrasse` +20. Das ist der
+  Klassenausgleich im Training (§4.3) – vorher stellte `verbot` die Hälfte aller Boxen.
+* **`verbot` hat 2 Punkte verloren** (0,801 → 0,779) und ist der Preis dafür. Weil
+  `verbot` aber 44 % der val-Boxen stellt, wirkt sich das auf die Gesamtzahl aus.
+* **`hinweis` hat die schwächste Precision (0,622, 73 Fehlalarme)** – blaue Rechtecke
+  werden zu oft als Hinweiszeichen gedeutet (Plakate, Schilder, Werbung). Das ist der
+  nächste Kandidat für harte Negative.
+* Die Dreiecks-Verwechslung ist kleiner, aber nicht weg: `vorfahrtGewaehren → warnung`
+  war 32× der häufigste Fehler, jetzt 14× (dafür ist `verbot → gebot` mit 31× der neue
+  häufigste). Details in §10.2.
+* Unschärfe, Dunkelheit, Blendung und Rauschen brechen das Modell weiterhin **nicht** –
+  genau die Bedingungen, an denen die Heuristik scheitert.
+
+Verlust (`DetLoss`): Objektivität als **fokale** BCE, Klasse als Cross-Entropy mit
+Label-Smoothing (nur positive Zellen), Box als L1 auf `(tx,ty,tw,th)` mit
+Größengewichtung (`2 − Fläche/Bildfläche`, begrenzt auf 0,5…2).
 
 | Klasse | Boxen | P | R | Bemerkung |
 |---|---|---|---|---|
@@ -314,9 +499,13 @@ Zellen" war der Lernschritt für die wenigen Schilder um Faktor ~16 000 verdünn
 Verlust bewegte sich kaum und die Validierung fand nichts. Nach der Umstellung fiel
 `obj` in 14 Schritten von 13,7 auf 2,0.
 
-Zielwerte je Objekt: **genau eine Zelle** auf der Stufe, deren stride der Objektgröße am
-nächsten liegt (`argmin |log2(diag/stride)|`). Dadurch bleibt der Offset `tx,ty` in
-[0,1) und passt exakt zur Decode-Formel.
+Zielwerte je Objekt: **eine Zelle** auf der Stufe, die zur **längsten Objektseite** passt
+(`ASSIGN_MAX_SIDE` in `tools/detmath.py`: < 16 px → stride 4, < 40 → stride 8, < 96 →
+stride 16, sonst stride 32). Liegt der Objektmittelpunkt im äußeren Viertel seiner Zelle,
+lernt zusätzlich die **Nachbarzelle** dasselbe Objekt (`dual`) – das behebt den auf 0,999
+festgeklemmten Offset der alten Ein-Zellen-Regel. Die vorherige Regel
+(`argmin |log2(diag/stride)|`) schickte ein 30-px-Schild auf stride 32 und damit auf ein
+10×10-Raster; sie ist der Grund für den kleinen-Schilder-Recall von ~0,29.
 
 ### 5.1 Selbsttest: kann das Netz ein Bild überfitten?
 
@@ -335,24 +524,34 @@ Fällt dieser Test unter IoU 0,5, ist etwas an Zuweisung oder Dekodierung kaputt
 ## 6. Export, Paritätscheck, Quantisierung
 
 ```
-python tools/export_onnx.py --ckpt models/signs-det.pt --out models/signs-det.onnx --int8 --calib-n 200
+python tools/export_onnx.py --ckpt models/signs-det.pt --out models/signs-det.onnx --dynamic --int8 --calib-n 200
 python tools/export_fixture.py --ckpt models/signs-det.pt        # Testfixture für tests/model.test.js
 ```
 
-Der Export erzeugt `models/signs-det.onnx` (Eingang `images`, Ausgänge `os8`, `os16`,
-`os32`), `models/labels.json` (Klassen, Größe, Stufen, Kanal-Layout – das liest
-`src/model.js`) und `models/manifest.json` (Architektur, Parameter, Trainingsmetriken,
-Parität, Größen, **sha256**, Torch-Version).
+Der Export erzeugt `models/signs-det.onnx` (Eingang `images`, **ein Ausgang je Stufe**:
+`os4`, `os8`, `os16`, `os32`), `models/labels.json` (Klassen, Größe, Stufen, Kanal-Layout –
+das liest `src/model.js`) und `models/manifest.json` (Architektur, Parameter,
+Trainingsmetriken, Parität, Größen, **sha256**, Torch-Version).
 
-Der **Paritätscheck** im Export ist Pflicht, nicht Deko: PyTorch und ONNX Runtime
-rechnen dieselben Bilder, verglichen werden rohe Tensoren **und** die fertigen
-Erkennungen. Gemessen am **ausgelieferten** Modell (`models/signs-det.onnx`, E159):
+`--dynamic` lässt Höhe und Breite offen. Dann kann **ein** Modell mit 256, 320, 384 oder
+448 px laufen, und die App bekommt eine Qualitäts-/Tempowahl (§3). Die Gegenprobe dazu ist
+im Export eingebaut: dasselbe Bild wird zusätzlich in `--check-size` durch ONNX geschickt
+und die Ausgangsformen werden gegen `size/stride` geprüft. Gemessen:
 
-* maximale Tensorabweichung **1,1 · 10⁻⁴**
-* Erkennungen: 4 gegen 4, **alle** Paare mit **IoU ≥ 0,95** → Export ist korrekt
-* Dateigröße **5,16 MB** (fp32), ONNX Runtime CPU (x86, 1 Thread), 320×320: **7,2 ms**
-  je Bild in der Referenzmessung des Exports (dieselbe Maschine, 4 Threads: 20–68 ms
-  unter Last – die Streuung kommt von der Auslastung, nicht vom Graphen)
+```
+[dynamisch] Eingang 384x384 -> Formen [[1,14,96,96], [1,14,48,48], [1,14,24,24], [1,14,12,12]]  passend=True  max. Abweichung=9,54e-06
+```
+
+Der **Paritätscheck** im Export ist Pflicht, nicht Deko: PyTorch und ONNX Runtime rechnen
+dieselben Bilder, verglichen werden rohe Tensoren **und** die fertigen Erkennungen.
+Gemessen am **ausgelieferten** Modell (E219, dynamisch):
+
+* maximale Tensorabweichung **2,1 · 10⁻⁴**
+* Erkennungen: 9 gegen 9, **alle** Paare mit **IoU ≥ 0,95** → Export ist korrekt
+* Dateigröße **5,23 MB** (fp32), ONNX Runtime CPU (x86, 1 Thread), 320×320: **10–18 ms**
+  je Bild (Referenzmessung des Exports; die Streuung kommt von der Auslastung der Maschine,
+  nicht vom Graphen). Statisch exportiert sind es 17,7 ms bei 320 px und 16,7 ms bei
+  384 px – die offenen Achsen kosten auf x86 rund 59 % (§3).
 
 **int8 ist nicht automatisch gut.** Mit 6 synthetischen Kalibrierbildern war das
 quantisierte Modell unbrauchbar: maximale Abweichung **4,12**. Auch mit **200 echten**
@@ -365,7 +564,7 @@ Hinweis im Log). Rezepte für einen zweiten Versuch: `QuantFormat.QOperator` sta
 quantisierungsfreundlich umbauen (die Warnungen des Quantisierers zeigen genau dorthin:
 `Expected bias '/p5/norm1/op/Constant_2_output_0' to be an initializer`).
 
-Warum das wichtig ist: Größe und Latenz sind verlockend (1,47 MB statt 5,16 MB), aber
+Warum das wichtig ist: Größe und Latenz sind verlockend (1,47 MB statt 5,23 MB), aber
 ein stillschweigend verschlechtertes Modell wäre im Feld schwer zu finden.
 
 ## 7. Browser-Seite
@@ -380,8 +579,16 @@ sich ONNX Runtime Web aus demselben Verzeichnis. `src/model.js`
 * liefert dieselbe Struktur `{label, x, y, w, h, conf, …}` wie `detector.js`.
 
 `src/app.js` entscheidet: Modell geladen → Modellpfad, sonst Heuristik. Im Modellpfad
-wird das **Quellbild** (Video/Photo) in ein 320×320-Letterbox-Canvas gezeichnet – das
-Netz sieht also echte 320 px Detail statt der auf 240 px verkleinerten Heuristik-Eingabe.
+wird das **Quellbild** (Video/Photo) in ein Letterbox-Canvas gezeichnet – das Netz sieht
+also echte 320 px Detail statt der auf 240 px verkleinerten Heuristik-Eingabe. Die
+**Eingabegröße** ist wählbar (Auswahlfeld „KI-Eingang“, erscheint nur im KI-Modus):
+
+* **automatisch** – Video in Modellgröße (320 px), **Foto in 384 px** (dort zählt Tempo
+  nicht, und 384 px bringt gemessene +2,5 Punkte Recall bei −21 % Fehlalarmen, §3)
+* **256 px** als Sparmodus für langsame Geräte, **448 px** für ein scharfes Einzelbild
+* Der Status zeigt die tatsächlich benutzte Größe und die gemessene Zeit:
+  `KI-Modell (wasm, 384 px) · 213 ms (Vorbereitung 2 ms)`
+
 Nebeneffekte, die man kennen sollte:
 
 * `conf` ist im Modellpfad eine **echte Score-Zahl** (sigmoid(obj)·max sigmoid(cls)),
@@ -397,14 +604,17 @@ Nebeneffekte, die man kennen sollte:
 
 | Punkt | Status |
 |---|---|
-| Modell, Training, Verlust, Zuweisung | **verifiziert** (`tools/selfcheck.py`: IoU ≈ 0,90 auf einem Bild) |
-| **Training auf echten Daten** (GTSRB, 23 000 + 2 000 Bilder) | **gelaufen** – P=0,891 / R=0,739 / F1=0,808 auf den val-Bildern (§5.1) |
-| **Auswertung nach Bedingung und Klasse** | **gemessen** (`tools/eval_conditions.py`, §5.2) – schlechtester Fall `mehrere` R=0,634, beste Klasse `ortstafel` R=0,745 |
+| Modell, Training, Verlust, Zuweisung | **verifiziert** (`tools/selfcheck.py`: nach 120 Schritten wird das eine Bild gefunden) |
+| **Training auf echten Daten** (GTSRB, 26 000 + 2 000 Bilder) | **gelaufen** – P = 0,883 / R = 0,796 / F1 = 0,837 auf den val-Bildern (§5.1); Vorfassung 0,891 / 0,739 / 0,808 |
+| **Auswertung nach Bedingung und Klasse** | **gemessen** (`tools/eval_conditions.py --diagnose`, §5.2/§10) – schlechtester Fall `mehrere` R = 0,682, schwächste Precision `hinweis` 0,622 |
+| **Fehlalarme auf Bildern ohne Schild** | **gemessen** (Split `neg`, 500 Bilder): 0,011 je Bild auf reinem Hintergrund, 0,155 auf schildähnlichen Störern |
+| **Eingabegröße 256/320/384 px** | **gemessen** (§3): F1 0,796 / 0,837 / 0,854 – als App-Einstellung verfügbar |
 | **Alle neun Typen im Modell** | **verifiziert** – `hinweis`/`ortstafel` rein synthetisch gelernt (§4.3) |
-| Parameter/FLOPs je Transformer-Variante | **gemessen** (`tools/bench_model.py`) |
-| ONNX-Export = PyTorch-Ausgabe | **verifiziert** (1,1 · 10⁻⁴, 4/4 Erkennungen IoU ≥ 0,95) |
+| Parameter/FLOPs je Variante | **gemessen** (`tools/bench_model.py`) |
+| ONNX-Export = PyTorch-Ausgabe | **verifiziert** (2,1 · 10⁻⁴, 9/9 Erkennungen IoU ≥ 0,95; dynamische Achsen zusätzlich bei 384 px geprüft) |
 | JavaScript-Dekodierung = Python-Dekodierung | **verifiziert** (`node tests/model.test.js`, Fixture aus dem **ausgelieferten** Modell) |
-| Letterbox/NMS/Rückrechnung in JS | **verifiziert** (26 Checks, `node tests/model.test.js`) |
+| Letterbox/NMS/Rückrechnung in JS | **verifiziert** (`node tests/model.test.js`, 32 Prüfungen) |
+| Laufzeit im **Browser** (wasm, echtes Gerät) | **gemessen für die Vorfassung**: 122 ms bei 320 px. Für die neue Fassung steht die Gerätezahl noch aus (die App zeigt sie an) |
 | Laufzeit auf **echten Handys** (WebGPU/WASM) | **nicht gemessen** – benötigt Gerätetest |
 | Erkennungsqualität auf echten **Straßenbildern** | **nicht gemessen** – der val-Satz besteht aus GTSRB-Ausschnitten auf erzeugten Hintergründen, nicht aus ganzen Szenen |
 | int8 brauchbar | **widerlegt** – 6 synthetische *und* 200 echte Kalibrierbilder, Tor verwirft es |
@@ -413,22 +623,32 @@ Nebeneffekte, die man kennen sollte:
 
 1. **Zahlen/Symbole** („30", Pfeile) liest auch dieses Netz nicht – dafür braucht es
    einen zweiten, kleinen Klassifikator auf dem Innenausschnitt oder OCR.
-2. **Rechenzeit auf dem Handy** zuerst messen: 320 px auf WebGPU, 192–224 px im
-   WASM-Rückfall. Die WEBGPU-Verfügbarkeit ist gut (Android 12+, iOS 26), aber
-   nicht überall.
+2. **Rechenzeit im Browser**: gemessen wurde `wasm` (Einfachthread) mit **122 ms** für die
+   Vorfassung (731 MFLOPs) – das sind ~0,167 ms je MFLOP. Die neue Fassung hat 878 MFLOPs,
+   also grob 150 ms; die Zahl am echten Gerät steht noch aus (Anzeige in der App).
+   Offene Frage: warum greift der Rückfall auf `wasm`, obwohl `webgpu` zuerst versucht
+   wird – wenn WebGPU läuft, ist deutlich mehr Rechnung bezahlbar.
 3. ~~**Auswertung nach Bedingung** fehlt noch~~ → **erledigt**: `tools/eval_conditions.py`
-   (Tabelle je Bedingung und je Klasse, `--json` für die Ablage in `data/`).
-4. **Dreiecks-Verwechslung senken** (`vorfahrtGewaehren` R=0,43 gegen `warnung`):
-   Roll-Verdrehung im Datensatz begrenzen (z.B. ±25°) oder die Innenfläche als
-   zusätzliches Merkmal geben. Das ist mit Abstand der größte Einzelposten (111 von
-   656 verpassten Boxen).
-5. **Kleine Klassen auffüllen** (`stop` 46, `einfahrtVerboten` 62 val-Boxen):
-   mehr Kompositionen dieser Klassen, z.B. über `--n` und gezielte Kacheln wie in
-   `tools/synth_missing.py`.
-6. **Verlust verfeinern**: CIoU statt L1 für die Box, Hard-Negative-Mining für die
-   Objektivität, mehrere positive Zellen je Objekt – typische +2…5 Punkte Recall bei
-   kleinen Schildern. Block 2 in §5.1 hat gezeigt, dass mehr Epochen allein **nichts**
-   mehr bringen.
+   (Tabelle je Bedingung und je Klasse, `--diagnose` für die Fehlerzerlegung, `--json` für
+   die Ablage in `data/`).
+4. **Dreiecks-Verwechslung** (`vorfahrtGewaehren` R=0,43 gegen `warnung`) – **angegangen**
+   mit drei Maßnahmen: Roll-Verdrehung für Dreiecke auf ±35° begrenzt (die alte
+   Augmentation erzeugte widersprüchliche Ziele), Klassen ausgeglichen, Kopf in zwei
+   Zweige getrennt. Ergebnisse in §5.1/§10. Bleibt offen: die Innenfläche (weißes Dreieck)
+   als zusätzliches Merkmal, und eine Entscheidungsschicht, die zwei Dreiecks-Klassen auf
+   derselben Stelle gegeneinander abwägt – gemessen brachte eine Arbitrierung nach NMS
+   allerdings nur **+0,7 % Precision**, deshalb nicht eingebaut.
+5. ~~**Kleine Klassen auffüllen**~~ → **erledigt** über `--balance` in
+   `tools/gtsrb_dataset.py`: jeder Typ hat jetzt ~3 600 Trainingsboxen (`stop` 3 625 statt
+   ~200, `verbot` 3 591 statt ~15 000). Die Validierung bleibt absichtlich unausgeglichen.
+6. **Verlust und Zuweisung**: `dual` (Nachbarzelle bei Randlage) und die Zuordnung nach
+   längster Seite sind **eingebaut**. Ein **CIoU-Verlust ist gemessen widerlegt** – die
+   Treffer haben schon eine mittlere IoU von 0,938, dort ist nichts zu holen.
+   **Hard-Negative-Mining bleibt offen**: das Netz könnte über den negativen Pool laufen
+   und die besten Fehltreffer selbst als Trainingsbilder nachliefern. Der gemessene Nutzen
+   ist aber begrenzt, weil nur 31 der 226 Fehlalarme auf freier Fläche lagen.
+   Ebenfalls gemessen: **mehr Epochen allein bringen nichts** (Block 2 in §5.1 war ein
+   Plateau über 40 Epochen).
 7. **Eigene Szenen** (§4.4) sind weiterhin der eigentliche Qualitätssprung: die val-Zahlen
    hier stammen aus komponierten Bildern, nicht aus Kamerafahrten.
 8. **Lizenzen** (Abschnitt 4.2) klären, bevor Fremddaten in ein veröffentlichtes Modell
@@ -437,5 +657,105 @@ Nebeneffekte, die man kennen sollte:
    ohne Trainingsdaten-Hash ist ein Modell nicht reproduzierbar. Für die Daten gehört
    zusätzlich der GTSRB-Archiv-Hash dazu (die Archive sind unveränderlich, der Hash
    steht auf der ERDA-Seite).
+10. **Kompatibilität**: Checkpoints der Vorfassung (drei Stufen, ein Kopfzweig) sind nicht
+    mehr ladbar (siehe §5). Wer den Vergleich reproduzieren will, muss die Vorfassung aus
+    der Versionsgeschichte holen und dort trainieren.
+
+## 10. Fehlerzerlegung: warum Boxen verpasst oder erfunden werden
+
+Eine Gesamtzahl versteckt die Ursache. `tools/eval_conditions.py --diagnose` teilt deshalb
+jede verpasste Box ein (keine Erkennung in der Nähe = Objektivität, Box sitzt falsch,
+falsche Klasse) und jeden Fehlalarm (auf einem echten Schild oder auf freier Fläche):
+
+```
+python tools/eval_conditions.py --ckpt models/signs-det.pt --data data/det --diagnose
+python tools/eval_conditions.py --ckpt models/signs-det.pt --data data/det --split neg
+```
+
+### 10.1 Vorfassung (drei Stufen, ein Kopfzweig) – die Zahlen, die den Umbau ausgelöst haben
+
+Gemessen mit 2 000 val-Bildern (2 509 Boxen), conf 0,25, IoU 0,5:
+TP 1 853, FP 226, FN 656.
+
+| Ursache | Anzahl | Anteil | Größe (Median) |
+|---|---|---|---|
+| verpasst (Objektivität) | 334 | 51 % der FN | 35 px – **46 % davon ≤ 32 px** |
+| falsche Klasse | **212** | **32 % der FN** | – |
+| Box sitzt falsch (IoU 0,1–0,5) | 110 | 17 % der FN | 125 px (große Schilder) |
+| FP auf echtem Schild | **195** | **86 % der FP** | – |
+| FP auf freier Fläche | 31 | 14 % der FP | – |
+
+Weiteres aus derselben Messung:
+
+* **Treffer-IoU im Mittel 0,938** (84 % über 0,9) – die Lokalisierung *gefundener* Schilder
+  ist nicht das Problem, ein CIoU-Verlust hätte hier nichts zu holen.
+* Verwechslungen (`gt → vorhergesagt`): `vorfahrtGewaehren → warnung` **32×** (häufigster
+  Fehler), `warnung → verbot` 12×, `verbot → warnung` 11×.
+* Nach Roll getrennt (1 000 Bilder): gesamt R 0,771 → **0,729** mit Roll; `warnung`
+  0,832 → **0,655**.
+* Klassenerinnerung: `vorfahrtGewaehren` **0,434**, `stop` 0,583, `einfahrtVerboten` 0,559,
+  `vorfahrtstrasse` 0,632, `warnung` 0,737, `verbot` 0,792, `gebot` 0,876 – und `verbot`
+  stellte **50 % aller Boxen** (GTSRB besteht zur Hälfte aus Tempolimits).
+* Schwellenwanderung (600 Bilder): conf 0,15 → P 0,812 / R 0,808; conf 0,25 → 0,896 / 0,753;
+  conf 0,35 → 0,938 / 0,675. F1 ist dabei fast konstant – die Schwelle ist ein
+  Recall/Precision-Regler, kein Qualitätsgewinn.
+* **Nachverarbeitung hilft nicht:** eine Klassen-Arbitrierung nach der NMS (zwei Klassen auf
+  derselben Stelle → nur die beste) brachte **+0,7 % Precision**; klassenloses NMS zerstört
+  das Ergebnis (P 0,023). Die Fehlalarme sind also keine Duplikate auf identischer Stelle,
+  sondern echte Fehlentscheidungen des Kopfes.
+
+Daraus folgten genau die vier Umbauten: Zuordnung nach längster Seite plus `stride 4`
+(kleine Schilder), getrennter Kopf (Arten), Klassenausgleich, begrenzte Roll-Verdrehung für
+Dreiecke. Die Negative gegen freie Fläche wurden trotzdem ergänzt (§4.3) – nur mit dem
+klaren Wissen, dass sie 14 % der Fehlalarme adressieren, nicht 86 %.
+
+### 10.2 Aktuelle Fassung
+
+Dieselbe Messung, dieselben 2 000 val-Bilder, dieselbe Schwelle. Zum Vergleich die
+Vorfassung daneben (TP 1 996, FP 264, FN 513):
+
+| Ursache | Anzahl | Anteil | vorher | Größe (Median) |
+|---|---|---|---|---|
+| verpasst (Objektivität) | 266 | 51,9 % | 334 | 30 px |
+| falsche Klasse | 160 | 31,2 % | 212 | – |
+| Box sitzt falsch (IoU 0,1–0,5) | 87 | 17,0 % | 110 | 125 px |
+| FP auf echtem Schild | 180 | 68,2 % | 195 | – |
+| FP auf freier Fläche | 84 | 31,8 % | 31 | – |
+
+* **Lokalisierung deutlich besser:** Treffer-IoU im Mittel **0,954** (vorher 0,938),
+  nur noch **10** Treffer unter 0,7 (vorher 31). Das ist der Effekt von `stride 4` plus
+  der Nachbarzellen-Zuweisung – nicht von einem neuen Boxverlust (der blieb L1).
+* **Alle drei Fehlerarten sind gesunken**: −68 verpasst, −52 falsche Klasse, −23 falsche Box.
+* **Fehlalarme haben sich verschoben, nicht verringert:** auf freier Fläche 31 → 84. Das
+  ausgeglichene Training macht seltene Typen empfindlicher, und die schwächste Precision
+  hat jetzt `hinweis` (0,622) – blaue Rechtecke. Auf dem **negativen Split** (500 Bilder
+  ohne jedes Schild, von `tools/synth_negatives.py`):
+
+  | Art der Fläche | Bilder | Fehlalarme | je Bild |
+  |---|---|---|---|
+  | nur Hintergrund (`leer`) | 274 | 3 | **0,011** |
+  | harte Störer (`hart:*`) | 226 | 35 | 0,155 |
+  | **gesamt** | 500 | 38 | **0,076** |
+
+  Reiner Hintergrund ist also praktisch fehlalarmfrei (3 von 274), während die bewusst
+  schildähnlichen Störer weiter treffen – am stärksten `hart:kreise` (13 von 30) und
+  `hart:bake` (5 von 28). Ziel war ≤ 0,05 gesamt; erreicht ist 0,076. Der ehrliche
+  nächste Schritt wäre Hard-Negative-Mining genau auf diesen Bildern.
+* **Verwechslungen:** `vorfahrtGewaehren → warnung` von 32 auf **14** gefallen (die
+  Roll-Begrenzung wirkt), dafür ist `verbot → gebot` mit 31 der neue Spitzenreiter –
+  rote Kreise werden mit blauen verwechselt. Auch das ist eine Folge des Ausgleichs
+  (`gebot` bekommt mehr Gewicht) und der nächste Ansatzpunkt.
+* **Fehlalarme sind selten sicher:** 25 von 264 liegen über Score 0,6, der Rest darunter
+  (87 bei 0,25–0,30, 93 bei 0,30–0,40, 59 bei 0,40–0,60). Eine höhere Schwelle in der
+  App verschiebt das Verhältnis also wirksam – auf Kosten von Recall (§10.1).
+
+Reproduzieren:
+
+```
+python tools/eval_conditions.py --ckpt models/signs-det.pt --data data/det --diagnose
+python tools/eval_conditions.py --ckpt models/signs-det.pt --data data/det --split neg
+python tools/eval_conditions.py --ckpt models/signs-det.pt --data data/det --size 384   # größerer Eingang
+```
+
 
 

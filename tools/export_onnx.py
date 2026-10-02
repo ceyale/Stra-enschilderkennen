@@ -3,7 +3,8 @@ tools/export_onnx.py - Trainiertes Netz nach ONNX ausgeben und die Ausgabe pruef
 
 Schritte:
   1. Checkpoint laden (models/signs-det.pt oder --ckpt), Netz rekonstruieren.
-  2. ONNX-Export mit statischer Eingabe (1,3,size,size) und drei Ausgaengen os8/os16/os32.
+  2. ONNX-Export mit statischer Eingabe (1,3,size,size) und einem Ausgang je Stufe
+   (os4/os8/os16/os32, siehe tools/detmath.py LEVELS).
   3. Paritaetscheck: PyTorch vs. ONNX Runtime auf denselben Bildern - sowohl rohe
      Tensoren (max. Abweichung) als auch die fertigen Erkennungen (Klassen + Boxen).
      Ohne diesen Schritt kann der Browser still andere Ergebnisse liefern als das Training.
@@ -85,12 +86,23 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def export_onnx(model, size: int, out_path: Path) -> None:
+def export_onnx(model, size: int, out_path: Path, dynamic: bool = False) -> None:
+    """Exportieren; die Ausgangsnamen folgen den Stufen (os4, os8, os16, os32).
+
+    src/model.js liest sie ueber labels.levels -> out['os' + stride]. Das Namensschema
+    haengt also an tools/detmath.py (LEVELS) und nicht an einer Liste hier.
+
+    dynamic=True laesst Hoehe und Breite offen (Vielfache von 32): EIN Modell fuer alle
+    Eingabegroessen. Das ist messbar sinnvoll - auf den val-Bildern bringt 384 px gegenueber
+    320 px +2.5 Punkte Recall und 21 % weniger Fehlalarme, 256 px ist umgekehrt der
+    Sparmodus fuer langsame Geraete (docs/TRAINING.md 3).
+    """
     dummy = torch.zeros(1, 3, size, size)
+    axes = {"images": {0: "batch", 2: "height", 3: "width"}} if dynamic else None
     torch.onnx.export(
         model, (dummy,), str(out_path),
-        input_names=["images"], output_names=["os8", "os16", "os32"],
-        opset_version=17, dynamo=False, do_constant_folding=True,
+        input_names=["images"], output_names=[f"os{s}" for s in dm.LEVELS],
+        opset_version=17, dynamo=False, do_constant_folding=True, dynamic_axes=axes,
     )
 
 
@@ -103,6 +115,28 @@ def ort_session(path: Path):
 def ort_run(sess, x: np.ndarray) -> list[np.ndarray]:
     names = [o.name for o in sess.get_outputs()]
     return sess.run(names, {"images": x})
+
+
+def dynamic_check(model, sess, size: int, other: int, seed: int = 5) -> dict:
+    """Gegenprobe fuer dynamische Achsen: dasselbe Bild in anderer Groesse durch ONNX.
+
+    Ohne diese Pruefung faellt eine offene Hoehe/Breite erst im Browser auf. Verglichen
+    werden die Ausgangsformen (muessen zu size/stride passen) und die Tensorabweichung
+    gegen PyTorch bei derselben Groesse.
+    """
+    rng = random.Random(seed)
+    arr, _, _ = sd.compose_sample(rng, size, degrade_prob=0.5)
+    from PIL import Image
+
+    small = np.asarray(Image.fromarray(arr).resize((other, other), Image.BILINEAR))
+    x = np.ascontiguousarray(small.transpose(2, 0, 1))[None].astype(np.float32) / 255.0
+    with torch.no_grad():
+        ref = [o.numpy()[0] for o in model(torch.from_numpy(x))]
+    got = ort_run(sess, x)
+    shapes = [list(o.shape) for o in got]                # (1, 14, H/stride, W/stride)
+    diff = max(float(np.abs(a - b[0]).max()) for a, b in zip(ref, got))
+    ok = all(s[2] == other // lv and s[3] == other // lv for s, lv in zip(shapes, dm.LEVELS))
+    return {"size": other, "shapes": shapes, "max_diff": diff, "forme_ok": ok}
 
 
 def parity_check(model, sess, size: int, n: int = 6, seed: int = 99) -> dict:
@@ -149,24 +183,38 @@ def main() -> None:
     ap.add_argument("--calib-n", type=int, default=8, help="Kalibrierbilder fuer int8 (mehr = besser)")
     ap.add_argument("--calib-data", default="", help="Ordner mit echten Bildern (z.B. data/det) fuer die Kalibrierung")
     ap.add_argument("--parity-n", type=int, default=6)
+    ap.add_argument("--size", type=int, default=0,
+                    help="Exportgroesse abweichend vom Checkpoint (0 = wie trainiert)")
+    ap.add_argument("--dynamic", action="store_true",
+                    help="Hoehe/Breite offenlassen (Vielfache von 32) - ein Modell fuer 256/320/384/448 px")
+    ap.add_argument("--check-size", type=int, default=384,
+                    help="Groesse fuer die Gegenprobe der dynamischen Achsen")
     ap.add_argument("--bench", type=int, default=10, help="Laeufe fuer die Laufzeitmessung (CPU-Referenz)")
     args = ap.parse_args()
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     model, cfg, ck = load_model(args.ckpt)
-    size = int(ck.get("size", 320))
+    size = int(args.size or ck.get("size", 320))
     print(f"[ckpt] {args.ckpt}  cfg={cfg.name()}  size={size}  params={n_params(model)}  "
           f"epoche={ck.get('epoch')}  metriken={ck.get('metrics')}")
 
-    export_onnx(model, size, out_path)
-    print(f"[export] {out_path}  {out_path.stat().st_size/1e6:.2f} MB")
+    export_onnx(model, size, out_path, dynamic=args.dynamic)
+    print(f"[export] {out_path}  {out_path.stat().st_size/1e6:.2f} MB"
+          + ("  (dynamische Hoehe/Breite)" if args.dynamic else ""))
 
     sess = ort_session(out_path)
     par = parity_check(model, sess, size, args.parity_n)
     print(f"[paritaet] max. Tensorabweichung={par['max_tensor_diff']:.2e}  "
           f"Erkennungen torch={par['det_ref']} onnx={par['det_onnx']} "
           f"davon IoU>=0.95 {par['matched_iou95']}")
+
+    dyn = None
+    if args.dynamic:
+        dyn = dynamic_check(model, sess, size, args.check_size)
+        print(f"[dynamisch] Eingang {args.check_size}x{args.check_size} -> "
+              f"Formen {dyn['shapes']}  passend={dyn['forme_ok']}  "
+              f"max. Tensorabweichung={dyn['max_diff']:.2e}")
 
     x = np.ascontiguousarray(np.zeros((1, 3, size, size), np.float32))
     t0 = time.perf_counter()
@@ -197,12 +245,13 @@ def main() -> None:
 
     labels = {"format": "signs-det/1", "classes": SIGN_LABELS, "size": size, "levels": list(dm.LEVELS),
               "channels": dm.N_CH, "layout": "tx,ty,tw,th,obj,cls0..cls8",
-              "score": "sigmoid(obj)*max(sigmoid(cls))", "files": files}
+              "score": "sigmoid(obj)*max(sigmoid(cls))", "dynamic": bool(args.dynamic),
+              "files": files}
     (out_path.parent / "labels.json").write_text(json.dumps(labels, indent=2, ensure_ascii=False), encoding="utf-8")
 
     manifest = {"arch": cfg.as_dict(), "params": n_params(model), "size": size, "classes": SIGN_LABELS,
                 "trained_epoch": ck.get("epoch"), "train_metrics": ck.get("metrics"),
-                "parity": par, "ort_cpu_ms": round(ms, 2), "files": files,
+                "parity": par, "dynamic": dyn, "ort_cpu_ms": round(ms, 2), "files": files,
                 "sha256": {k: sha256(out_path.parent / v) for k, v in files.items() if k.endswith("onnx")},
                 "torch": torch.__version__}
     (out_path.parent / "manifest.json").write_text(

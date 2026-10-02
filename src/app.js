@@ -33,6 +33,15 @@
   }
 
   /** Erkennung auf einer Bildquelle ausführen (Video oder Foto): KI-Modell oder Heuristik. */
+  /** Eingabegröße des Netzes. "auto" = Video in Modellgröße (320), Foto in 384 px –
+   *  gemessen auf 2000 val-Bildern: 256 px F1 0,796 / 320 px 0,837 / 384 px 0,854.
+   *  Das Modell wird mit offener Höhe/Breite exportiert, deshalb geht jede dieser Größen. */
+  function modelInputSize(kind) {
+    const v = $('size') ? $('size').value : 'auto';
+    if (v && v !== 'auto') return +v;
+    return kind === 'foto' ? 384 : ((model && model.size) || 320);
+  }
+
   function analyse(source, useTracker) {
     if (model) return analyseModel(source, useTracker);
     const t0 = performance.now();
@@ -53,18 +62,21 @@
     const sw = source.videoWidth || source.naturalWidth;
     const sh = source.videoHeight || source.naturalHeight;
     if (!sw || !sh) return;
+    const sz = modelInputSize(useTracker ? 'video' : 'foto');
+    if (modelCv.width !== sz) modelCv.width = modelCv.height = sz;
     const t0 = performance.now();
-    SignModel.drawLetterbox(mctx, source, sw, sh, model.size);        // Grau 114 wie im Training
-    const img = mctx.getImageData(0, 0, model.size, model.size);
+    SignModel.drawLetterbox(mctx, source, sw, sh, sz);                 // Grau 114 wie im Training
+    const img = mctx.getImageData(0, 0, sz, sz);
     const tPrep = performance.now() - t0;
-    const dets = await model.detect(img);
-    const lb = SignModel.math.letterboxParams(sw, sh, model.size);
+    const dets = await model.detect(img, sz);
+    const lb = SignModel.math.letterboxParams(sw, sh, sz);
     const mapped = SignModel.math.toImageCoords(dets, lb, model.labels.classes);
     current = useTracker ? tracker.update(mapped) : mapped;
     mask = null;                                                     // Farbmasken gibt es nur in der Heuristik
     srcW = sw; srcH = sh; boxScale = view.width / sw;
     statusEl.textContent = (running ? 'Kamera läuft' : 'Foto analysiert') + ' · KI-Modell (' + model.backend
-      + ') · ' + Math.round(performance.now() - t0) + ' ms (Vorbereitung ' + Math.round(tPrep) + ' ms)';
+      + ', ' + sz + ' px) · ' + Math.round(performance.now() - t0) + ' ms (Vorbereitung '
+      + Math.round(tPrep) + ' ms)';
     renderList();
     draw();
   }
@@ -168,6 +180,8 @@
     $('satOut').textContent = (+$('sat').value).toFixed(2);
     if (still) showStill();
   }));
+  // Größe des Netz-Eingangs: nur relevant im KI-Modus, deshalb erst dann sichtbar.
+  $('size').addEventListener('change', () => { if (still) showStill(); });
   renderList();
 
   // Optionales KI-Modell: liegen models/labels.json + eine ONNX-Datei bereit und ist
@@ -179,8 +193,9 @@
       statusEl.textContent = 'Heuristik-Modus (' + res.reason + ')';
       return;
     }
-    modelCv.width = modelCv.height = res.size;
+    modelCv.width = modelCv.height = modelInputSize('video');
     model = res;
+    $('sizeRow').hidden = false;                 // Größenwahl ist nur im KI-Modus sinnvoll
     statusEl.textContent = 'KI-Modell bereit (' + res.backend + ', ' + res.size
       + ' px). Kamera starten oder ein Foto wählen.';
   })();

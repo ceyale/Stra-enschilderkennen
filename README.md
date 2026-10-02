@@ -27,14 +27,18 @@ Dann `http://localhost:8000` öffnen. `localhost` gilt als sicher, die Webcam fu
 
 ## KI-Modus (optional)
 
-Ein kleines Netz sagt **Position und Art** in einem Durchlauf voraus (anchor-free, drei
+Ein kleines Netz sagt **Position und Art** in einem Durchlauf voraus (anchor-free, vier
 Stufen, 9 Typen) – trainiert mit `tools/`, ausgeliefert als ONNX und im Browser gerechnet.
 Einzelne tiefe Stufen sind **Transformer-Blöcke** statt CNN-Schichten; mehr dazu und alle
 gemessenen Zahlen in [`docs/TRAINING.md`](docs/TRAINING.md).
 
-**Aktueller Stand (gemessen, `docs/TRAINING.md` §5):** 1 287 066 Parameter, 731 MFLOPs,
-5,16 MB ONNX – auf 2 000 Validierungsbildern **P = 0,891 / R = 0,739 / F1 = 0,808**,
-alle neun Typen inklusive `hinweis` und `ortstafel`.
+**Aktueller Stand (gemessen, `docs/TRAINING.md` §5):** 1 300 360 Parameter, 878 MFLOPs,
+5,23 MB ONNX – auf 2 000 Validierungsbildern **P = 0,883 / R = 0,796 / F1 = 0,837**,
+alle neun Typen inklusive `hinweis` und `ortstafel`. Vor der Überarbeitung waren es
+0,891 / 0,739 / 0,808 – der Recall ist um **5,7 Punkte** gestiegen, vor allem bei den
+Typen mit wenigen Beispielen (`stop` R 0,48 → 0,72, `vorfahrtGewaehren` 0,43 → 0,69).
+Die Eingabegröße ist wählbar: 256 px (F1 0,796, Sparmodus), 320 px (0,837, Video),
+**384 px (0,854, Foto)** – dieselbe Modell-Datei.
 
 Mit echten Daten (GTSRB, frei für Forschung) statt nur synthetischen:
 
@@ -47,17 +51,21 @@ curl -L -C - -o data/gtsrb/GTSRB_Final_Test_GT.zip \
   https://sid.erda.dk/public/archives/daaeac0d7ce1152aea9b61d9f1e19370/GTSRB_Final_Test_GT.zip
 
 python tools/gtsrb_dataset.py --zip data/gtsrb/GTSRB_Final_Training_Images.zip \
-    --out data/det --n 20000 --size 320                    # train
+    --out data/det --n 20000 --size 320 --balance           # train (Typen ausgeglichen)
 python tools/gtsrb_dataset.py --zip data/gtsrb/GTSRB_Final_Test_Images.zip \
     --gt-zip data/gtsrb/GTSRB_Final_Test_GT.zip \
     --out data/det --n 1800 --size 320 --split val          # val (Labels im Extra-Archiv!)
 python tools/synth_missing.py --out data/det --n 3000        # hinweis + ortstafel fehlen in GTSRB
 python tools/synth_missing.py --out data/det --n 200 --split val
+python tools/synth_negatives.py --out data/det --n 3000 --split train   # Bilder OHNE Schild
+python tools/synth_negatives.py --out data/det --n 500  --split neg     # Messlatte dafür
 
 python tools/train_det.py --data data/det --size 320 --preset balanced \
-    --batch 16 --epochs 80 --steps 100 --workers 4 --eval-every 5   # --device auto erkennt CUDA
-python tools/eval_conditions.py --ckpt models/signs-det.pt --data data/det
-python tools/export_onnx.py --ckpt models/signs-det.pt --int8 --calib-n 200 --calib-data data/det
+    --batch 16 --epochs 220 --steps 100 --lr 1.5e-3 --degrade 0.6 --zoom 0.5 \
+    --workers 6 --eval-every 10 --save-every 10               # --device auto erkennt CUDA
+python tools/eval_conditions.py --ckpt models/signs-det.pt --data data/det --diagnose
+python tools/eval_conditions.py --ckpt models/signs-det.pt --data data/det --split neg
+python tools/export_onnx.py --ckpt models/signs-det.pt --dynamic   # eine Datei für 256…448 px
 ```
 
 Ohne echten Datensatz geht es auch rein synthetisch (Rauchtest der ganzen Kette):

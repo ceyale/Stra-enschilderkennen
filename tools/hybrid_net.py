@@ -2,12 +2,19 @@
 tools/hybrid_net.py - Hybrides Nano-Netz fuer Schildererkennung.
 
 Aufgabe: in EINEM Vorwaertslauf Position (Bounding Box) und Art (9 Schildtypen)
-finden - anchor-free, einstufig, drei Aufloesungsstufen (stride 8 / 16 / 32)
+finden - anchor-free, einstufig, vier Aufloesungsstufen (stride 4 / 8 / 16 / 32)
 bei fester Eingabe 320x320.
+
+Warum vier Stufen? Gemessen war der Recall fuer Schilder unter 32 px Diagonale nur
+etwa 0.29 gegen 0.74 im Mittel - und die alte Zuordnung (naechste Stufe in log2)
+schickte ein 30-px-Schild auf stride 32, wo nur 10x10 Zellen zur Verfuegung stehen.
+Stride 4 kostet rund ein Viertel mehr Rechnung (siehe tools/bench_model.py), deshalb
+wird dort nur die feinste Stufe bedient (siehe tools/detmath.py, ASSIGN_MAX_SIDE).
 
 Warum Transformer nur in den TIEFEN Stufen?
     Attention kostet O(N^2) in der Tokenzahl N = (H/stride) * (W/stride).
-    320x320 ergibt:  stride 8 -> 40x40 = 1600 Tokens
+    320x320 ergibt:  stride 4  -> 80x80 = 6400 Tokens
+                     stride 8  -> 40x40 = 1600 Tokens
                      stride 16 -> 20x20 =  400 Tokens
                      stride 32 -> 10x10 =  100 Tokens
     Ein globaler Block auf stride 8 waere ~256x teurer als auf stride 32.
@@ -53,8 +60,8 @@ class NetCfg:
     tr_ffn: float = 2.0                   # FFN-Expansion im Transformer-Block
     tr_norm: str = "gn"                   # "gn" = GroupNorm(1,C) schnell | "ln" = LayerNorm je Token
     win: int = 5                          # Fenstergroesse fuer windowed Attention
-    levels: tuple = (8, 16, 32)           # Erkennungsstufen (stride) fuer die Koepfe
-    mid: tuple = (32, 64, 128)            # Kopf-Breite je Stufe
+    levels: tuple = (4, 8, 16, 32)        # Erkennungsstufen (stride) fuer die Koepfe
+    mid: tuple = (32, 32, 64, 128)        # Kopfbreite je Stufe (gleiche Reihenfolge)
 
     def as_dict(self) -> dict:
         d = dict(self.__dict__)
@@ -71,13 +78,13 @@ class NetCfg:
 # Gemessen mit tools/bench_model.py --preset <name> (siehe docs/TRAINING.md).
 PRESETS: dict[str, dict] = {
     # kleinste Variante: ~1/4 der Rechnung von "balanced", Hardswish, ein schmaler Kopf
-    "fast": dict(width=(24, 48, 96, 192), depth=(1, 1, 1, 1), mid=(24, 48, 96),
+    "fast": dict(width=(24, 48, 96, 192), depth=(1, 1, 1, 1), mid=(24, 24, 48, 96),
                  tr_global=("p5",), tr_window=(), act="hardswish"),
     # Standard: volle Breiten, 2 Bloecke je tiefer Stufe, globaler Block nur auf p5
-    "balanced": dict(width=(32, 64, 128, 256), depth=(1, 2, 2, 2), mid=(32, 64, 128),
+    "balanced": dict(width=(32, 64, 128, 256), depth=(1, 2, 2, 2), mid=(32, 32, 64, 128),
                      tr_global=("p5",), tr_window=(), act="silu"),
     # mehr Kontext (p4 zusaetzlich), dafuer teurer
-    "quality": dict(width=(32, 64, 128, 256), depth=(1, 2, 2, 2), mid=(32, 64, 128),
+    "quality": dict(width=(32, 64, 128, 256), depth=(1, 2, 2, 2), mid=(32, 32, 64, 128),
                     tr_global=("p5", "p4"), tr_window=("p4",), act="silu"),
 }
 
@@ -240,13 +247,16 @@ class HybridEncoder(nn.Module):
 
 
 class Head(nn.Module):
-    """Erkennungskopf: Depthwise 3x3 -> 1x1 -> Vorhersage (14 Kanaele).
+    """Erkennungskopf: gemeinsamer Stamm, dann zwei getrennte Zweige (Box/Objekt, Art).
 
-    Ausgabe je Zelle: [tx, ty, tw, th, obj, cls0..cls8]
-    Dekodierung (identisch in Python und JavaScript, siehe src/model.js):
-        cx = (gx + sigmoid(tx)) * stride      cy = (gy + sigmoid(ty)) * stride
-        w  = exp(tw) * stride                 h  = exp(th) * stride
-        score = sigmoid(obj) * max_j sigmoid(cls_j)
+    Ausgabe je Zelle bleibt [tx, ty, tw, th, obj, cls0..cls8] - diese Reihenfolge ist der
+    Vertrag mit tools/detmath.py und src/model.js und darf sich nicht aendern.
+
+    Warum getrennte Zweige? Gemessen waren von 656 verpassten Boxen 212 falsch
+    klassifiziert, und 195 der 226 Fehlalarme lagen auf echten Schildern: der Kopf
+    verwechselt Arten (rotes Dreieck Spitze oben gegen Spitze unten 32x). Ortstreue (Box)
+    und Invarianz (Art) sind gegensaetzliche Aufgaben, ein gemeinsamer Kanalvorrat fuer
+    beide bremst. Die Trennung kostet rund 4 MFLOPs (siehe tools/bench_model.py).
     """
 
     def __init__(self, cin: int, mid: int, act: str = "silu"):
@@ -255,19 +265,21 @@ class Head(nn.Module):
             cba(cin, mid, 3, 1, g=mid, act=act),
             cba(mid, mid, 1, 1, act=act),
         )
-        self.pred = nn.Conv2d(mid, N_CH, 1)
+        self.obj = nn.Conv2d(mid, 5, 1)                 # tx, ty, tw, th, obj
+        self.cls = nn.Conv2d(mid, N_CLASSES, 1)         # cls0..cls8
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.pred(self.stem(x))
+        y = self.stem(x)
+        return torch.cat([self.obj(y), self.cls(y)], dim=1)
 
 
 class HybridNano(nn.Module):
-    """Ein Netz fuer Ort und Art: CNN-Backbone, optional Transformer-Stufen, FPN-lite, 3 Koepfe.
+    """Ein Netz fuer Ort und Art: CNN-Backbone, optional Transformer-Stufen, FPN-lite, je Stufe ein Kopf.
 
     Eingang: (B, 3, 320, 320), Werte 0..1 (RGB).
-    Ausgang: 3 Tensoren in der Reihenfolge stride 8, 16, 32 (fein -> grob),
-             je (B, 14, H/stride, W/stride). Reihenfolge wie LEVELS in tools/detmath.py
-             und wie die ONNX-Ausgaenge os8/os16/os32 (siehe tools/export_onnx.py).
+    Ausgang: ein Tensor je Stufe, fein -> grob, je (B, 14, H/stride, W/stride).
+             Reihenfolge wie LEVELS in tools/detmath.py und wie die ONNX-Ausgaenge
+             os4/os8/os16/os32 (siehe tools/export_onnx.py).
     """
 
     def __init__(self, cfg: NetCfg | None = None):
@@ -275,31 +287,38 @@ class HybridNano(nn.Module):
         self.cfg = cfg or NetCfg()
         c = self.cfg
         w = c.width
+        if len(c.mid) != len(c.levels) or len(w) not in (len(c.levels), len(c.levels) + 1):
+            raise ValueError("width/mid/levels passen nicht zusammen: mid und levels gleich lang, "
+                             "width gleich lang oder genau ein Eintrag mehr")
+        # Abgriffe = die letzten len(levels) Rueckgrat-Stufen. Eine aeltere Konfiguration mit
+        # drei Stufen (8/16/32) laeuft damit unveraendert durch denselben Code.
+        self.taps = list(range(len(w) - len(c.levels), len(w)))
         self.stem = cba(3, 16, 3, 2, act=c.act)                     # /2
-        self.stage1 = self._stage(16, w[0], c.depth[0], c.act)      # /4
+        self.stage1 = self._stage(16, w[0], c.depth[0], c.act)      # /4   -> p2
         self.stage2 = self._stage(w[0], w[1], c.depth[1], c.act)    # /8   -> p3
         self.stage3 = self._stage(w[1], w[2], c.depth[2], c.act)    # /16  -> p4
         self.stage4 = self._stage(w[2], w[3], c.depth[3], c.act)    # /32  -> p5
 
-        # Transformer-Ersatz: tief = global, mittig = lokal (windowed)
-        self.tr = nn.ModuleDict()
-        if "p5" in c.tr_global:
-            self.tr["p5"] = HybridEncoder(w[3], c, window=0)
-        if "p4" in c.tr_global:
-            self.tr["p4"] = HybridEncoder(w[2], c, window=0)
-        if "p4" in c.tr_window:
-            self.tr["p4w"] = HybridEncoder(w[2], c, window=c.win)
-        if "p3" in c.tr_window:
-            self.tr["p3w"] = HybridEncoder(w[1], c, window=c.win)
+        # Transformer-Bloecke: tief = global, mittig = lokal (windowed). tr_plan haelt die
+        # Reihenfolge fest, in der die Abgriffe bearbeitet werden (grob -> fein).
+        self.tr, self.tr_plan = nn.ModuleDict(), []
+        for name, stride in (("p5", 32), ("p4", 16), ("p3", 8), ("p2", 4)):
+            if stride not in c.levels:
+                continue
+            pos = c.levels.index(stride)
+            if name in c.tr_global:
+                self.tr[name] = HybridEncoder(w[self.taps[pos]], c, window=0)
+                self.tr_plan.append((pos, name))
+            if name in c.tr_window:
+                self.tr[name + "w"] = HybridEncoder(w[self.taps[pos]], c, window=c.win)
+                self.tr_plan.append((pos, name + "w"))
 
-        # FPN-lite: Querverbindungen + Fusion (billig, hebt kleine Schilder)
-        self.lat5 = cba(w[3], w[2], 1, 1, act="")
-        self.lat4 = cba(w[2], w[1], 1, 1, act="")
-        self.fuse4 = cba(w[2], w[2], 3, 1, act=c.act)
-        self.fuse3 = cba(w[1], w[1], 3, 1, act=c.act)
-
-        # Stufe i sitzt auf dem Merkmal mit width[i+1] Kanaelen (p3=w[1], p4=w[2], p5=w[3])
-        self.heads = nn.ModuleList([Head(w[i + 1], c.mid[i], c.act) for i in range(3)])
+        # FPN-lite: lat[i] holt die groebere Stufe hoch, fuse[i] glaettet die Summe.
+        # Die groebste Stufe wird nicht gefiltert - sie hat nichts ueber sich.
+        self.lat = nn.ModuleList([cba(w[t + 1], w[t], 1, 1, act="") for t in self.taps[:-1]])
+        self.fuse = nn.ModuleList([cba(w[t], w[t], 3, 1, act=c.act) for t in self.taps[:-1]])
+        self.heads = nn.ModuleList([Head(w[t], c.mid[i], c.act)
+                                    for i, t in enumerate(self.taps)])
         self._init_weights()
 
     @staticmethod
@@ -317,32 +336,32 @@ class HybridNano(nn.Module):
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
-        # Objektivitaet zu Beginn selten (Prior ~1%): stabilisiert die ersten Epochen
+        # Objektivitaet zu Beginn selten (Prior ~1 %), Klassen zunaechst unsicher:
+        # stabilisiert die ersten Epochen. Die beiden Kopfzweige werden getrennt vorbelegt.
         for head in self.heads:
-            nn.init.constant_(head.pred.bias[4], -4.6)
-            nn.init.constant_(head.pred.bias[5:], -2.0)
+            nn.init.constant_(head.obj.bias[4], -4.6)
+            nn.init.constant_(head.cls.bias, -2.0)
 
     def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
         x = self.stem(x)
-        c8 = self.stage2(self.stage1(x))          # /8
-        c16 = self.stage3(c8)                     # /16
-        c32 = self.stage4(c16)                    # /32
-        # Ersetzen statt anhaengen: die Stufe wird durch den Transformer-Block gefuehrt,
-        # das CNN liefert weiterhin die feinen Stufen (stride 8 und kleiner).
-        for name, feat in (("p5", "c32"), ("p4", "c16"), ("p4w", "c16"), ("p3w", "c8")):
-            if name not in self.tr:
-                continue
-            if feat == "c32":
-                c32 = self.tr[name](c32)
-            elif feat == "c16":
-                c16 = self.tr[name](c16)
-            else:
-                c8 = self.tr[name](c8)
-        p5 = c32
-        p4 = self.fuse4(c16 + F.interpolate(self.lat5(p5), size=c16.shape[-2:], mode="nearest"))
-        p3 = self.fuse3(c8 + F.interpolate(self.lat4(p4), size=c8.shape[-2:], mode="nearest"))
-        # Reihenfolge fein -> grob (stride 8, 16, 32): identisch zu tools/detmath.LEVELS
-        return [self.heads[0](p3), self.heads[1](p4), self.heads[2](p5)]
+        feats = [self.stage1(x)]                    # /4  (p2)
+        feats.append(self.stage2(feats[-1]))        # /8  (p3)
+        feats.append(self.stage3(feats[-1]))        # /16 (p4)
+        feats.append(self.stage4(feats[-1]))        # /32 (p5)
+        # Transformer-Bloecke anwenden (Reihenfolge wie beim Bau, grob -> fein)
+        for pos, name in self.tr_plan:
+            tap = self.taps[pos]
+            feats[tap] = self.tr[name](feats[tap])
+        # FPN-lite von grob nach fein: jede Stufe bekommt die hochgezogene groebere Stufe
+        out: list[torch.Tensor | None] = [None] * len(self.taps)
+        out[-1] = feats[self.taps[-1]]
+        for i in range(len(self.taps) - 2, -1, -1):
+            tap = self.taps[i]
+            up = F.interpolate(self.lat[i](out[i + 1]), size=feats[tap].shape[-2:],
+                               mode="nearest")
+            out[i] = self.fuse[i](feats[tap] + up)
+        # Reihenfolge fein -> grob (stride 4, 8, 16, 32): identisch zu tools/detmath.LEVELS
+        return [head(o) for head, o in zip(self.heads, out)]
 
 
 def build_model(cfg: NetCfg | None = None) -> HybridNano:

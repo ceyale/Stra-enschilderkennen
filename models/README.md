@@ -14,20 +14,27 @@ das im Status an – sie bricht nicht.
 
 ## Stand des hier erzeugten Modells
 
-`hybridnano_gP5_w-_silu` (`--preset balanced`), 1 287 066 Parameter, 731 MFLOPs,
-**5,16 MB fp32** – trainiert in drei Blöcken (159 Epochen) auf 23 000 Bildern aus
-GTSRB-Kompositionen plus 3 000 synthetischen Bildern für `hinweis`/`ortstafel`.
+`hybridnano_gP5_w-_silu` (`--preset balanced`), **vier** Erkennungsstufen
+(stride 4/8/16/32), 1 300 360 Parameter, 878 MFLOPs, **5,23 MB fp32** – trainiert in
+einem Lauf über 220 Epochen auf **26 000 Bildern** (20 000 ausgeglichene
+GTSRB-Kompositionen, 3 000 synthetische Bilder für `hinweis`/`ortstafel`, 3 000 Bilder
+**ohne** Schild).
 
 | Kennzahl | Wert |
 |---|---|
-| Precision / Recall / F1 (2 000 val-Bilder, conf 0,25, IoU 0,5) | **0,891 / 0,739 / 0,808** |
-| ONNX ↔ PyTorch: max. Tensorabweichung, Trefferquote | 1,1 · 10⁻⁴, 4/4 Erkennungen mit IoU ≥ 0,95 |
-| Laufzeit ONNX Runtime CPU (x86, 1 Thread, 320×320) | 7,2 ms je Bild |
+| Precision / Recall / F1 (2 000 val-Bilder, conf 0,25, IoU 0,5, 320 px) | **0,883 / 0,796 / 0,837** |
+| dasselbe Modell bei 384 px Eingabe | **0,907 / 0,808 / 0,854** (fp/Bild 0,104) |
+| Fehlalarme je Bild (2 000 val-Bilder) | 0,132 |
+| Fehlalarme auf Bildern ohne Schild (Split `neg`, 500 Bilder) | 0,076 gesamt, davon 0,011 auf reinem Hintergrund |
+| Treffer-IoU (Mittel) | 0,954 |
+| ONNX ↔ PyTorch: max. Tensorabweichung, Trefferquote | 2,1 · 10⁻⁴, 9/9 Erkennungen mit IoU ≥ 0,95 |
+| Laufzeit ONNX Runtime CPU (x86, 1 Thread, 320×320) | 10–18 ms je Bild (dynamische Achsen) |
+| Laufzeit im Browser (wasm, echtes Gerät, 320 px) | Vorfassung gemessen: 122 ms – neue Zahl steht aus (die App zeigt sie an) |
 | int8 | **verworfen** (Qualitätstor, Abweichung 3,16 · 10¹ auch mit 200 echten Kalibrierbildern) |
 | Tests | `node tests/model.test.js` (Fixture aus genau diesem Modell) und `node tests/detector.test.js` grün |
 
-Details, Verlauf und die schwachen Stellen (z.B. `vorfahrtGewaehren` gegen `warnung`):
-`docs/TRAINING.md` §5.
+Details, Verlauf, Klassentabelle und die Fehlerzerlegung (z. B. `hinweis` hat die
+schwächste Precision): `docs/TRAINING.md` §5 und §10.
 
 Kurzweg zu einem ersten Modell:
 

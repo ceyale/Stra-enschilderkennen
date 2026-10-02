@@ -22,6 +22,15 @@
   </div>
   <div class="row tune">
     <label>Farbstrenge <input id="sat" type="range" min="0.35" max="0.8" step="0.05" value="0.5"> <output id="satOut">0.50</output></label>
+    <label id="sizeRow" hidden>KI-Eingang
+      <select id="size">
+        <option value="auto" selected>automatisch</option>
+        <option value="256">256 px (schnell)</option>
+        <option value="320">320 px</option>
+        <option value="384">384 px (genauer)</option>
+        <option value="448">448 px (Foto, langsam)</option>
+      </select>
+    </label>
     <label><input id="maskCb" type="checkbox"> Farbmasken zeigen</label>
   </div>
   <ul id="list"></ul>

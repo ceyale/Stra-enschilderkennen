@@ -94,12 +94,14 @@ Für eine neue Form (z. B. Sechseck) `shapeOf` erweitern und passende Kennzahlen
 1. **Zahlen lesen** (Tempolimit): Innenfläche eines Verbotskreises ausschneiden und mit Tesseract.js oder einem kleinen Ziffern-Modell erkennen – **offen**.
 2. **Echtes ML-Modell:** *umgesetzt und trainiert* als hybrides Netz (`tools/`,
    optionaler Modus in `src/model.js`). Es findet **Position und Art in einem Durchlauf**
-   (anchor-free, 9 Typen, drei Stufen) statt nur ausgeschnittene Flächen zu klassifizieren
-   – der Vorfilter ist damit nicht mehr Voraussetzung. Einzelne tiefe Stufen sind
-   Transformer-Blöcke. Trainiert wurde es auf GTSRB-Kompositionen (23 000 Bilder) plus
+   (anchor-free, 9 Typen, vier Stufen stride 4/8/16/32) statt nur ausgeschnittene Flächen
+   zu klassifizieren – der Vorfilter ist damit nicht mehr Voraussetzung. Einzelne tiefe
+   Stufen sind Transformer-Blöcke. Trainiert wurde es auf GTSRB-Kompositionen
+   (26 000 Bilder, Typen ausgeglichen, inklusive Bilder **ohne** Schild) plus
    synthetischen Bildern für die zwei Typen, die GTSRB nicht enthält; gemessen
-   **P = 0,891 / R = 0,739 / F1 = 0,808** auf 2 000 Validierungsbildern. Kosten, Training,
-   Auswertung je Bedingung und alle Messwerte stehen in [`TRAINING.md`](TRAINING.md).
+   **P = 0,883 / R = 0,796 / F1 = 0,837** auf 2 000 Validierungsbildern (bei 384 px
+   Eingabe 0,854 – die Größe ist in der App wählbar). Kosten, Training, Auswertung je
+   Bedingung, Fehlerzerlegung und alle Messwerte stehen in [`TRAINING.md`](TRAINING.md).
    Die Heuristik bleibt als Rückfall erhalten.
 3. **Perspektive:** Kanten/Ecken über Konturnäherung bestimmen statt Breitenprofil – **entfällt im
    Modellmodus** (das Netz sieht Schräglage und Roll aus den Trainingsdaten), bleibt aber offen
