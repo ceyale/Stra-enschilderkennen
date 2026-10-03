@@ -37,6 +37,10 @@
    *  gemessen auf 2000 val-Bildern: 256 px F1 0,796 / 320 px 0,837 / 384 px 0,854.
    *  Das Modell wird mit offener Höhe/Breite exportiert, deshalb geht jede dieser Größen. */
   function modelInputSize(kind) {
+    // Ein statisch exportiertes Modell (model.dynamisch === false) kennt NUR seine
+    // Trainingsgröße. Ohne diese Sperre würde hier in 384 px geletterboxt und im Netz mit
+    // 320 px gerechnet – die Boxen lägen daneben, ohne dass ein Fehler auftritt.
+    if (model && model.dynamisch === false) return model.size || 320;
     const v = $('size') ? $('size').value : 'auto';
     if (v && v !== 'auto') return +v;
     return kind === 'foto' ? 384 : ((model && model.size) || 320);

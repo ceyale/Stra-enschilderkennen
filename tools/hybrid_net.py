@@ -85,6 +85,11 @@ SIGN_LABELS = signmap.LABELS
 N_CLASSES = len(SIGN_LABELS)          # 74 (siehe tools/signmap.py)
 # Kanalreihenfolge im Kopf-Ausgang: [tx, ty, tw, th, obj, cls0..cls73]
 N_CH = 4 + 1 + N_CLASSES              # 79
+# Hierarchie: Oberkategorien (Familien) und die Zuordnung je Klasse. Sie steht in
+# tools/signmap.py bei den Klassen, damit es nur EINE Taxonomie gibt.
+N_SUPER = signmap.N_SUPER             # 9
+SUPER_LABELS = signmap.SUPER_LABELS
+SUPER_OF = signmap.SUPER_OF           # Liste: Klasse -> Familie (Laenge N_CLASSES)
 
 
 @dataclass
@@ -99,6 +104,8 @@ class NetCfg:
     lgp_ctx: bool = True                  # Kontextzweig der LGP-FPN (globale Sicht)
     levels: tuple = (4, 8, 16, 32)        # Erkennungsstufen (stride) fuer die Koepfe
     mid: tuple = (32, 32, 64, 128)        # Kopfbreite je Stufe (gleiche Reihenfolge)
+    head: str = "tgad"                    # "tgad" = TGADHead (Standard) | "plain" = alter Kopf
+    hier: bool = True                     # hierarchischer Klassifikationskopf (Ober-/Unterart)
 
     def as_dict(self) -> dict:
         d = dict(self.__dict__)
@@ -107,7 +114,10 @@ class NetCfg:
 
     def name(self) -> str:
         catm = "".join(s.upper() for s in self.catm) or "-"
-        return f"hybridnano_catm{catm}_lgp_{self.act}"
+        # Kopf und Hierarchie gehoeren in den Namen: sie aendern die Gewichte, und
+        # manifest.json haelt die Konfiguration fest - ohne sie waeren zwei Laeufe mit
+        # verschiedenem Kopf im Bericht nicht unterscheidbar.
+        return f"hybridnano_catm{catm}_lgp_{self.head}{'hier' if self.hier else 'flach'}_{self.act}"
 
 
 # Fertige Groessen: schneller heisst hier schmaler UND flacher UND weniger CATM-Stufen.
@@ -360,7 +370,13 @@ class Head(nn.Module):
     verwechselt Arten (rotes Dreieck Spitze oben gegen Spitze unten 32x). Ortstreue (Box)
     und Invarianz (Art) sind gegensaetzliche Aufgaben, ein gemeinsamer Kanalvorrat fuer
     beide bremst. Die Trennung kostet rund 4 MFLOPs (siehe tools/bench_model.py).
+
+    Diese Fassung ist der EINFACHE Kopf (cfg.head="plain"): beide Zweige teilen sich einen
+    Stamm, es gibt keinen Austausch zwischen ihnen und keine Aufgabengewichtung. Der
+    Standardkopf ist TGADHead.
     """
+
+    hat_aux = False
 
     def __init__(self, cin: int, mid: int, act: str = "silu"):
         super().__init__()
@@ -369,11 +385,215 @@ class Head(nn.Module):
             cba(mid, mid, 1, 1, act=act),
         )
         self.obj = nn.Conv2d(mid, 5, 1)                 # tx, ty, tw, th, obj
-        self.cls = nn.Conv2d(mid, N_CLASSES, 1)         # cls0..cls8
+        self.cls = nn.Conv2d(mid, N_CLASSES, 1)         # cls0..cls73
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def init_bias(self) -> None:
+        """Startwerte der Ausgaenge: Objektivitaet selten, Klassen unsicher (siehe Aufrufer)."""
+        nn.init.constant_(self.obj.bias[4], -4.6)
+        nn.init.constant_(self.cls.bias, -2.0)
+
+    def forward(self, x: torch.Tensor, want_aux: bool = False):
         y = self.stem(x)
         return torch.cat([self.obj(y), self.cls(y)], dim=1)
+
+
+class TaskDecoupledAttentionDistributor(nn.Module):
+    """TDAD - aufgabenspezifische Aufmerksamkeitsverteilung (TGADHead, Zuo u. a. 2024).
+
+    Das Verfahren teilt die Merkmale auf die beiden Teilaufgaben auf und gibt jeder die
+    Aufmerksamkeit, die SIE braucht. Der Abstract nennt genau das: "two well-designed task
+    specific attention perceptrons to enhance the spatial information required for
+    localization and the semantic information required for classification".
+
+      * ORT (Lokalisierung) braucht RAUM: wo beginnt das Schild, wo endet es. Aufmerksamkeit
+        deshalb ueber die ZELLEN (Tiefenconv 3x3 -> 1 Kanal -> Sigmoid) - ein Gewicht je
+        Bildpunkt. Genau der Teil, der bei kleinen Schildern ueber Treffer entscheidet.
+      * ART (Klassifikation) braucht BEDEUTUNG: welche Farbe, welches Symbol. Aufmerksamkeit
+        deshalb ueber die KANAELE (globaler Mittelwert -> 1x1 -> Sigmoid) - ein Gewicht je
+        Merkmalskanal, ortsunabhaengig. Das ist gewuenscht: dieselbe Art soll an jeder
+        Bildstelle gleich heissen.
+
+    Warum getrennt und nicht eine gemeinsame Aufmerksamkeit: eine gemeinsame Gewichtung
+    muesste beide Anforderungen gleichzeitig erfuellen. Ortsgewichtung ist scharf und
+    lokal, Kanalgewichtung weich und global - zusammen mittelt sich das zu etwas, das
+    weder dem einen noch dem anderen dient.
+
+    Beide Zweige sind Tiefenconvs (groups=dim) bzw. 1x1 auf dem Mittelwert; der Zusatz
+    kostet damit einen Bruchteil der Kopfbreite (siehe tools/bench_model.py).
+    """
+
+    def __init__(self, dim: int, act: str = "silu"):
+        super().__init__()
+        # Ort: raeumliche Aufmerksamkeit (dwc 3x3 - die uebliche Ortsgewichtung)
+        self.ort_dw = nn.Conv2d(dim, dim, 3, 1, 1, groups=dim, bias=False)
+        self.ort_bn = nn.BatchNorm2d(dim)
+        self.ort_gate = nn.Conv2d(dim, 1, 1)
+        self.ort_out = cba(dim, dim, 1, 1, act=act)
+        # Art: semantische Aufmerksamkeit (Kanalgewichtung ueber den globalen Kontext)
+        self.art_pool = nn.AdaptiveAvgPool2d((1, 1))
+        eng = max(8, dim // 4)
+        self.art_gate = nn.Sequential(nn.Conv2d(dim, eng, 1), act_layer(act),
+                                      nn.Conv2d(eng, dim, 1))
+        self.art_out = cba(dim, dim, 1, 1, act=act)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        raum = torch.sigmoid(self.ort_gate(F.silu(self.ort_bn(self.ort_dw(x)))))
+        ort = self.ort_out(x * raum)                     # (B, C, H, W)
+        semantik = torch.sigmoid(self.art_gate(self.art_pool(x)))
+        art = self.art_out(x * semantik)                 # (B, C, H, W)
+        return ort, art
+
+
+class TaskCorrelationNetwork(nn.Module):
+    """TCN - Austausch zwischen den Aufgaben (TGADHead, Zuo u. a. 2024).
+
+    Der Abstract begruendet es so: genaue Ortung und hoher Klassenscore gehen in
+    bestehenden Detektoren auseinander ("accurate localization may show a poor
+    classification score or vice versa"), und das senkt die Genauigkeit. Das TCN
+    uebertraegt die Korrelation zwischen beiden Merkmalsmengen und haelt sie konsistent.
+
+    Umsetzung: jeder Zweig bekommt einen Restzweig vom anderen, gedaempft durch ein
+    gelerntes Tor:
+        ort += gate_ort(1x1(art))     - der Ort erfaehrt, WAS dort liegt
+        art += gate_art(1x1(ort))     - die Art erfaehrt, WO sie liegt
+    Das Tor startet ueberwiegend geschlossen (Bias -1 -> Sigmoid 0,27), damit der Austausch
+    ANFANGSNEUTRAL beginnt und sich erst aufbaut. Ohne diese Daempfung schaukeln sich beide
+    Zweige in den ersten Epochen gegenseitig auf.
+
+    Der Zusatz ist ein 1x1 je Richtung - zwei Faltungen. Das ist der Preis dafuer, dass die
+    beiden Teilaufgaben nicht mehr unabhaengig voneinander raten.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.art_to_ort = nn.Conv2d(dim, dim, 1, bias=False)
+        self.ort_to_art = nn.Conv2d(dim, dim, 1, bias=False)
+        self.gate_ort = nn.Conv2d(dim, dim, 1)
+        self.gate_art = nn.Conv2d(dim, dim, 1)
+        nn.init.constant_(self.gate_ort.bias, -1.0)
+        nn.init.constant_(self.gate_art.bias, -1.0)
+
+    def forward(self, ort: torch.Tensor, art: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        ort = ort + torch.sigmoid(self.gate_ort(art)) * self.art_to_ort(art)
+        art = art + torch.sigmoid(self.gate_art(ort)) * self.ort_to_art(ort)
+        return ort, art
+
+
+class HierarchicalClassBranch(nn.Module):
+    """Klassifikationszweig mit Ober- und Unterkategorien (tools/signmap.py).
+
+    Statt einer flachen Entscheidung ueber alle 74 Klassen entstehen zwei:
+        1. FAMILIE  (9 Ausgaenge): Form und Farbe - grob, robust, meist eindeutig
+        2. UNTERART (74 Ausgaenge): das Symbol IM Inneren - fein, aber nur noch innerhalb
+           der Familie zu entscheiden
+
+    Verrechnet wird in LOG-Wahrscheinlichkeiten:
+        logit_k = super[familie(k)] + sub[k]     =>  P(k) = P(Familie) * P(k | Familie)
+    Die Summe ist genau das Produkt der beiden Wahrscheinlichkeiten. Deshalb steht im
+    Ausgangstensor weiterhin EIN Wert je Klasse - tools/detmath.py und src/model.js bleiben
+    unveraendert (dort gilt weiter "sigmoid(obj) * max(sigmoid(cls))").
+
+    Warum das bei Verkehrszeichen hilft: die haeufigsten Verwechslungen waren Geschwister
+    (tempo70/tempo80, rotes Dreieck Spitze oben gegen Spitze unten). Der flache Kopf musste
+    "ist es 70?" gegen 73 andere Antworten abwaegen, darunter alle Gebotszeichen und
+    Hinweisschilder. Der hierarchische Kopf entscheidet erst ueber die Familie - eine Frage,
+    die ueber Form und Farbe meist eindeutig ist - und vergleicht danach nur noch die 18
+    Tempolimits untereinander.
+
+    Der Familienkopf kann zusaetzlich DIREKT ueberwacht werden (Hilfsverlust, --hier-aux):
+    die Familie bekommt damit ein eigenes, groeberes Lernsignal, das auch dann greift, wenn
+    die Unterart noch falsch liegt. Dafuer wird der Familien-Ausgang mitgegeben; er ist
+    KEIN zusaetzlicher Kanal im Ausgangstensor.
+    """
+
+    def __init__(self, cin: int, mid: int, act: str = "silu"):
+        super().__init__()
+        self.trunk = cba(cin, mid, 3, 1, g=mid, act=act)
+        self.super = nn.Conv2d(mid, N_SUPER, 1)          # 1. Stufe: Familie (9)
+        self.sub = nn.Conv2d(mid, N_CLASSES, 1)          # 2. Stufe: Unterart (74)
+        # Zuordnung Familie je Klasse als fester Puffer (kein Gewicht): sie steht in
+        # tools/signmap.py und darf sich nicht mittrainieren.
+        self.register_buffer("super_of", torch.tensor(SUPER_OF, dtype=torch.long))
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        y = self.trunk(x)
+        fam = self.super(y)                              # (B, 9, H, W)
+        sub = self.sub(y)                                # (B, 74, H, W)
+        return sub + fam.index_select(1, self.super_of), fam
+
+
+class TGADHead(nn.Module):
+    """TGADHead - aufgabengefuehrter, entkoppelter Erkennungskopf.
+
+    Herkunft: Zuo, Liu, Chen, Fu, Wang, "TGADHead: An efficient and accurate task-guided
+    attention-decoupled head for single-stage object detection", Knowledge-Based Systems
+    302:112349 (2024). Das Verfahren besteht laut Abstract aus TDAD (Aufgabenaufteilung mit
+    zwei aufgabenspezifischen Aufmerksamkeits-Wahrnehmungen) und TCN (Austausch zwischen den
+    Aufgaben). Eine oeffentliche Referenzumsetzung gibt es nicht; dieser Code ist nach dem im
+    Abstract beschriebenen Aufbau geschrieben und NICHT aus dem Paper abgetippt - Abweichungen
+    im Detail sind daher moeglich. Beide Bausteine sind oben einzeln dokumentiert.
+
+    Aufbau je Stufe:
+        stamm (dwc 3x3 + 1x1) -> TDAD -> TCN -> { Ort-Zweig: 5 Kanaele,
+                                                  Art-Zweig: hierarchisch (74 Kanaele) }
+
+    Was hier anders ist als beim Vorgaengerkopf: der hatte die Zweige zwar getrennt, teilte
+    sich aber einen gemeinsamen Stamm und liess sie danach nebeneinander herlaufen. Genau das
+    kritisieren die Autoren ("current methods show inconsistency between the two subtasks").
+    Neu sind deshalb (a) die AUFGABENSPEZIFISCHE Aufmerksamkeit vor jedem Zweig und (b) der
+    Austausch ZWISCHEN den Zweigen.
+
+    Der Ausgang bleibt [tx, ty, tw, th, obj, cls0..cls73] je Zelle (79 Kanaele) - der Vertrag
+    mit tools/detmath.py, tools/export_onnx.py (os4/os8/os16/os32) und src/model.js.
+    """
+
+    hat_aux = True
+
+    def __init__(self, cin: int, mid: int, act: str = "silu", hier: bool = True):
+        super().__init__()
+        self.hier = hier
+        self.stem = nn.Sequential(
+            cba(cin, mid, 3, 1, g=mid, act=act),
+            cba(mid, mid, 1, 1, act=act),
+        )
+        self.tdad = TaskDecoupledAttentionDistributor(mid, act)
+        self.tcn = TaskCorrelationNetwork(mid)
+        self.obj = nn.Sequential(cba(mid, mid, 3, 1, g=mid, act=act), nn.Conv2d(mid, 5, 1))
+        if hier:
+            self.cls_branch: nn.Module = HierarchicalClassBranch(mid, mid, act)
+        else:
+            # Flacher Zweig, aber MIT eigener Aufmerksamkeit und Austausch: so laesst sich
+            # der Nutzen der Hierarchie allein messen (cfg.hier=False).
+            self.cls_branch = nn.Sequential(cba(mid, mid, 3, 1, g=mid, act=act),
+                                            nn.Conv2d(mid, N_CLASSES, 1))
+
+    def init_bias(self) -> None:
+        """Startwerte: Objektivitaet selten, Klassen unsicher.
+
+        Bei der Hierarchie wird der Startwert auf beide Stufen aufgeteilt (-0,5 Familie,
+        -1,5 Unterart). In der Summe ergibt das wieder -2,0 wie beim flachen Kopf, die ersten
+        Epochen laufen also vergleichbar an. Ein Bias nur auf einer Stufe wuerde die Familie
+        oder die Unterart einseitig bevorzugen.
+        """
+        nn.init.constant_(self.obj[-1].bias[4], -4.6)
+        if self.hier:
+            nn.init.constant_(self.cls_branch.super.bias, -0.5)
+            nn.init.constant_(self.cls_branch.sub.bias, -1.5)
+        else:
+            nn.init.constant_(self.cls_branch[-1].bias, -2.0)
+
+    def forward(self, x: torch.Tensor, want_aux: bool = False):
+        y = self.stem(x)
+        ort, art = self.tdad(y)
+        ort, art = self.tcn(ort, art)
+        if self.hier:
+            cls, familie = self.cls_branch(art)
+        else:
+            cls, familie = self.cls_branch(art), None
+        kopf = torch.cat([self.obj(ort), cls], dim=1)
+        if want_aux and familie is not None:
+            return kopf, familie
+        return kopf
 
 
 class GranularPerception(nn.Module):
@@ -469,9 +689,22 @@ class HybridNano(nn.Module):
         self.lgp_top = nn.Sequential(
             GranularPerception(w[self.taps[-1]], c.act),
             *((ContextAware(w[self.taps[-1]]),) if c.lgp_ctx else ()))
-        self.heads = nn.ModuleList([Head(w[t], c.mid[i], c.act)
+        self.heads = nn.ModuleList([self._kopf(w[t], c.mid[i], c)
                                     for i, t in enumerate(self.taps)])
         self._init_weights()
+
+    @staticmethod
+    def _kopf(cin: int, mid: int, cfg: NetCfg) -> nn.Module:
+        """Erkennungskopf je Stufe bauen. Kopf und Hierarchie sind umschaltbar.
+
+        Beide Varianten liefern denselben Ausgangstensor (79 Kanaele) und sind damit fuer
+        Training, Export und Browser austauschbar - cfg.head waehlt nur den Weg dorthin.
+        """
+        if cfg.head == "plain":
+            return Head(cin, mid, cfg.act)
+        if cfg.head == "tgad":
+            return TGADHead(cin, mid, cfg.act, hier=cfg.hier)
+        raise ValueError(f"unbekannter Kopf {cfg.head!r}; bekannt: tgad, plain")
 
     @staticmethod
     def _stage(cin: int, cout: int, depth: int, act: str) -> nn.Sequential:
@@ -489,12 +722,22 @@ class HybridNano(nn.Module):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
         # Objektivitaet zu Beginn selten (Prior ~1 %), Klassen zunaechst unsicher:
-        # stabilisiert die ersten Epochen. Die beiden Kopfzweige werden getrennt vorbelegt.
+        # stabilisiert die ersten Epochen. Jeder Kopf belegt seine Ausgaenge selbst vor
+        # (Head.init_bias / TGADHead.init_bias), weil sich die Pfade unterscheiden.
         for head in self.heads:
-            nn.init.constant_(head.obj.bias[4], -4.6)
-            nn.init.constant_(head.cls.bias, -2.0)
+            head.init_bias()
 
     def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+        """Ausgaenge je Stufe (fein -> grob). `net(x, want_aux=True)` gibt zusaetzlich die
+        Familien-Logits des hierarchischen Kopfes zurueck - nur fuer den Hilfsverlust im
+        Training. Der Export ruft IMMER ohne want_aux, damit der ONNX-Vertrag (vier
+        Ausgaenge os4/os8/os16/os32) unveraendert bleibt.
+        """
+        return self.forward_aux(x, want_aux=False)
+
+    def forward_aux(self, x: torch.Tensor, want_aux: bool = False):
+        """Eigentlicher Vorwaertslauf. Getrennt von forward, weil nn.Module.__call__ nur eine
+        Signatur hat - torch.onnx.export ruft `model(x)` und darf keine Tupel bekommen."""
         x = self.stem(x)
         feats = [self.stage1(x)]                    # /4  (p2)
         feats.append(self.stage2(feats[-1]))        # /8  (p3)
@@ -514,7 +757,11 @@ class HybridNano(nn.Module):
                                mode="nearest")
             out[i] = self.lgp[i](feats[tap] + up)
         # Reihenfolge fein -> grob (stride 4, 8, 16, 32): identisch zu tools/detmath.LEVELS
-        return [head(o) for head, o in zip(self.heads, out)]
+        # want_aux nur an Koepfe geben, die einen Hilfsausgang haben (Head.hat_aux = False).
+        kopf = [head(o, want_aux and head.hat_aux) for head, o in zip(self.heads, out)]
+        if want_aux and any(h.hat_aux for h in self.heads):
+            return [k[0] for k in kopf], [k[1] for k in kopf]
+        return kopf
 
 
 def build_model(cfg: NetCfg | None = None) -> HybridNano:

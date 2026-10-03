@@ -112,7 +112,7 @@ def sigmoid(x: np.ndarray) -> np.ndarray:
 
 def assign_targets(boxes_xyxy: np.ndarray, labels: np.ndarray, size: int,
                    levels: tuple = LEVELS, max_side: tuple = ASSIGN_MAX_SIDE,
-                   dual: bool = True) -> list[dict]:
+                   dual: bool = True, ref_size: int = 320) -> list[dict]:
     """Zielwerte fuer den Verlust: je Objekt eine Zelle, bei Randlage die Nachbarzelle mit.
 
     Zwei Aenderungen gegenueber der ersten Fassung, beide aus Messungen begruendet:
@@ -121,9 +121,16 @@ def assign_targets(boxes_xyxy: np.ndarray, labels: np.ndarray, size: int,
         Nachbarzelle dasselbe Objekt mit. Die alte Ein-Zellen-Regel presste den Offset auf
         0.999 fest - bei grossen Schildern (Median der Lokalisierungsfehler: 125 px) musste
         die Box also aus einer einzigen Zelle heraus mehrere Zellen weit regressiert werden.
+
+    `ref_size` ist die Eingabegroesse, auf die ASSIGN_MAX_SIDE gemessen wurde. Die Grenzen
+    sind ABSOLUTE Pixel und muessen mit der Eingabe mitwachsen: ohne die Umrechnung landet
+    dasselbe Schild bei 384 px eine Stufe feiner als bei 320 px. Die Zellen der feineren
+    Stufe sind kleiner als das Schild - der Offset klemmt dann am Zellenrand, und die
+    Stufen sind ungleich ausgelastet. Bei size == ref_size bleibt alles wie bisher.
     """
     boxes = np.asarray(boxes_xyxy, dtype=np.float32).reshape(-1, 4)
     labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+    faktor = float(size) / float(ref_size)
     out = []
     for s in levels:
         g = size // s
@@ -140,7 +147,7 @@ def assign_targets(boxes_xyxy: np.ndarray, labels: np.ndarray, size: int,
         side = max(w, h)
         idx = len(levels) - 1                      # groebste Stufe als Rueckfall
         for i, lim in enumerate(tuple(max_side)[:len(levels)]):
-            if side < lim:
+            if side < lim * faktor:                # Grenzen mit der Eingabe skalieren
                 idx = i                            # kleinste passende Stufe zuerst
                 break
         s = levels[idx]

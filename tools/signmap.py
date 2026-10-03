@@ -64,6 +64,75 @@ N_LABELS = len(LABELS)
 CLASS_ID: dict[str, int] = {name: i for i, name in enumerate(LABELS)}
 
 # ---------------------------------------------------------------------------
+# Hierarchie: Ober- und Unterkategorien (fuer den hierarchischen Klassifikationskopf).
+#
+# Wozu ueberhaupt: die 74 Klassen sind keine gleichartige Liste, sondern neun Familien,
+# zwischen denen der Kopf GANZ unterschiedlich leicht unterscheidet. Gemessen (PLAN.md)
+# lagen die Fehler genau zwischen Geschwistern - "rotes Dreieck Spitze oben" gegen
+# "Spitze unten", tempo70 gegen tempo80. Ein flacher Kopf muss alle 74 Entscheidungen
+# auf einmal treffen; ein hierarchischer erst die Familie (Form/Farbe - das ist grob und
+# robust) und danach das Symbol IM Inneren (fein, aber nur noch innerhalb der Familie).
+#
+# Wirkung auf die Ausgabe: KEINE. Der Kopf gibt weiterhin N_LABELS Kanaele aus, nur ist
+# der Wert je Klasse die SUMME aus Familien-Logit und Unter-Logit. In Log-Wahrscheinlich-
+# keiten ist das genau P(Klasse) = P(Familie) * P(Klasse | Familie) - dieselbe Rechnung,
+# nur in zwei Schritten gelernt. Damit bleiben tools/detmath.py und src/model.js
+# unveraendert (dort steht weiter "sigmoid(obj) * max(sigmoid(cls))").
+#
+# Die Reihenfolge der Familien ist die Reihenfolge im Modell (9 Ausgaenge im Familienkopf).
+# Wer hier etwas aendert, muss neu trainieren - wie bei LABELS haengen die Gewichte daran.
+# ---------------------------------------------------------------------------
+SUPER_LABELS: list[str] = [
+    "vorfahrt",    # Vorfahrt und Halt
+    "tempo",       # Geschwindigkeitsbegrenzungen samt Ende und Zonen 20/30
+    "ueberholen",  # Ueberholverbote
+    "verbot",      # Verbote
+    "warnung",     # Gefahrzeichen (gleiche Form, unterschiedliches Symbol)
+    "gebot",       # Gebotszeichen (blauer Kreis, Richtung/Rad/Mindestgeschwindigkeit)
+    "radfuss",     # Rad- und Fusswege
+    "zone",        # Zonen
+    "hinweis",     # Hinweiszeichen
+]
+N_SUPER = len(SUPER_LABELS)
+SUPER_ID: dict[str, int] = {name: i for i, name in enumerate(SUPER_LABELS)}
+
+# Zuordnung Unterkategorie -> Oberkategorie. Bewusst ueber NAMEN und nicht ueber Indizes:
+# ein Tippfehler faellt in pruefen() auf, ein falscher Index nicht. Die Familien sind an
+# der Verkehrsbedeutung und an der Form ausgerichtet (das ist es, was das Netz sieht).
+SUPER_GRUPPEN: dict[str, tuple[str, ...]] = {
+    "vorfahrt": ("stop", "vorfahrtGewaehren", "vorfahrtstrasse", "vorfahrtstrasseEnde",
+                 "andreaskreuz"),
+    "tempo": ("tempo5", "tempo10", "tempo20", "tempo30", "tempo40", "tempo50", "tempo60",
+              "tempo70", "tempo80", "tempo90", "tempo100", "tempo110", "tempo120", "tempo130",
+              "tempoEnde", "zone20", "zone30", "zoneEnde"),
+    "ueberholen": ("ueberholverbot", "ueberholverbotKfz", "ueberholverbotEnde"),
+    "verbot": ("einfahrtVerboten", "verbotFahrzeuge", "verbotFussgaenger",
+               "verbotRadverkehr", "verbotWenden", "halteverbot", "verbotSonstiges"),
+    "warnung": ("warnGefahrstelle", "warnKreuzung", "warnKurve", "warnDoppelkurve",
+                "warnVerengung", "warnUnebeneFahrbahn", "warnSchleuder", "warnGlaette",
+                "warnArbeitsstelle", "warnLichtzeichen", "warnFussgaenger", "warnKinder",
+                "warnRadverkehr", "warnTiereWildwechsel", "warnGegenverkehr", "warnStau",
+                "warnSteinschlag", "warnBahnuebergang", "warnSonstiges"),
+    # Mindestgeschwindigkeit ist ein Gebotszeichen (blauer Kreis, Z 275) - es gehoert
+    # deshalb hierher und nicht zu den Tempolimits, obwohl es von Geschwindigkeit handelt.
+    "gebot": ("gebotRechts", "gebotLinks", "gebotGeradeaus", "gebotGeradeausSeitlich",
+              "gebotVorbeifahrt", "kreisverkehr", "mindestgeschwindigkeit"),
+    "radfuss": ("radweg", "gehweg", "gemeinsamerGehUndRadweg", "getrennterRadGehweg"),
+    "zone": ("fussgaengerzone", "fahrradstrasse"),
+    "hinweis": ("einbahnstrasse", "haltestelle", "parken", "autobahn", "tunnel",
+                "sackgasse", "umleitung", "ortstafel", "hinweisSonstiges"),
+}
+
+# Unterkategorie -> Index der Oberkategorie, in der Reihenfolge von LABELS. Das ist die
+# Tabelle, die der Klassifikationskopf beim Bauen liest (tools/hybrid_net.py).
+SUPER_OF: list[int] = [-1] * N_LABELS
+for _familie, _mitglieder in SUPER_GRUPPEN.items():
+    for _name in _mitglieder:
+        if _name in CLASS_ID:
+            SUPER_OF[CLASS_ID[_name]] = SUPER_ID[_familie]
+del _familie, _mitglieder, _name
+
+# ---------------------------------------------------------------------------
 # Anzeige-Informationen fuer die Web-Oberflaeche (src/detector.js, SIGNS).
 # Je Zeile: (Label, Anzeigename, StVO-Nummer, Farbe, Kurznotiz).
 # Muss zu LABELS passen - die Pruefung dazu steht am Ende dieser Datei (pruefen()).
@@ -473,6 +542,19 @@ def pruefen() -> list[str]:
         unbekannt = sorted({z for z in ziele if z not in CLASS_ID})
         if unbekannt:
             fehler.append(f"{quelle} verweist auf unbekannte Labels: {unbekannt}")
+    # Hierarchie (tools/signmap.py oben): jede Unterkategorie genau EINER Oberkategorie
+    # zugeordnet. Ohne diese Pruefung faellt ein Tippfehler in SUPER_GRUPPEN erst beim
+    # Training auf - dann als eine Klasse, die nie richtig erkannt wird, weil ihr
+    # Familien-Logit nie ein Ziel bekommt (-1).
+    ohne = [LABELS[i] for i, v in enumerate(SUPER_OF) if v < 0]
+    if ohne:
+        fehler.append(f"SUPER_GRUPPEN deckt diese Labels nicht ab: {ohne}")
+    doppelt = sorted({n for g in SUPER_GRUPPEN.values() for n in g
+                      if sum(g2.count(n) for g2 in SUPER_GRUPPEN.values()) > 1})
+    if doppelt:
+        fehler.append(f"SUPER_GRUPPEN enthaelt Labels mehrfach: {doppelt}")
+    if len({v for v in SUPER_OF if v >= 0}) != N_SUPER:
+        fehler.append("mindestens eine Oberkategorie hat keine Unterkategorie")
     return fehler
 
 

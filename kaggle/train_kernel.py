@@ -70,7 +70,16 @@ DATEN = dict(
     eigene_share=0.75,        # davon 75 % eigene Fotos, 25 % coco128 als Streuung
     coco_test_n=12,           # die letzten 12 coco-Fotos bleiben fuer die Messlatte gesperrt
     user_share_train=0.55,    # Anteil des eigenen Fotos, nur die obere Haelfte
-    size=320,
+    size=384,                 # TRAININGS- und Datensatzgroesse (vorher 320). Warum:
+                              # der Median der verpassten Objekte lag bei 35 px Bilddiagonale -
+                              # bei 320 px Eingang ist ein 35-px-Schild nach dem Downsampling
+                              # auf stride 32 nur noch EIN Pixel breit. Bei 384 px sind es
+                              # 1,2 - und die feinste Stufe (stride 4) sieht viermal so viele
+                              # Bildpunkte. Datensatz und Training MUESSEN dieselbe Zahl
+                              # benutzen: crops_dataset schreibt die Bilder in dieser Groesse,
+                              # train_det letterboxt darauf (--size).
+                              # Achtung Werkzeuge: tools/crops_dataset.py --size 384,
+                              # tools/gtsdb_dataset.py --size 384 (beide aus diesem Wert).
     weights=("gtsign=2", "synset=2"),
     gtsign_train_max=24000,   # Ausschnitte aus dem GTSIGN-Trainingssplit
     gtsign_val_max=6000,      # Ausschnitte aus dem GTSIGN-Validierungssplit (fremde Messlatte)
@@ -89,21 +98,53 @@ TRAINING = dict(
     # Selbstattention aus, und die Fensteraufteilung auf p4 ist ersatzlos entfallen. Neu dazu
     # kommt CATM auf p3 (dort ist die Rechnung pro Zelle konstant).
     preset="breit",
-    size=320,
+    size=384,             # siehe DATEN["size"] - beide MUESSEN gleich sein
     batch=16,
     epochs=220,
     steps=150,            # 150 x 16 = 2 400 Bilder je Epoche
     lr=1.5e-3,
-    degrade=0.6,
-    zoom=0.5,             # Mehrskaligkeit - Grund fuer die freie Eingabegroesse im Browser
+    # Augmentierung ZURUECKGENOMMEN (vorher degrade 0.6, zoom 0.5):
+    #  * Zoom verstärkt genau das Problem, das er loesen soll: ein aggressiver Skalenschnitt
+    #    schrumpft kleine Schilder weiter, statt sie dem Netz naeher zu bringen. Gemessen
+    #    (data/_fp_messung.py, 6x6-Kacheln auf dem Poster) kann das Netz 15-px-Schilder
+    #    erkennen - es sieht sie nur im Trainingsbild zu selten in brauchbarer Groesse.
+    #  * Dieselbe Ueberlegung fuer degrade: starke Stoerung auf einem 20-px-Schild loescht
+    #    das Symbol, nicht nur dessen Kontrast. Was uebrig bleibt, ist Rauschen mit einer
+    #    Box daran - und genau das erzeugt Fehlalarme.
+    # Der Rest der Augmentierung (Zoom-Bereich 0.7..1.5, Helligkeit/Kontrast in synth_data)
+    # bleibt: die Zielbedingungen (Nacht, Regen, Bewegung) muessen weiter abgedeckt sein.
+    degrade=0.4,
+    zoom=0.3,
     workers=4,            # Kaggle hat 4 vCPU
     eval_every=10,
     save_every=10,
     seed=7,
     obj_norm="pos",
     val_split="val",
+    # Verlust und Kopf (siehe tools/train_det.py):
+    #  * focal_gamma 2 / focal_alpha 0.25: Focal Loss im Klassifikationskopf. 98 % aller
+    #    Fehlalarme waren echte Schilder mit FALSCHER Klasse - der Kopf findet, entscheidet
+    #    aber falsch, und die Kreuzentropie gewichtet leichte und schwere Faelle gleich.
+    #  * cls_w 4.0 gleicht das alpha=0.25 wieder aus: der Klassifikationskopf rechnet nur auf
+    #    positiven Zellen, dort ist alpha ein KONSTANTER Faktor und wuerde den Kopf sonst
+    #    still auf ein Viertel drosseln (4.0 x 0.25 = 1.0 wie vorher).
+    #  * smooth 0.075: Label-Smoothing haelt die Logits endlich und bremst die Ueberzeugung
+    #    bei aehnlichen Zeichen (Verwechslungsmatrix: Geschwister waren die Hauptfehler).
+    #  * hier_aux 0.3: die FAMILIE (9 Oberkategorien) wird direkt ueberwacht. Der
+    #    hierarchische Kopf bekaeme sonst nur mittelbar ein Signal.
+    focal_gamma=2.0,
+    focal_alpha=0.25,
+    cls_w=4.0,
+    smooth=0.075,
+    hier_aux=0.3,
 )
-AUSWERTUNG = dict(conf=0.25, iou=0.5, iou_det=0.45, zweite_groesse=384)
+# Auswertung: conf und NMS werden NICHT mehr fest angenommen. Der Sweep (--sweep) sucht das
+# beste Paar nach F1 ueber 0,15..0,60 (conf) x 0,40..0,70 (NMS-IoU) und kostet kein
+# Neutraining - das Netz laeuft einmal, die Nachbearbeitung danach beliebig oft. Die hier
+# eingetragenen Werte bleiben als Startwert der uebrigen Schritte stehen (und als
+# Vergleichswert im Bericht); der Sweep schreibt sein Optimum nach berichte/sweep.json.
+AUSWERTUNG = dict(conf=0.25, iou=0.5, iou_det=0.45, zweite_groesse=448,
+                  sweep_limit=400)
 # int8-Quantisierung: QDQ mit Kalibrierung auf den ECHTEN Bildern des Datensatzes - die
 # Verteilung des Einsatzes entscheidet ueber die Skalen, nicht eine synthetische. 200 Bilder
 # sind gemessen ausreichend; mehr kostet nur Zeit. Das Werkzeug verwirft die int8-Datei
@@ -1034,14 +1075,16 @@ def datensatz_bauen(p: Protokoll, ein: dict) -> tuple[dict, dict]:
                                 "--neg-share", str(d["neg_share_val"]))),
         # 3. Synthetische Negative (gezeichnete Stoererflaechen, Anzeigen, Nacht)
         ("synthetische negative", python("tools/synth_negatives.py", "--out", "data/det",
-                                         "--n", str(d["n_neg_synth"]), "--split", "train")),
+                                         "--n", str(d["n_neg_synth"]), "--split", "train",
+                                         "--size", str(d["size"]))),
         # 4. Echte Negative aus Block 5 (eigenes Foto + coco128) - andere Umgebung als OI
         ("echte negative", python("tools/real_negatives.py", "--out", "data/det",
-                                  "--n", str(d["n_echt_train"]), "--split", "train",
-                                  "--real-train", "user/Nothing.jpg",
-                                  "--train-region", "0,0,1,0.5",
-                                  *coco_args,
-                                  "--user-share", str(d["user_share_train"]))),
+                                   "--n", str(d["n_echt_train"]), "--split", "train",
+                                   "--size", str(d["size"]),
+                                   "--real-train", "user/Nothing.jpg",
+                                   "--train-region", "0,0,1,0.5",
+                                   *coco_args,
+                                   "--user-share", str(d["user_share_train"]))),
         # 5. Die Gegenprobe auf Fehlalarme: nur Bilder OHNE Schild, aus dem dritten OI-Topf.
         #    Ohne diese Szenen ist der Schritt sinnlos (er besteht nur aus ihnen) - dann faellt
         #    er weg, statt mit FileNotFoundError den Lauf zu beenden.
@@ -1051,7 +1094,8 @@ def datensatz_bauen(p: Protokoll, ein: dict) -> tuple[dict, dict]:
                                         *szene_neg_q, "--neg-share", "1.0"))]
           if szene_neg_q else []),
         ("synthetische negative (Messlatte)", python("tools/synth_negatives.py", "--out", "data/det",
-                                                     "--n", str(d["n_neg_synth"]), "--split", "neg")),
+                                                     "--n", str(d["n_neg_synth"]), "--split", "neg",
+                                                     "--size", str(d["size"]))),
         # 6. GTSDB: die einzigen ECHTEN Szenen (Schild klein im Bild). Trainingssplit ins
         #    Training, valid+test in die Messlatte - getrennte Ordner, also kein Leck.
         ("gtsdb train", python("tools/gtsdb_dataset.py", "--coco", "gtsdb-coco/train",
@@ -1075,6 +1119,7 @@ def datensatz_bauen(p: Protokoll, ein: dict) -> tuple[dict, dict]:
         schritte.append(("eigene negative (Training)",
                          python("tools/real_negatives.py", "--out", "data/det",
                                 "--n", str(d["n_eigene_train"]), "--split", "train",
+                                "--size", str(d["size"]),
                                 # Eigenes Kennzeichen: sonst haette dieser Aufruf die 3 600
                                 # echten Negative des Schritts darueber geloescht (gleicher
                                 # src "echt (Negativ)" und gleicher Split = Ersetzen).
@@ -1086,6 +1131,7 @@ def datensatz_bauen(p: Protokoll, ein: dict) -> tuple[dict, dict]:
         schritte.append(("eigene negative (Messlatte)",
                          python("tools/real_negatives.py", "--out", "data/det",
                                 "--n", str(d["n_eigene_neg"]), "--split", "neg",
+                                "--size", str(d["size"]),
                                 "--src", "eigene (Negativ)",
                                 "--real-test", *eigene_neg)))
     for was, cmd in schritte:
@@ -1161,6 +1207,13 @@ def trainieren(p: Protokoll) -> float:
                  "--workers", str(t["workers"]), "--eval-every", str(t["eval_every"]),
                  "--save-every", str(t["save_every"]), "--obj-norm", t["obj_norm"],
                  "--val-split", t["val_split"], "--out", "models/signs-det.pt",
+                 # Verlust und Kopf: Focal im Klassifikationskopf, Klassengewichte,
+                 # Label-Smoothing, hierarchischer Kopf mit direkt ueberwachter Familie.
+                 "--focal-gamma", str(t["focal_gamma"]),
+                 "--focal-alpha", str(t["focal_alpha"]),
+                 "--cls-w", str(t["cls_w"]),
+                 "--smooth", str(t["smooth"]),
+                 "--hier-aux", str(t["hier_aux"]),
                  "--seed", str(t["seed"]))
     return lauf(p, cmd, f"Training: {t['epochs']} Epochen x {t['steps']} Schritte "
                         f"x {t['batch']} Bilder (Merksatz: 1 Epoche = {t['steps']*t['batch']} Bilder)")
@@ -1212,6 +1265,12 @@ def auswerten(p: Protokoll, ein: dict, mit_fixture: bool = True) -> dict:
         (f"Messlatte {a['zweite_groesse']} px", "tools/eval_conditions.py",
          ["--ckpt", "models/signs-det.pt", *gemein, "--split", "val",
           "--size", str(a["zweite_groesse"]), "--json", "berichte/val384.json"]),
+        # Schwellen-Suche: conf 0,15..0,60 x NMS-IoU 0,40..0,70, Optimum nach F1. Kostet kein
+        # Neutraining, sondern nur die Nachbearbeitung - das Netz laeuft einmal. Ergebnis nach
+        # berichte/sweep.json; der Bericht uebernimmt es als "sweep.json".
+        ("Schwellen-Suche conf/NMS", "tools/eval_conditions.py",
+         ["--ckpt", "models/signs-det.pt", *gemein, "--split", "val", "--sweep",
+          "--sweep-limit", str(a["sweep_limit"]), "--json", "berichte/sweep.json"]),
     ]
     if ein.get("alt"):
         schritte.append(("Vergleich alter Checkpoint (dieselbe Messlatte)",
@@ -1291,7 +1350,7 @@ def kurzfassung(p: Protokoll, geraetname: str, ein: dict, dauer: dict, zahlen: d
 
     berichte = {name: lade(WORK / "berichte" / name)
                 for name in ("val.json", "neg.json", "val384.json", "val_block4.json",
-                             "model-out.json")}
+                             "sweep.json", "model-out.json")}
     dateien = {f.name: f.stat().st_size for f in sorted((WORK / "models").glob("*")) if f.is_file()}
     report = {
         "stand": time.strftime("%Y-%m-%d %H:%M"),
@@ -1346,14 +1405,17 @@ def main() -> None:
     p.zeile()
     p.zeile(f"[fertig] Gesamtdauer {gesamt:.0f} min auf {geraetename}")
     for name, blatt in (("val (Messlatte)", "val.json"), ("neg (Fehlalarme)", "neg.json"),
-                        ("val 384 px", "val384.json"),
-                        ("Vergleich Block 4", "val_block4.json")):
+                        (f"val {AUSWERTUNG['zweite_groesse']} px", "val384.json"),
+                        ("Vergleich Block 4", "val_block4.json"),
+                        ("Schwellen-Suche", "sweep.json")):
         daten = report["kennzahlen"].get(blatt)
         if daten:
             p.zeile(f"[ergebnis] {name:18s} P={daten['precision']:.3f} R={daten['recall']:.3f} "
                     f"F1={daten['f1']:.3f}  tp={daten['tp']} fp={daten['fp']} fn={daten['fn']}")
     p.zeile(f"[ergebnis] Modell: models/signs-det.onnx "
             f"{report['modelldateien'].get('signs-det.onnx', 0)/1e6:.2f} MB, "
+            f"int8 {report['modelldateien'].get('signs-det-int8.onnx', 0)/1e6:.2f} MB "
+            f"(das liefert der Browser aus), "
             f"Checkpoint {report['modelldateien'].get('signs-det.pt', 0)/1e6:.1f} MB")
     if FEHLER:
         p.zeile()

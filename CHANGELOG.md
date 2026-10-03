@@ -1,5 +1,101 @@
 # Changelog
 
+## 0.6.0 – 2026-10-03
+- **Erkennungskopf ersetzt: TGADHead** (`tools/hybrid_net.py`) – aufgabengeführter,
+  entkoppelter Kopf aus Zuo, Liu, Chen, Fu, Wang, *„TGADHead: An efficient and accurate
+  task-guided attention-decoupled head for single-stage object detection"*, Knowledge-Based
+  Systems **302:112349 (2024)**. Zwei Bausteine:
+  * **TDAD** (Task Decoupled Attention Distributor): zwei aufgabenspezifische
+    Aufmerksamkeits-Wahrnehmungen. Der **Ort**-Zweig gewichtet über die *Zellen* (Tiefenconv
+    3×3 → 1 Kanal → Sigmoid), der **Art**-Zweig über die *Kanäle* (globaler Mittelwert → 1×1
+    → Sigmoid). Getrennt, weil eine gemeinsame Gewichtung scharf-lokal und weich-global
+    gleichzeitig sein müsste – zusammen mittelt sich das zu etwas, das keinem von beiden dient.
+  * **TCN** (Task Correlation Network): Austausch *zwischen* den Zweigen
+    (`ort += gate(1×1(art))`, `art += gate(1×1(ort))`, Tor startet bei Sigmoid 0,27). Der
+    Abstract begründet ihn damit, dass genaue Ortung und hoher Klassenscore in bestehenden
+    Detektoren auseinandergehen – genau das war hier gemessen: 195 von 226 Fehlalarmen lagen
+    auf echten Schildern.
+  * **Herkunft, offen benannt:** es gibt **keine öffentliche Referenzumsetzung**; der Code ist
+    nach dem im Abstract beschriebenen Aufbau geschrieben und **nicht aus dem Paper
+    abgetippt** – Abweichungen im Detail sind möglich. Steht so im Quelltext. Gemessen
+    (Preset `breit`, 320 px): **2,79 Mio. Parameter** gegen 2,20 Mio. des Vorgängers, also
+    +0,59 Mio. für Aufgabentrennung und Austausch.
+- **Hierarchischer Klassifikationskopf**: statt einer flachen Entscheidung über 74 Klassen
+  jetzt zwei Stufen – **9 Oberkategorien** (Familie: Form/Farbe) und **74 Unterkategorien**
+  (Symbol im Inneren), verrechnet als `logit_k = super[familie(k)] + sub[k]`, in
+  Log-Wahrscheinlichkeiten also `P(k) = P(Familie)·P(k|Familie)`.
+  * Die Hierarchie steht in `tools/signmap.py` bei den Klassen (**eine** Taxonomie) und ist
+    verteilt: **74 = 5 + 18 + 3 + 7 + 19 + 7 + 4 + 2 + 9** (Vorfahrt, Tempo, Überholen, Verbot,
+    Warnung, Gebot, Rad/Fuß, Zone, Hinweis). `signmap.pruefen()` erzwingt jetzt, dass jede
+    Unterkategorie genau einer Familie zugeordnet ist – ein Tippfehler wäre sonst erst als
+    Klasse aufgefallen, die nie erkannt wird.
+  * **Der Ausgangsvertrag bleibt unverändert** (79 Kanäle, `os4/os8/os16/os32`): die Summe
+    steht im selben Tensor, `tools/detmath.py` und `src/model.js` sind nicht angefasst.
+  * Die **Familie wird zusätzlich direkt überwacht** (`--hier-aux 0.3`, Hilfsverlust auf
+    denselben positiven Zellen). Ohne ihn bekäme die grobe Entscheidung nur mittelbar ein
+    Signal.
+- **Focal Loss im Klassifikationskopf** (`tools/train_det.py`) mit **Klassengewichten** und
+  **Label-Smoothing**:
+  * `γ=2`, `α=0,25`; Klassen `w_c = (1/häufigkeit_c)^0,5`, auf Mittelwert 1 normiert
+    (gedämpft – `1/f` hätte den Kopf in die Gegenrichtung kippen lassen), Smoothing `0,075`.
+  * **α wirkt hier nur als konstanter Faktor** (der Kopf rechnet ausschließlich auf positiven
+    Zellen, es gibt keine Negativklasse auszugleichen) und würde den Kopf still auf ein
+    Viertel drosseln. Deshalb gleicht `--cls-w 4.0` das aus (0,25 × 4,0 = 1,0 wie vorher) –
+    im Kernel mit Begründung hinterlegt.
+  * Die Häufigkeiten kommen aus den **Labeldateien des Trainingssplits**, nicht aus `val`
+    (sonst steckte eine Messlatte im Verlust). Gemessen am lokalen Datensatz:
+    `tempo10=10175` ist die häufigste, Gewichte `0,65 … 1,11`.
+- **Trainingsauflösung 320 → 384 px** (`kaggle/train_kernel.py`, `DATEN` *und* `TRAINING`).
+  Grund: der Median der verpassten Objekte liegt bei 35 px Diagonale – bei 320 px ist das auf
+  `stride 32` noch **ein** Pixel breit. Datensatz *und* Training müssen dieselbe Zahl
+  benutzen; `--size` wird jetzt auch an `synth_negatives.py` und `real_negatives.py`
+  durchgereicht (vorher schrieben die mit dem 320er-Default). Die zweite Messgröße wandert
+  entsprechend auf **448 px**.
+  * Dazu in `tools/detmath.py`: `ASSIGN_MAX_SIDE` wird mit `size/320` **skaliert**. Die
+    Grenzen sind absolute Pixel aus der 320-px-Zeit; ohne die Umrechnung landete dasselbe
+    Schild bei 384 px eine Stufe feiner, und der Offset klemmt am Zellenrand.
+    Bei `size == 320` ist das Verhalten unverändert.
+- **Augmentierung zurückgenommen**: `zoom 0,5 → 0,3`, `degrade 0,6 → 0,4`. Aggressiver
+  Skalenschnitt verkleinert kleine Schilder weiter, statt sie näherzubringen; starke Störung
+  löscht auf einem 20-px-Schild das Symbol, nicht nur dessen Kontrast – was übrig bleibt, ist
+  Rauschen mit einer Box daran.
+- **Schwellen-Suche in der Auswertung** (`tools/eval_conditions.py --sweep`): `conf`
+  0,15…0,60 × NMS-IoU 0,40…0,70, Optimum **nach F1** (auf einem Split ohne Boxen nach
+  `fp/Bild`). Das Netz läuft **einmal**, je `conf` einmal `decode_level`, je NMS-Paar nur
+  NMS + Zuordnung – deshalb 70 Kombinationen in Sekunden statt 70 Netzlaufzeiten. Rohausgaben
+  als `float16` (`--sweep-limit 400`, rund 0,8 GB). Ergebnis nach `berichte/sweep.json` und
+  damit in `kaggle_report.json`; zusätzlich wird gegen den bisherigen Wert
+  (conf 0,25 / NMS 0,45) gerechnet, damit die Verbesserung dasteht.
+
+- **ONNX-Export: der Fehler aus dem Kaggle-Lauf ist behoben und darf sich nicht wiederholen.**
+  Im Lauf vom 03.10. brach der Export mit `Reshape … Input shape:{1,128,24,24}, requested
+  shape:{1,128,4,5,4,5}` ab, und der Kernel schlug den Schritt als **Ganzes** fehl
+  („übersprungen") – 2,5 Stunden Training ohne auslieferbares Modell. Zwei Ursachen, zwei
+  Maßnahmen:
+  * Der `Reshape` mit fest eingebauter Fenstergröße stammte aus dem **alten
+    Aufmerksamkeitsblock**. Mit CATM existiert diese Stelle nicht mehr – die Fensterteilung
+    ist ersatzlos entfallen (belegt: kein `win`/`pad` mehr im Baum, `py_compile` und Export
+    gegen einen frischen Checkpoint laufen durch).
+  * Unabhängig davon ist der Export jetzt **abgesichert**: schlägt die Gegenprobe der
+    dynamischen Achsen fehl oder wirft sie, wird **statisch** exportiert, `labels.json`
+    bekommt `dynamic:false` **plus** `dynamic_fallback` mit Grund und fester Größe, ebenso
+    `manifest.json`. Das Werkzeug endet mit Code 0 statt 1. Ein Modell, das nur seine
+    Trainingsgröße kann, ist ungleich besser als keines.
+  * `src/model.js`/`src/app.js` respektieren das: bei `labels.dynamic === false` werden
+    `inputSize` und die Größenauswahl **ignoriert** und fest auf `labels.size` gerechnet –
+    sonst würde in 384 px geletterboxt und in 320 px gerechnet, ohne dass ein Fehler auftritt.
+  * Beide Wege sind durchgespielt: normal **Parität 4,77e-06**, dynamisch 384 px →
+    Formen `[96,48,24,12]` passend; künstlich erzwungener Fehler → Rückfall auf statisch,
+    Parität 3,81e-06, `dynamic:false` im `labels.json`.
+- **Verifiziert in diesem Schritt** (jeweils gemessen, nicht angenommen):
+  Kopfvarianten bauen und liefern **79 Kanäle** (`tgadhier` 2 785 132 / `tgadflach`
+  2 780 776 / `plainhier` 2 195 212 Parameter bei 320 px); Rauchtest mit echten Daten
+  (Loss-Zerlegung zeigt `fam`); Schwellen-Suche end-to-end gegen 15 Bilder inkl. JSON;
+  `signmap.pruefen()` ohne Fehler; `node tests/model.test.js` und `detector.test.js` ohne FAIL.
+  * Details: `data/det` lokal = 29 600 train / 2 000 val / 1 100 neg (GTSRB);
+    `int8` aus dem neuen Kopf: **7,57 MB → 2,46 MB**, Abweichung 1,94e-02, **keine**
+    „Expected bias"-Warnung mehr.
+
 ## 0.5.0 – 2026-10-03 (in Arbeit)
 - **Architektur umgebaut** (`tools/hybrid_net.py`): die fensterbasierte Selbstattention ist
   durch den **CATM** (Convolutional Additive Token Mixer) aus CAS-ViT ersetzt

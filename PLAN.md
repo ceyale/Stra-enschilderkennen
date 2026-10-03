@@ -154,6 +154,26 @@ ist klein, nicht die Dateizahl.
      `tools/bench_model.py`, nicht geschätzt. Ausgeliefert wird **INT8** (2,67 MB gegen
      8,75 MB FP32), mit Rückfall auf FP32 in `src/model.js`.
 
+     **Nachtrag (Runde 03.10., zweiter Teil):** der Kopf ist jetzt ein **TGADHead**
+     (Zuo u. a., Knowledge-Based Systems 302:112349, 2024) – **TDAD** (aufgabenspezifische
+     Aufmerksamkeit: Ort über Zellen, Art über Kanäle) plus **TCN** (Austausch zwischen den
+     Zweigen, Tor startet bei 0,27). Keine öffentliche Referenzumsetzung, im Quelltext als
+     solche gekennzeichnet. Dazu ein **hierarchischer Klassifikationskopf**: 9 Oberkategorien
+     → 74 Unterarten, verrechnet als `logit_k = super[familie(k)] + sub[k]`, also
+     `P(k) = P(Familie)·P(k|Familie)`; der Ausgangsvertrag (79 Kanäle) bleibt gleich, damit
+     `tools/detmath.py` und `src/model.js` unangetastet bleiben. Die Familie wird zusätzlich
+     direkt überwacht (`--hier-aux 0,3`). Gemessen: 2,79 Mio. Parameter gegen 2,20 Mio.
+     (Preset `breit`, 320 px).
+
+     **Weiter in dieser Runde:** Training auf **384 px** (Datensatz *und* Training; der
+     Median der verpassten Objekte liegt bei 35 px – bei 320 px ist das auf `stride 32` ein
+     Pixel), `ASSIGN_MAX_SIDE` skaliert mit `size/320`, Augmentierung zurückgenommen
+     (`zoom 0,5→0,3`, `degrade 0,6→0,4`), **Focal Loss** im Klassifikationskopf mit
+     Klassengewichten `(1/f)^0,5` und Label-Smoothing, sowie eine **Schwellen-Suche**
+     (`--sweep`, conf × NMS, Optimum nach F1) in der Auswertung. Der Export ist abgesichert:
+     die dynamische Gegenprobe kann den Export nicht mehr mitreißen (Rückfall auf statisch,
+     Grund in `labels.json`).
+
 2. **Kachelmodus in die App**: `src/model.js` + `src/app.js` – Foto in N×N überlappende
    Kacheln, Treffer verschieben, NMS über die Kachelgrenzen, **höhere Schwelle** im Kachelmodus
    (Messung: conf 0,3 → 40 statt 115 Treffer auf dem Poster, aber 5 statt 22 FP auf `Nothing`).
@@ -172,7 +192,15 @@ ist klein, nicht die Dateizahl.
 * Kachelmodus muss in **Python und JS identisch** umgesetzt sein (sonst rechnet der Browser
   anders als die Messung) – die Regel „eine Rechnung, zwei Sprachen“ gilt auch hier.
 * Alte Checkpoints sind nicht ladbar (Kopfzweige umbenannt); ein Lauf muss von Grund auf neu.
-* int8 bleibt verworfen (Qualitätstor), ausgeliefert wird fp32.
+* int8 wird inzwischen **ausgeliefert** (2,67 MB gegen 8,75 MB FP32, Parität 1,03e-02 am
+  Prüfmodell): `tools/export_onnx.py` verwirft die quantisierte Datei SELBST, wenn die Parität
+  gegen PyTorch zu schlecht ist, und `src/model.js` fällt auf FP32 zurück, wenn das Laden
+  scheitert. Beide Wege sind also abgesichert – nicht „verworfen", sondern „mit Gürtel und
+  Hosenträgern".
+* Ein **statisch** exportiertes Modell (`labels.dynamic === false`) darf NICHT mit einer anderen
+  Eingabegröße aufgerufen werden. `src/model.js` und `src/app.js` sperren die Größenauswahl in
+  diesem Fall; ohne diese Sperre würde in 384 px geletterboxt und in 320 px gerechnet, ohne
+  dass irgendwo ein Fehler auftritt.
 
 ## 5. Offene Fragen an den Nutzer
 

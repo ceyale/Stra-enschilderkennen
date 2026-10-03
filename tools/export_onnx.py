@@ -232,12 +232,38 @@ def main() -> None:
           f"Erkennungen torch={par['det_ref']} onnx={par['det_onnx']} "
           f"davon IoU>=0.95 {par['matched_iou95']}")
 
-    dyn = None
+    dyn, rueckfall, grund = None, False, ""
     if args.dynamic:
-        dyn = dynamic_check(model, sess, size, args.check_size)
-        print(f"[dynamisch] Eingang {args.check_size}x{args.check_size} -> "
-              f"Formen {dyn['shapes']}  passend={dyn['forme_ok']}  "
-              f"max. Tensorabweichung={dyn['max_diff']:.2e}")
+        # Die Gegenprobe darf den Export NICHT mitreissen. Genau das ist im Kaggle-Lauf vom
+        # 03.10. passiert: ein Reshape im damaligen Aufmerksamkeitsblock hatte die
+        # Fenstergroesse fest eingebaut (4x5), das Netz stiess bei 384 px auf eine andere
+        # Zellenzahl - die Ausnahme flog bis in main() durch, das Werkzeug endete mit Code 1,
+        # und der Kernel SCHLUG DEN EXPORT ALS GANZEN FEHL ("uebersprungen"). Ergebnis: 2,5
+        # Stunden Training, kein auslieferbares Modell.
+        # Jetzt gilt: laesst sich Hoehe/Breite nicht oeffnen, wird STATISCH exportiert. Ein
+        # Modell, das nur seine Trainingsgroesse kann, ist ungleich besser als keines -
+        # src/model.js liest labels.dynamic und skaliert dann fest auf labels.size.
+        try:
+            dyn = dynamic_check(model, sess, size, args.check_size)
+            print(f"[dynamisch] Eingang {args.check_size}x{args.check_size} -> "
+                  f"Formen {dyn['shapes']}  passend={dyn['forme_ok']}  "
+                  f"max. Tensorabweichung={dyn['max_diff']:.2e}")
+        except Exception as fehler:                   # noqa: BLE001 - Rueckfall statt Abbruch
+            grund = f"{type(fehler).__name__}: {str(fehler)[:160]}"
+            dyn = None
+        if dyn is not None and not dyn["forme_ok"]:
+            grund = f"Ausgangsformen passen nicht zu {args.check_size} px"
+            dyn = None
+        if dyn is None:
+            rueckfall, args.dynamic = True, False
+            print(f"[dynamisch] FEHLGESCHLAGEN ({grund})")
+            print(f"[rueckfall] statischer Export auf {size} px (fest)")
+            out_path.unlink(missing_ok=True)
+            export_onnx(model, size, out_path, dynamic=False)
+            sess = ort_session(out_path)
+            par = parity_check(model, sess, size, args.parity_n)
+            print(f"[rueckfall] {out_path}  {out_path.stat().st_size/1e6:.2f} MB  "
+                  f"Paritaet={par['max_tensor_diff']:.2e}")
 
     x = np.ascontiguousarray(np.zeros((1, 3, size, size), np.float32))
     t0 = time.perf_counter()
@@ -272,12 +298,25 @@ def main() -> None:
               # Anzeige-Informationen je Klasse. Ohne sie kennt die Oberflaeche nur die neun
               # Heuristik-Typen und koennte die uebrigen Klassen nicht benennen.
               "info": {name: signmap.INFO[name] for name in SIGN_LABELS},
+              # Hierarchie (tools/signmap.py): Oberkategorie je Klasse und die Familien mit
+              # ihren Unterkategorien. Der Browser BRAUCHT sie nicht - der Ausgangstensor
+              # traegt die fertige Klasse. Sie steht hier, damit die Herkunft einer
+              # Erkennung nachvollziehbar bleibt (z.B. "Tempolimit -> tempo70").
+              "hierarchy": {"super": {name: signmap.SUPER_LABELS[signmap.SUPER_OF[i]]
+                                      for i, name in enumerate(SIGN_LABELS)},
+                            "groups": {f: list(signmap.SUPER_GRUPPEN[f])
+                                       for f in signmap.SUPER_LABELS}},
               "files": files}
+    if rueckfall:
+        # Nicht verschweigen: die Anzeige und jedes spaetere Debugging haengt daran, ob das
+        # Modell andere Eingabegroessen annehmen kann. Grund im Klartext dazu.
+        labels["dynamic_fallback"] = {"grund": grund, "feste_groesse": size}
     (out_path.parent / "labels.json").write_text(json.dumps(labels, indent=2, ensure_ascii=False), encoding="utf-8")
 
     manifest = {"arch": cfg.as_dict(), "params": n_params(model), "size": size, "classes": SIGN_LABELS,
                 "trained_epoch": ck.get("epoch"), "train_metrics": ck.get("metrics"),
                 "parity": par, "dynamic": dyn, "ort_cpu_ms": round(ms, 2), "files": files,
+                "dynamic_fallback": ({"grund": grund, "feste_groesse": size} if rueckfall else None),
                 "sha256": {k: sha256(out_path.parent / v) for k, v in files.items()
                            if k in ("onnx", "int8")},
                 "torch": torch.__version__}

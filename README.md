@@ -28,11 +28,16 @@ Dann `http://localhost:8000` öffnen. `localhost` gilt als sicher, die Webcam fu
 ## KI-Modus (optional)
 
 Ein kleines Netz sagt **Position und Art** in einem Durchlauf voraus (anchor-free, vier
-Stufen, 9 Typen) – trainiert mit `tools/`, ausgeliefert als ONNX und im Browser gerechnet.
+Stufen, 74 Klassen) – trainiert mit `tools/`, ausgeliefert als ONNX und im Browser gerechnet.
 Einzelne tiefe Stufen sind **CATM-Blöcke** (Convolutional Additive Token Mixer, CAS-ViT) statt
-CNN-Schichten, die Merkmalspyramide ist eine **LGP-FPN**; ausgeliefert wird ein **INT8**-Modell
-mit FP32-Rückfall. Mehr dazu und alle gemessenen Zahlen in
-[`docs/TRAINING.md`](docs/TRAINING.md).
+CNN-Schichten, die Merkmalspyramide ist eine **LGP-FPN**, der Erkennungskopf ein **TGADHead**
+(aufgabengeführt und entkoppelt: TDAD + TCN) mit **hierarchischem Klassifikationskopf**
+(9 Oberkategorien → 74 Unterarten); ausgeliefert wird ein **INT8**-Modell mit FP32-Rückfall.
+Mehr dazu und alle gemessenen Zahlen in [`docs/TRAINING.md`](docs/TRAINING.md).
+
+Der hierarchische Kopf ist der Grund, warum die Anzeige eine Herkunft nennen kann: jede
+Erkennung kennt ihre **Familie** (`labels.json` → `hierarchy`), z. B. „Tempolimit → tempo70".
+Die Klassenliste aller 74 Zeichen steht in `tools/signmap.py`.
 
 **Aktueller Stand (gemessen, `docs/TRAINING.md` §5):** 1 300 360 Parameter, 878 MFLOPs,
 5,23 MB ONNX – auf 2 000 Validierungsbildern **P = 0,883 / R = 0,796 / F1 = 0,837**,

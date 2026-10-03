@@ -32,8 +32,10 @@ import torch.nn.functional as F
 from PIL import Image
 
 import detmath as dm
+import signmap as sm
 import synth_data as sd
-from hybrid_net import N_CH, N_CLASSES, SIGN_LABELS, NetCfg, build_model, n_params, preset_cfg
+from hybrid_net import (N_CH, N_CLASSES, N_SUPER, SIGN_LABELS, NetCfg, build_model,
+                        n_params, preset_cfg)
 
 
 class SignDataset(torch.utils.data.Dataset):
@@ -190,13 +192,107 @@ def collate(batch, size: int):
     return xs, targets, meta
 
 
+def class_frequencies(ds, n_klassen: int = N_CLASSES) -> np.ndarray:
+    """Anzahl der Boxen je Klasse im Trainingssplit (aus den YOLO-Labeldateien).
+
+    Grundlage der Klassengewichte. Gezaehlt werden Boxen, nicht Bilder: entscheidend ist,
+    wie oft der Kopf eine Klasse ueberhaupt zu sehen bekommt.
+    """
+    zaehler = np.zeros(n_klassen, dtype=np.float64)
+    for _bild, lab, _eintrag in ds.items:
+        if not lab.exists():
+            continue
+        for zeile in lab.read_text(encoding="utf-8").splitlines():
+            teile = zeile.split()
+            if len(teile) >= 5:
+                k = int(float(teile[0]))
+                if 0 <= k < n_klassen:
+                    zaehler[k] += 1.0
+    return zaehler
+
+
+def super_frequencies(cls_counts: np.ndarray) -> np.ndarray:
+    """Boxen je FAMILIE (Summe ihrer Unterkategorien) - Grundlage der Familien-Gewichte."""
+    fam = np.zeros(N_SUPER, dtype=np.float64)
+    for k, n in enumerate(cls_counts):
+        f = sm.SUPER_OF[k]
+        if f >= 0:
+            fam[f] += n
+    return fam
+
+
+def class_weights_from(counts: np.ndarray) -> np.ndarray:
+    """w_c = (1/haeufigkeit_c)^0.5, auf Mittelwert 1 normiert.
+
+    Gedaempft, nicht 1/f: die seltenste Klasse waere sonst einige hundert Mal so schwer wie
+    die haeufigste und der Kopf kippte in die Gegenrichtung (er sagte dann bevorzugt die
+    seltenen Klassen und produzierte genau die Fehlalarme, die er loswerden soll). Die
+    Wurzel daempft das, und die Normierung auf 1 haelt den Anteil des Kopfes am
+    Gesamtverlust unveraendert - sonst aendert sich mit den Gewichten auch die Balance
+    zwischen Objektivitaet, Klasse und Box.
+
+    Die Laenge richtet sich nach der Eingabe (nicht nach N_CLASSES): dieselbe Funktion
+    rechnet die Gewichte der 74 Unterkategorien UND die der 9 Familien.
+    """
+    counts = np.asarray(counts, dtype=np.float64).reshape(-1)
+    w = np.ones(len(counts), dtype=np.float64)
+    da = counts > 0
+    if da.any():
+        w[da] = (1.0 / counts[da]) ** 0.5
+        w[da] /= w[da].mean()
+    return w
+
+
+def focal_cross_entropy(logits: torch.Tensor, target: torch.Tensor, gamma: float = 2.0,
+                        alpha: float = 1.0, weight: torch.Tensor | None = None,
+                        smoothing: float = 0.0) -> torch.Tensor:
+    """Mehrklassen-Focal-Loss (Summe) fuer die Klassifikation der positiven Zellen.
+
+    Warum Focal statt Kreuzentropie: bei der Fehlerzerlegung waren 98 % aller Fehlalarme
+    echte Schilder mit FALSCHER Klasse (tools/eval_conditions.py --diagnose). Der Kopf
+    findet die Boxen also, entscheidet sich aber falsch - und die Kreuzentropie behandelt
+    leichte und schwere Faelle gleich. Der Faktor (1 - p_t)^gamma zieht die schweren nach
+    vorn, ohne die leichten ganz wegzunehmen (gamma=0 ist wieder Kreuzentropie).
+
+    alpha wirkt hier NUR als konstanter Faktor: der Klassifikationskopf rechnet
+    ausschliesslich auf positiven Zellen, es gibt also keine Negativzelle auszugleichen -
+    genau das macht alpha im RetinaNet-Rezept. Der dortige Wert 0,25 drosselt damit den
+    Anteil des Kopfes am Gesamtverlust auf ein Viertel; kaggle/train_kernel.py gleicht das
+    mit --cls-w 4.0 wieder aus (0,25 x 4,0 = 1,0). Ohne diesen Ausgleich wuerde die
+    Aenderung den Kopf schwaecht, den sie staerken soll.
+
+    smoothing verteilt einen kleinen Teil der Zielmasse gleichmaessig auf alle Klassen
+    (Label-Smoothing). Das haelt die Logits endlich und bremst die Ueberzeugung bei
+    aehnlichen Zeichen - die Verwechslungsmatrix zeigte genau dort die Fehler.
+    """
+    logp = F.log_softmax(logits, dim=-1)
+    with torch.no_grad():
+        echt = torch.zeros_like(logp)
+        echt.scatter_(1, target[:, None], 1.0)
+        if smoothing > 0.0:
+            echt = echt * (1.0 - smoothing) + smoothing / logp.shape[1]
+    p = logp.exp()
+    pt = (echt * p).sum(dim=-1).clamp(1e-7, 1.0)
+    verlust = -(1.0 - pt).pow(gamma) * (echt * logp).sum(dim=-1)
+    if alpha != 1.0:
+        verlust = verlust * alpha
+    if weight is not None:
+        verlust = verlust * weight.to(target.device)[target]
+    return verlust.sum()
+
+
 class DetLoss(nn.Module):
-    """Verlust: Objektivitaet (fokal), Art (CE mit Label-Smoothing), Box (L1, groessengewichtet).
+    """Verlust: Objektivitaet (fokal), Art (fokal, klassengewichtet, geglaettet), Box (L1, groessengewichtet).
 
     Bewusst ohne IoU/DFL-Verlust. Der Kommentar "CIoU waere der naechste Genauigkeitsschritt"
     war eine Vermutung - gemessen wurde sie widerlegt: die 1853 Treffer auf 2000 val-Bildern
     haben im Mittel IoU 0.938 (84 % ueber 0.9). Der Verlust ist also nicht die Baustelle;
     die Fehler liegen in der Klassentrennung (32 % der FN) und bei kleinen Schildern.
+
+    Der ART-Verlust ist seit dem 03.10. ein Focal-Loss mit Klassengewichten
+    (siehe focal_cross_entropy) - die Fehlerzerlegung hatte gezeigt, dass 98 % aller
+    Fehlalarme echte Schilder mit falscher Klasse sind. Eine Auswertung ist in
+    docs/TRAINING.md Abschnitt 10 nachgezogen.
 
     obj_norm steuert die Normierung des Objektivitaetsverlusts: "pos" teilt durch die Zahl
     der positiven Zellen (RetinaNet-Rezept), "sqrt" durch deren Wurzel. Mit vielen
@@ -206,15 +302,43 @@ class DetLoss(nn.Module):
 
     def __init__(self, size: int = 320, alpha: float = 0.25, gamma: float = 2.0,
                  w_obj: float = 1.0, w_cls: float = 1.0, w_box: float = 5.0, smooth: float = 0.05,
-                 obj_norm: str = "pos"):
+                 obj_norm: str = "pos", cls_gamma: float = 2.0, cls_alpha: float = 1.0,
+                 class_weights: np.ndarray | None = None, hier_aux: float = 0.0,
+                 super_of: np.ndarray | None = None,
+                 super_weights: np.ndarray | None = None):
         super().__init__()
         self.size, self.alpha, self.gamma = size, alpha, gamma
         self.w_obj, self.w_cls, self.w_box, self.smooth = w_obj, w_cls, w_box, smooth
         self.obj_norm = obj_norm
+        # alpha/gamma oben gehoeren zur OBJEKTIVITAET (binaer, dort gleicht alpha die
+        # Uebermacht der Hintergrundzellen aus). cls_alpha/cls_gamma gehoeren zur ART.
+        self.cls_gamma, self.cls_alpha = cls_gamma, cls_alpha
+        self.class_weights = None if class_weights is None else torch.as_tensor(
+            np.asarray(class_weights, dtype=np.float32))
+        # Hilfsverlust auf der FAMILIE (nur hierarchischer Kopf, siehe TGADHead). Ohne ihn
+        # lernt der Familienkopf nur mittelbar: sein Logit geht in die Summe ein, ein
+        # eigenes Ziel hat er nicht. Mit ihm bekommt die grobe Entscheidung ein eigenes,
+        # groeberes Signal - auch dann, wenn die Unterart noch falsch liegt.
+        self.hier_aux = hier_aux
+        self.super_of = None if super_of is None else torch.as_tensor(
+            np.asarray(super_of, dtype=np.int64))
+        self.super_weights = None if super_weights is None else torch.as_tensor(
+            np.asarray(super_weights, dtype=np.float32))
 
-    def forward(self, preds: list[torch.Tensor], targets: dict) -> tuple[torch.Tensor, dict]:
+    @property
+    def will_aux(self) -> bool:
+        """Braucht der Verlust den Familien-Ausgang? (dann want_aux=True im Vorwaertslauf)"""
+        return self.hier_aux > 0.0 and self.super_of is not None
+
+    def forward(self, preds, targets: dict) -> tuple[torch.Tensor, dict]:
+        # Der hierarchische Verlustlauf liefert ein Paar (Ausgaenge, Familien-Logits);
+        # die Auswertung ruft das Netz ohne want_aux und bekommt nur die Ausgaenge.
+        familie = None
+        if isinstance(preds, tuple):
+            preds, familie = preds
         zero = torch.zeros((), dtype=torch.float32)
         obj_t, cls_t, box_t = zero, zero.clone(), zero.clone()
+        fam_t = zero.clone()
         n_pos = 0
         for lvl, p in enumerate(preds):
             t_obj = targets["obj"][lvl]
@@ -231,8 +355,18 @@ class DetLoss(nn.Module):
             n_pos += int(flat.sum())
             cls_logits = p[:, 5:].permute(0, 2, 3, 1).reshape(-1, N_CLASSES)[flat]
             cls_target = targets["cls"][lvl].reshape(-1)[flat]
-            cls_t = cls_t + F.cross_entropy(cls_logits, cls_target,
-                                            label_smoothing=self.smooth, reduction="sum")
+            cls_t = cls_t + focal_cross_entropy(cls_logits, cls_target, gamma=self.cls_gamma,
+                                                alpha=self.cls_alpha, weight=self.class_weights,
+                                                smoothing=self.smooth)
+            if familie is not None and self.super_of is not None:
+                # Familie = Ziel-Familie der Wahren Klasse. flat waehlt dieselben Zellen aus
+                # wie oben, damit der Hilfsverlust genau auf den positiven Zellen wirkt.
+                fam_logits = familie[lvl].permute(0, 2, 3, 1).reshape(-1, N_SUPER)[flat]
+                fam_target = self.super_of.to(cls_target.device)[cls_target]
+                fam_t = fam_t + focal_cross_entropy(fam_logits, fam_target, gamma=self.cls_gamma,
+                                                    alpha=self.cls_alpha,
+                                                    weight=self.super_weights,
+                                                    smoothing=self.smooth)
             pb = p[:, :4].permute(0, 2, 3, 1).reshape(-1, 4)[flat]
             tb = targets["box"][lvl].reshape(-1, 4)[flat]
             pred = torch.cat([torch.sigmoid(pb[:, :2]), pb[:, 2:]], dim=1)
@@ -246,9 +380,10 @@ class DetLoss(nn.Module):
         # Normierung wie in RetinaNet: durch die Anzahl positiver Zellen teilen, nicht
         # durch alle Zellen. Sonst waeren die wenigen Schilder im Lernschritt verdunnt.
         obj, cls, box = obj_t / n, cls_t / n, box_t / n
-        loss = self.w_obj * obj + self.w_cls * cls + self.w_box * box
+        fam = fam_t / n
+        loss = self.w_obj * obj + self.w_cls * cls + self.w_box * box + self.hier_aux * fam
         return loss, {"obj": float(obj.detach()), "cls": float(cls.detach()),
-                      "box": float(box.detach()), "n_pos": n_pos}
+                      "box": float(box.detach()), "fam": float(fam.detach()), "n_pos": n_pos}
 
 
 METRIC_KEYS = ("precision", "recall", "f1", "tp", "fp", "fn", "fp_bild")
@@ -297,10 +432,13 @@ def cfg_from_args(args) -> NetCfg:
     # Mit --preset bestimmt das Preset die Groesse VOLLSTAENDIG. Sonst wuerden die
     # CLI-Defaults (z.B. --act silu) die Preset-Werte (hardswish) still ueberschreiben
     # und die Variante waere langsamer als gemessen.
+    # Kopf und Hierarchie sind davon AUSGENOMMEN: sie sind keine Groesse, sondern eine
+    # Bauart - und werden in beiden Zweigen ausdruecklich durchgereicht.
+    kopf = dict(head=args.head, hier=not args.no_hier)
     if getattr(args, "preset", ""):
-        return preset_cfg(args.preset)
+        return preset_cfg(args.preset, **kopf)
     return NetCfg(catm=parse_list(args.catm), act=args.act,
-                  tr_ffn=args.ffn, tr_norm=args.norm)
+                  tr_ffn=args.ffn, tr_norm=args.norm, **kopf)
 
 
 def make_loader(root: str, size: int, split: str, batch: int, shuffle: bool,
@@ -344,6 +482,24 @@ def main() -> None:
     ap.add_argument("--zoom-hi", type=float, default=1.5, help="groesster Zoomfaktor")
     ap.add_argument("--obj-norm", default="pos", choices=["pos", "sqrt"],
                     help="Normierung des Objektivitaetsverlusts (bei vielen Negativen: sqrt)")
+    ap.add_argument("--focal-gamma", type=float, default=2.0,
+                    help="Focal-gamma im KLASSIFIKATIONSkopf (0 = reine Kreuzentropie)")
+    ap.add_argument("--focal-alpha", type=float, default=1.0,
+                    help="konstanter Faktor des Klassifikations-Focal-Loss; 0,25 ist der "
+                         "RetinaNet-Wert und drosselt den Kopf auf ein Viertel - dann mit "
+                         "--cls-w 4.0 ausgleichen (tools/train_det.py focal_cross_entropy)")
+    ap.add_argument("--cls-w", type=float, default=1.0, help="Gewicht des Klassifikationsverlusts")
+    ap.add_argument("--smooth", type=float, default=0.05,
+                    help="Label-Smoothing im Klassifikationskopf (0 = aus)")
+    ap.add_argument("--no-class-weights", action="store_true",
+                    help="Klassengewichte (1/haeufigkeit)^0.5 abschalten")
+    ap.add_argument("--head", default="tgad", choices=["tgad", "plain"],
+                    help="Erkennungskopf: tgad = TGADHead (aufgabengefuehrt, entkoppelt), "
+                         "plain = Vorgaengerkopf mit gemeinsamem Stamm")
+    ap.add_argument("--no-hier", action="store_true",
+                    help="flacher Klassifikationskopf statt Ober-/Unterkategorien")
+    ap.add_argument("--hier-aux", type=float, default=0.3,
+                    help="Gewicht des Hilfsverlusts auf der FAMILIE (0 = aus)")
     ap.add_argument("--val-split", default="val", choices=["val", "neg"],
                     help="Split fuer die Auswertung; 'neg' ist die Gegenprobe auf Fehlalarme")
     ap.add_argument("--synth-train", type=int, default=400)
@@ -376,7 +532,6 @@ def main() -> None:
         print(f"[resume] {args.resume} -> Epoche {start_epoch}, Konfiguration aus Checkpoint, "
               f"size={args.size}")
     model = build_model(cfg)
-    crit = DetLoss(size=args.size, w_box=args.box_w, obj_norm=args.obj_norm)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     if ckpt:
         model.load_state_dict(ckpt["model"])
@@ -394,13 +549,50 @@ def main() -> None:
                                    args.zoom, args.zoom_lo, args.zoom_hi)
     vloader, val_ds = make_loader(args.data, args.size, args.val_split, args.batch, False,
                                   args.synth_val, args.seed + 999, 0.0, args.workers)
+
+    # Klassengewichte aus dem TRAININGSsplit (nicht aus val - sonst waere das eine
+    # versteckte Messlatte im Verlust). Gezaehlt werden die Boxen der Labeldateien.
+    cls_weights = None
+    haeufig = np.zeros(N_CLASSES, dtype=np.float64)   # immer definiert: der Familien-
+    if not args.no_class_weights:                     # Hilfsverlust braucht sie auch
+        haeufig = class_frequencies(train_ds)
+        if haeufig.sum() > 0:
+            cls_weights = class_weights_from(haeufig)
+            selten = np.argsort(haeufig)[:6]
+            print("[klassen] haeufigste: " + ", ".join(
+                f"{SIGN_LABELS[k]}={int(haeufig[k])}" for k in np.argsort(-haeufig)[:6]))
+            print("[klassen] seltenste:  " + ", ".join(
+                f"{SIGN_LABELS[k]}={int(haeufig[k])} -> w={cls_weights[k]:.2f}" for k in selten
+                if haeufig[k] > 0))
+            print(f"[klassen] Gewichte (1/haeufigkeit)^0.5, Mittelwert 1: "
+                  f"min={cls_weights[haeufig > 0].min():.2f} max={cls_weights[haeufig > 0].max():.2f}")
+    # Der Hilfsverlust der Hierarchie braucht die Ziel-Familien je Klasse. Sie kommen aus
+    # tools/signmap.py; die Familien-Gewichte werden wie die Klassengewichte aus den
+    # HAEUFIGKEITEN gerechnet (Summe der Unterkategorien), nicht geraten.
+    hier_aux = args.hier_aux if (cfg.hier and args.head == "tgad") else 0.0
+    super_of = np.asarray(sm.SUPER_OF, dtype=np.int64)
+    fam_weights = None
+    if hier_aux > 0 and not args.no_class_weights:
+        fam_weights = class_weights_from(super_frequencies(haeufig)) if haeufig.sum() > 0 else None
+    crit = DetLoss(size=args.size, w_box=args.box_w, w_cls=args.cls_w, obj_norm=args.obj_norm,
+                   cls_gamma=args.focal_gamma, cls_alpha=args.focal_alpha,
+                   class_weights=cls_weights, smooth=args.smooth,
+                   hier_aux=hier_aux, super_of=super_of, super_weights=fam_weights)
+    if args.hier_aux > 0 and hier_aux == 0.0:
+        print("[hierarchie] Hilfsverlust abgeschaltet - er wirkt nur mit dem "
+              "hierarchischen TGADHead (--head tgad ohne --no-hier)")
+
     total = max(1, args.epochs * args.steps)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=total, eta_min=args.lr * 0.05, last_epoch=start_epoch * args.steps - 1)
 
     print(f"[modell] {cfg.name()}  params={n_params(model)}  daten={train_ds.manifest.get('source')} "
           f"train={len(train_ds)} {args.val_split}={len(val_ds)} geraet={device} "
-          f"zoom={args.zoom} obj_norm={args.obj_norm}"
+          f"zoom={args.zoom} obj_norm={args.obj_norm} kopf={args.head} "
+          f"hier={'aus' if args.no_hier else 'an'} "
+          f"cls=fokal(gamma={args.focal_gamma} alpha={args.focal_alpha} "
+          f"w={args.cls_w} smooth={args.smooth} gewichte={'an' if cls_weights is not None else 'aus'}) "
+          f"fam-hilfsverlust={hier_aux}"
           + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     history = list(ckpt.get("history", [])) if ckpt else []
@@ -414,7 +606,7 @@ def main() -> None:
                 break
             x = x.to(device, non_blocking=True)
             tgt = {k: [t.to(device, non_blocking=True) for t in v] for k, v in tgt.items()}
-            preds = model(x)
+            preds = model.forward_aux(x, want_aux=crit.will_aux)
             loss, parts = crit(preds, tgt)
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -425,6 +617,7 @@ def main() -> None:
             if step % args.log_every == 0:
                 print(f"  e{epoch} {step:4d}/{args.steps} loss={float(loss.detach()):7.3f} "
                       f"obj={parts['obj']:.3f} cls={parts['cls']:.3f} box={parts['box']:.3f} "
+                      f"fam={parts['fam']:.3f} "
                       f"pos={parts['n_pos']} n={len(x)} ({time.perf_counter()-t0:.0f}s)", flush=True)
         # Auswertung ist teuer (jede val-Bild durch das Netz + NMS in numpy): nur alle
         # --eval-every Epochen und immer in der letzten - sonst steht im Log nichts Belastbares.

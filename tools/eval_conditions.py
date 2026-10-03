@@ -192,6 +192,97 @@ def print_diagnose(d: dict) -> None:
             print(f"   {e['gt']:<20} -> {e['vorhergesagt']:<20}{e['n']:>5}")
 
 
+def _stufen(text: str) -> list[float]:
+    """'0.15:0.60:0.05' -> [0.15, 0.20, ..., 0.60].
+
+    Ueber die Anzahl der Schritte gerechnet und danach gerundet: start + i*schritt allein
+    ergaebe bei 0,05 in Fliesskomma 0,6000000000000001, und der Vergleich mit einer
+    gewuenschten 0,6 wuerde scheitern.
+    """
+    start, ende, schritt = (float(x) for x in text.split(":"))
+    if schritt <= 0:
+        raise ValueError("Schrittweite muss groesser als 0 sein")
+    n = int(round((ende - start) / schritt))
+    return [round(start + i * schritt, 3) for i in range(n + 1)]
+
+
+def sweep(model, loader, ds, device, confs: list[float], nms_list: list[float],
+          limit: int, iou: float) -> dict:
+    """Schwellen-Suche: EIN Netzlauf, danach viele conf/NMS-Paare.
+
+    Warum ueberhaupt: conf=0,25 war ein Startwert, kein Optimum. Die Auswertung ist der
+    einzige Ort, an dem sich das ohne Neutraining korrigieren laesst - und sie zeigt, was
+    eine hoehere Schwelle kostet (Recall) und bringt (Fehlalarme).
+
+    Aufbau: je conf einmal decode_level (der teure Teil), je NMS-Paar nur nms + Zuordnung.
+    Die rohen Stufenausgaben werden als float16 gehalten - bei 400 Bildern sind das rund
+    0,8 GB, deshalb --sweep-limit. Ein niedrigerer Wert aendert die Rangfolge der Paare
+    nicht, nur ihre Genauigkeit.
+
+    Bewertet wird nach F1 (Vorgabe). Auf einem Split OHNE Boxen (neg) ist F1 immer 0 -
+    dort wird nach der kleinsten Fehlalarmzahl je Bild gewaehlt.
+    """
+    roh: list[list[np.ndarray]] = []
+    ziel: list[tuple[np.ndarray, np.ndarray]] = []
+    with torch.no_grad():
+        for x, _tgt, meta in loader:
+            outs = [o.cpu().numpy() for o in model(x.to(device))]
+            for bi in range(len(meta)):
+                if len(roh) >= limit:
+                    break
+                roh.append([o[bi].astype(np.float16) for o in outs])
+                b, l = meta[bi]
+                ziel.append((b.numpy(), l.numpy()))
+            if len(roh) >= limit:
+                break
+    if not roh:
+        raise SystemExit("Schwellen-Suche: keine Bilder geladen")
+    gt = int(sum(len(l) for _b, l in ziel))
+    zeilen: list[dict] = []
+    for conf in confs:
+        # decode_level je Bild und Stufe OHNE NMS - genau die Reihenfolge, die auch
+        # dm.decode_multi benutzt (erst alle Stufen sammeln, dann unterdruecken).
+        je_bild = [[d for aus, stufe in zip(o, dm.LEVELS)
+                    for d in dm.decode_level(aus.astype(np.float32), stufe, conf)]
+                   for o in roh]
+        for nms_iou in nms_list:
+            tp = fp = fn = 0
+            for dets, (b, l) in zip(je_bild, ziel):
+                a, bb, c = dm.match_counts(dm.nms(dets, nms_iou), b, l, iou_thres=iou)
+                tp, fp, fn = tp + a, fp + bb, fn + c
+            p = tp / max(tp + fp, 1)
+            r = tp / max(tp + fn, 1)
+            zeilen.append({"conf": conf, "nms": nms_iou, "tp": tp, "fp": fp, "fn": fn,
+                           "img": len(ziel), "gt": gt, "det": tp + fp,
+                           "precision": p, "recall": r,
+                           "fp_bild": fp / max(len(ziel), 1),
+                           "f1": 2 * p * r / max(p + r, 1e-9)})
+    # Bestes Paar: nach F1. Nur wenn es keine Wahre gibt (Negativ-Split), nach fp/Bild -
+    # dort ist F1 konstruktionsbedingt 0 und damit als Kriterium unbrauchbar.
+    if gt:
+        best = max(zeilen, key=lambda z: (z["f1"], -z["fp_bild"], z["tp"]))
+    else:
+        best = min(zeilen, key=lambda z: (z["fp_bild"], -z["nms"]))
+
+    print(f"\nSchwellen-Suche ({len(ziel)} Bilder, {gt} Boxen, IoU-Zuordnung={iou})")
+    kopf = "".join(f"{n:>9.2f}" for n in nms_list)
+    print(f"{'conf \\ NMS':<12}{kopf}")
+    for conf in confs:
+        werte = {z["nms"]: z["f1"] for z in zeilen if z["conf"] == conf}
+        print(f"{conf:<12.2f}" + "".join(f"{werte.get(n, float('nan')):>9.3f}" for n in nms_list))
+    print(f"[suche] {'bestes F1' if gt else 'wenigste Fehlalarme'}: "
+          f"conf={best['conf']:.2f} NMS={best['nms']:.2f}  P={best['precision']:.3f} "
+          f"R={best['recall']:.3f} F1={best['f1']:.3f} fp/Bild={best['fp_bild']:.3f}")
+    alt = [z for z in zeilen if abs(z["conf"] - 0.25) < 1e-9 and abs(z["nms"] - 0.45) < 1e-9]
+    if alt and gt:
+        a = alt[0]
+        print(f"[suche] gegen den bisherigen Wert (conf=0.25, NMS=0.45): "
+              f"F1={a['f1']:.3f} fp/Bild={a['fp_bild']:.3f} -> "
+              f"{best['f1'] - a['f1']:+.3f} F1, {best['fp_bild'] - a['fp_bild']:+.3f} fp/Bild")
+    return {"bilder": len(ziel), "boxen": gt, "iou": iou, "conf": best["conf"],
+            "nms": best["nms"], "alle": best, "gitter": zeilen}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Precision/Recall je Bedingung und je Klasse")
     ap.add_argument("--ckpt", default="models/signs-det.pt")
@@ -209,6 +300,12 @@ def main() -> None:
     ap.add_argument("--json", default="", help="Ergebnis zusaetzlich als JSON ablegen")
     ap.add_argument("--diagnose", action="store_true",
                     help="zusaetzlich zerlegen, WARUM Boxen verpasst/erfunden werden")
+    ap.add_argument("--sweep", action="store_true",
+                    help="confidence und NMS-IoU durchsuchen und das beste Paar waehlen")
+    ap.add_argument("--sweep-limit", type=int, default=400,
+                    help="Bilder fuer die Suche (0 = alle). Speicher: rund 2 MB je Bild.")
+    ap.add_argument("--sweep-conf", default="0.15:0.60:0.05", help="Bereich der confidence")
+    ap.add_argument("--sweep-nms", default="0.40:0.70:0.05", help="Bereich der NMS-IoU")
     args = ap.parse_args()
 
     model, cfg, ck = load_model(args.ckpt)
@@ -256,6 +353,11 @@ def main() -> None:
         diag = diagnose(model, loader, ds, device, args.conf, args.iou)
         print_diagnose(diag)
 
+    suche = None
+    if args.sweep:
+        suche = sweep(model, loader, ds, device, _stufen(args.sweep_conf),
+                      _stufen(args.sweep_nms), args.sweep_limit or seen, args.iou)
+
     if args.json:
         out = Path(args.json)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -265,6 +367,7 @@ def main() -> None:
             "bedingungen": {k: _prf(v) for k, v in je_bedingung.items()},
             "klassen": {SIGN_LABELS[c]: _prf(v) for c, v in sorted(je_klasse.items())},
             **({"diagnose": diag} if diag else {}),
+            **({"suche": suche} if suche else {}),
         }, indent=2, ensure_ascii=False), encoding="utf-8")
         print(f"\n[json] {out}")
 

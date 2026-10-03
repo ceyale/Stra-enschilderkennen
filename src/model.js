@@ -187,6 +187,13 @@
     }
 
     const size = labels.size;
+    // Kann das Modell andere Eingabegroessen annehmen? tools/export_onnx.py exportiert mit
+    // offener Hoehe/Breite (dann ist labels.dynamic wahr). Scheitert diese Gegenprobe, wird
+    // statisch exportiert und labels.dynamic_fallback gesetzt - dann gilt NUR labels.size.
+    // Ohne dieses Wissen wuerde der Aufrufer einen 384-px-Letterbox zeichnen und das Netz mit
+    // 320 px rechnen: die Boxen laegen daneben, ohne dass irgendwo ein Fehler auftaucht.
+    const dynamisch = labels.dynamic !== false;
+    const festeGroesse = dynamisch ? 0 : (labels.size || 320);
     const nCls = labels.classes.length;
     const conf = o.conf, iouThres = o.iou;
     const feedName = labels.input || 'images';
@@ -208,7 +215,7 @@
 
     /** Bilddaten eines sz×sz-Letterbox-Canvas auswerten. `inputSize` ist optional. */
     async function detect(imageData, inputSize) {
-      const sz = inputSize || size;
+      const sz = festeGroesse || inputSize || size;
       const p0 = sz * sz;
       const chw = chwFor(sz);
       const d = imageData.data;
@@ -226,7 +233,9 @@
     }
 
     return { ok: true, backend: backend, labels: labels, size: size, detect: detect,
-             session: session };
+             // dynamisch=false heisst: das Modell kann nur `size`. src/app.js richtet die
+             // Eingabegroesse danach, sonst passt der Letterbox nicht zur Rechnung.
+             dynamisch: dynamisch, session: session };
   }
 
   /** Letterbox in einen Canvas zeichnen (Grau 114 wie im Training). */

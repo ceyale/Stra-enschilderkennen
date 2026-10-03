@@ -24,7 +24,7 @@ Fehlt das Modell oder kann die Laufzeit es nicht laden, arbeitet die App wie bis
 | Stufe /32 → `p5` | 2 × IR-Block, 256 Kanäle |
 | **Token-Mischer** | CATM (CAS-ViT) auf `p5`, `p4` und `p3` – additiv, ohne N×N-Feld, ohne Fenster (siehe unten) |
 | Fusion | **LGP-FPN**: 1×1 lateral + Nearest-Upsample + Add, dann je Stufe granulare Wahrnehmung (Tiefenconv 3×3 + 5×5, additiv) und Kontextbezug (globaler Mittelwert) |
-| Köpfe | je Stufe: 3×3 Depthwise → 1×1 (gemeinsamer Stamm), dann **zwei 1×1-Zweige** – 5 Kanäle (`tx,ty,tw,th,obj`) und 74 Kanäle (`cls0..cls73`) |
+| Köpfe | je Stufe **TGADHead**: Stamm (3×3 Depthwise → 1×1) → **TDAD** → **TCN** → Ort-Zweig (5 Kanäle) und hierarchischer Art-Zweig (9 Familien + 74 Unterarten, als Summe 74 Kanäle) |
 
 Kopf-Layout je Zelle: `[tx, ty, tw, th, obj, cls0..cls73]` (79 Kanäle), Dekodierung
 (Python wie JS):
@@ -34,6 +34,59 @@ cx = (gx + sigmoid(tx)) * stride        cy = (gy + sigmoid(ty)) * stride
 w  = exp(clip(tw, ±8)) * stride         h  = exp(clip(th, ±8)) * stride
 score = sigmoid(obj) * max_j sigmoid(cls_j)
 ```
+
+**Der Erkennungskopf: TGADHead (aufgabengeführt, entkoppelt).** Herkunft: Zuo, Liu, Chen, Fu,
+Wang, *„TGADHead: An efficient and accurate task-guided attention-decoupled head for
+single-stage object detection"*, Knowledge-Based Systems **302:112349 (2024)**. Der Abstract
+nennt zwei Teile, beide sind umgesetzt:
+
+* **TDAD** – zwei aufgabenspezifische Aufmerksamkeits-Wahrnehmungen. Der **Ort**-Zweig bekommt
+  eine Gewichtung über die *Zellen* (Tiefenconv 3×3 → 1 Kanal → Sigmoid), der **Art**-Zweig
+  eine über die *Kanäle* (globaler Mittelwert → 1×1 → Sigmoid). Warum getrennt: eine
+  gemeinsame Gewichtung müsste scharf-lokal *und* weich-global gleichzeitig sein; zusammen
+  mittelt sich das zu etwas, das keinem von beiden dient.
+* **TCN** – Austausch zwischen den Zweigen (`ort += gate(1×1(art))`,
+  `art += gate(1×1(ort))`, Tor startet bei Sigmoid 0,27). Die Autoren begründen ihn damit,
+  dass Ortung und Klassifikation auseinandergehen („accurate localization may show a poor
+  classification score or vice versa") – hier gemessen: **195 von 226 Fehlalarmen lagen auf
+  echten Schildern**, also auf einer richtigen Box mit falscher Klasse.
+
+> **Herkunft, offen benannt:** es gibt **keine öffentliche Referenzumsetzung** dieses Kopfes.
+> Der Code ist nach dem im Abstract beschriebenen Aufbau geschrieben und **nicht aus dem Paper
+> abgetippt** – Abweichungen im Detail sind möglich. Gemessen (Preset `breit`, 320 px):
+> **2 785 132 Parameter** gegen 2 195 212 des Vorgängerkopfes (ohne Hierarchie: 2 780 776).
+
+**Der hierarchische Klassifikationskopf.** Statt einer flachen Entscheidung über 74 Klassen
+gibt es zwei Stufen:
+
+```
+logit_k = super[familie(k)] + sub[k]        =>   P(k) = P(Familie) · P(k | Familie)
+```
+
+Die neun Familien (Form und Farbe – grob, robust, meist eindeutig) stehen in
+`tools/signmap.py` bei den Klassen; **74 = 5 + 18 + 3 + 7 + 19 + 7 + 4 + 2 + 9**:
+
+| Familie | Anzahl | Inhalt |
+|---|---|---|
+| `vorfahrt` | 5 | Stop, Vorfahrt gewähren/Straße, Ende, Andreaskreuz |
+| `tempo` | 18 | Z 274-5 … -130, Ende, Zonen 20/30, Zonenende |
+| `ueberholen` | 3 | Z 276, 277, 280/281 |
+| `verbot` | 7 | Z 267, 250/251/253, 259, 254, 272, 283 ff., sonstige |
+| `warnung` | 19 | alle Gefahrzeichen (Form gleich, Symbol innen verschieden) |
+| `gebot` | 7 | Z 209-10/-20/-30, 214, 222, 215, 275 (blauer Kreis) |
+| `radfuss` | 4 | Z 237, 239, 240, 241 |
+| `zone` | 2 | Z 242.1, 244.1 |
+| `hinweis` | 9 | Z 220, 224, 314, 330/331, 327, 357, 4xx, 310, sonstige |
+
+Warum das hier hilft: die häufigsten Verwechslungen waren **Geschwister** (tempo70/tempo80,
+rotes Dreieck Spitze oben gegen unten). Der flache Kopf musste „ist es 70?" gegen 73 andere
+Antworten abwägen, darunter alle Gebotszeichen und Hinweisschilder; der hierarchische
+entscheidet erst die Familie und vergleicht danach nur noch die 18 Tempolimits untereinander.
+
+`P(k)` und `P(Familie)` werden in Log-Wahrscheinlichkeiten **addiert**, deshalb steht im
+Ausgangstensor weiterhin ein Wert je Klasse – **der Vertrag mit `tools/detmath.py` und
+`src/model.js` bleibt unverändert**. Die Familie wird zusätzlich direkt überwacht
+(`--hier-aux 0.3`), damit die grobe Entscheidung ein eigenes Lernsignal bekommt.
 
 **Warum vier Stufen und warum ein getrennter Kopf?** Beides kam aus der Messung, nicht aus
 dem Gefühl (Zahlen in §10). Von 656 verpassten Boxen waren 334 „tief verpasst“, davon
@@ -84,10 +137,9 @@ das N×N-Feld kosten mehr, als die zusätzliche Kapazität auf `p3` hinzufügt.
 
 Der Block selbst (`CatmBlock`) ist CAS-ViT-artig: `x = x + local(x)` (lokale Wahrnehmung als
 Restzweig, `LocalIntegration`), dann CATM, dann FFN – davor Pre-Norm; die Ortsinformation trägt
-weiterhin eine Depthwise-Convolution (CPE).
-Pre-Norm, MHSA per MatMul/Softmax (kein Sonderop), **CPE** = Depthwise-Conv als
-Positionsersatz (damit funktioniert derselbe Block bei jeder Auflösung),
-FFN als 1×1 → Depthwise 3×3 → 1×1, LayerScale (γ = 0,01) und Restverbindungen.
+weiterhin eine Depthwise-Convolution (CPE, Positionsersatz – damit funktioniert derselbe Block
+bei jeder Auflösung), FFN als 1×1 → Depthwise 3×3 → 1×1, LayerScale (γ = 0,01) und
+Restverbindungen.
 
 ## 2. Gemessene Kosten je Variante
 
@@ -340,15 +392,24 @@ python tools/train_det.py --data synth --epochs 30 --steps 100 --batch 8   # on-
 ## 5. Training
 
 ```
-python tools/train_det.py --data data/det --size 320 --preset balanced \
-    --batch 16 --epochs 220 --steps 100 --lr 1.5e-3 --degrade 0.6 --zoom 0.5 \
-    --workers 6 --eval-every 10 --save-every 10 \
+python tools/train_det.py --data data/det --size 384 --preset breit \
+    --batch 16 --epochs 220 --steps 150 --lr 1.5e-3 --degrade 0.4 --zoom 0.3 \
+    --focal-gamma 2 --focal-alpha 0.25 --cls-w 4 --smooth 0.075 --hier-aux 0.3 \
+    --workers 4 --eval-every 10 --save-every 10 \
     --out models/signs-det.pt --seed 7
 ```
 
 | Schalter | Wirkung |
 |---|---|
-| `--preset fast\|balanced\|quality` | Größe komplett aus `tools/hybrid_net.py` (überschreibt Breiten/Tiefen) |
+| `--preset fast\|balanced\|quality\|breit` | Größe komplett aus `tools/hybrid_net.py` (überschreibt Breiten/Tiefen) |
+| **`--head tgad\|plain`** | `tgad` = TGADHead (Standard), `plain` = Vorgängerkopf mit gemeinsamem Stamm |
+| **`--no-hier`** | flacher Klassifikationskopf statt Ober-/Unterkategorien |
+| **`--hier-aux 0…1`** | Gewicht des Hilfsverlusts auf der **Familie** (0 = aus; wirkt nur mit `--head tgad` ohne `--no-hier`) |
+| **`--focal-gamma`** | `γ` des Focal Loss im Klassifikationskopf (0 = reine Kreuzentropie) |
+| **`--focal-alpha`** | konstanter Faktor des Klassifikations-Focal-Loss. Der RetinaNet-Wert 0,25 drosselt den Kopf auf ein Viertel – dann mit `--cls-w 4` ausgleichen |
+| **`--cls-w`** | Gewicht des Klassifikationsverlusts |
+| **`--smooth`** | Label-Smoothing im Klassifikationskopf |
+| **`--no-class-weights`** | Klassengewichte `(1/häufigkeit)^0,5` abschalten |
 | `--device auto\|cpu\|cuda` | `auto` nimmt CUDA, wenn vorhanden – sonst läuft dasselbe Kommando auf der CPU |
 | `--catm p5,p4,p3` | Stufen mit CATM. `-` schaltet ab (reines CNN) |
 | `--act silu\|hardswish` | Hardswish war in der Messung ~6 % schneller |
@@ -360,6 +421,43 @@ python tools/train_det.py --data data/det --size 320 --preset balanced \
 | `--eval-every N` | Auswertung nur alle N Epochen (die letzte Epoche wird immer gemessen) |
 | `--resume models/signs-det.pt` | weitertrainieren (Architektur + Auflösung kommen aus dem Checkpoint) |
 | `--steps`, `--epochs` | Bilddurchläufe: eine Epoche sieht `steps × batch` Bilder |
+
+**Auflösung: `--size` ist Trainings- *und* Datensatzgröße.** `tools/crops_dataset.py`,
+`tools/gtsdb_dataset.py`, `tools/synth_negatives.py` und `tools/real_negatives.py` schreiben
+die Bilder in dieser Größe, `SignDataset` letterboxt darauf. Beide Zahlen **müssen** zusammen
+passen; ein Datensatz in 320 px und `--size 384` funktioniert zwar (die Labels werden
+mitgerechnet, siehe `_load_real`), verschenkt aber Schärfe.
+
+> **Warum 384 und nicht 320 (oder 448)?** Der Median der verpassten Objekte liegt bei
+> **35 px** Diagonale. Bei 320 px Eingang ist ein 35-px-Schild auf `stride 32` noch **ein**
+> Pixel breit – dort kann keine Box entstehen. Bei 384 px sind es 1,2, und die feinste Stufe
+> (`stride 4`) sieht viermal so viele Bildpunkte. 448 px wäre eine weitere Verbesserung,
+> kostet aber 1,36× Rechnung gegenüber 384 – und die Trainingszeit ist der begrenzende Faktor
+> (Kaggle: 12 h je Lauf). Deshalb 384 im Training und **448 als zweite Messgröße** in der
+> Auswertung, damit die Frage für den nächsten Lauf beantwortet ist.
+
+**Warum die Augmentierung zurückgenommen ist** (`zoom 0,5 → 0,3`, `degrade 0,6 → 0,4`):
+aggressiver Skalenschnitt verkleinert kleine Schilder weiter, statt sie dem Netz näher zu
+bringen – und genau die kleinen sind das Problem. Dieselbe Überlegung für `degrade`: eine
+starke Störung auf einem 20-px-Schild löscht das **Symbol**, nicht nur dessen Kontrast; was
+übrig bleibt, ist Rauschen mit einer Box daran, und das erzeugt Fehlalarme. Der Rest der
+Augmentierung (Zoom-Bereich 0,7–1,5, Helligkeit/Kontrast in `tools/synth_data.py`) bleibt,
+weil die Zielbedingungen Nacht, Regen und Bewegungsunschärfe weiter abgedeckt sein müssen.
+
+**Der Klassifikationsverlust ist ein Focal Loss** (siehe `focal_cross_entropy` in
+`tools/train_det.py`) mit Klassengewichten und Label-Smoothing. Warum: 98 % aller Fehlalarme
+waren echte Schilder mit **falscher Klasse** (§10) – der Kopf findet die Boxen, entscheidet
+sich aber falsch, und die Kreuzentropie behandelt leichte und schwere Fälle gleich. Der
+Faktor `(1 − p_t)^γ` zieht die schweren nach vorn. Die Gewichte
+`w_c = (1/häufigkeit_c)^0,5` kommen aus den Labeldateien des **Trainings**splits (nicht aus
+`val` – sonst steckte eine Messlatte im Verlust) und sind auf Mittelwert 1 normiert, damit
+sich der Anteil des Kopfes am Gesamtverlust nicht mitverschiebt.
+
+> **Zu `--focal-alpha 0.25`:** im RetinaNet-Rezept gleicht `α` die Übermacht der
+> Negativzellen aus. Der Klassifikationskopf rechnet hier **ausschließlich auf positiven
+> Zellen** – es gibt keine Negativklasse, und `α` ist damit ein reiner konstanter Faktor, der
+> den Kopf still auf ein Viertel drosseln würde. Deshalb steht im Rezept `--cls-w 4`
+> (0,25 × 4 = 1,0 wie vorher). Wer die Drosselung will, setzt `--cls-w 1`.
 
 **`--zoom` ist der Grund, warum die Eingabegröße im Browser frei bleibt.** Ohne
 Skalenschnitt ist das Netz auf genau die Skalen festgelegt, die im Datensatz vorkommen;
@@ -476,10 +574,6 @@ Lesbare Erkenntnisse:
 * Unschärfe, Dunkelheit, Blendung und Rauschen brechen das Modell weiterhin **nicht** –
   genau die Bedingungen, an denen die Heuristik scheitert.
 
-Verlust (`DetLoss`): Objektivität als **fokale** BCE, Klasse als Cross-Entropy mit
-Label-Smoothing (nur positive Zellen), Box als L1 auf `(tx,ty,tw,th)` mit
-Größengewichtung (`2 − Fläche/Bildfläche`, begrenzt auf 0,5…2).
-
 | Klasse | Boxen | P | R | Bemerkung |
 |---|---|---|---|---|
 | ortstafel | 137 | 0,971 | 0,745 | rein synthetisch gelernt |
@@ -505,9 +599,17 @@ Lesbare Erkenntnisse:
 * Unschärfe, Dunkelheit, Blendung und Rauschen brechen das Modell **nicht** mehr
   (R 0,69–0,76) – genau die Bedingungen, an denen die Heuristik scheitert.
 
-Verlust (`DetLoss`): Objektivität als **fokale** BCE, Klasse als Cross-Entropy mit
-Label-Smoothing (nur positive Zellen), Box als L1 auf `(tx,ty,tw,th)` mit
-Größengewichtung (`2 − Fläche/Bildfläche`, begrenzt auf 0,5…2).
+Verlust (`DetLoss`): Objektivität als **fokale** BCE, Klasse als **Focal Loss** mit
+Klassengewichten und Label-Smoothing (nur positive Zellen), Box als L1 auf `(tx,ty,tw,th)` mit
+Größengewichtung (`2 − Fläche/Bildfläche`, begrenzt auf 0,5…2). Dazu der Familien-Hilfsverlust
+des hierarchischen Kopfes.
+
+| Anteil | Formel | Anmerkung |
+|---|---|---|
+| `obj` | `α_t (1−p_t)^γ · BCE`, `γ=2`, `α=0,25` | binar – hier gleicht `α` wirklich die Hintergrundzellen aus |
+| `cls` | `w_c (1−p_t)^γ · CE_smooth`, `γ=2`, `α=0,25`, `w_c=(1/f_c)^0,5` | nur positive Zellen; `α` ist dort ein konstanter Faktor, deshalb `--cls-w 4` |
+| `fam` | wie `cls`, Ziele = Oberkategorien der wahren Klassen | Hilfsverlust `--hier-aux 0,3` |
+| `box` | `L1` auf `(tx,ty,tw,th)` · Größengewicht | kein IoU-Verlust nötig – mittlere IoU der Treffer 0,938 |
 
 Wichtig und gemessen: die Objektivität wird **durch die Anzahl positiver Zellen**
 geteilt (RetinaNet-Normierung), **nicht** durch alle Zellen. Mit „Mittelwert über alle
@@ -523,7 +625,31 @@ festgeklemmten Offset der alten Ein-Zellen-Regel. Die vorherige Regel
 (`argmin |log2(diag/stride)|`) schickte ein 30-px-Schild auf stride 32 und damit auf ein
 10×10-Raster; sie ist der Grund für den kleinen-Schilder-Recall von ~0,29.
 
-### 5.1 Selbsttest: kann das Netz ein Bild überfitten?
+### 5.3 Schwellen-Suche: conf und NMS-IoU
+
+`conf = 0,25` war ein Startwert, kein Optimum – und jedes Urteil „zu viele Fehlalarme" hing an
+ihm. Die Suche kostet **kein** Neutraining:
+
+```
+python tools/eval_conditions.py --ckpt models/signs-det.pt --data data/det --split val \
+    --sweep --sweep-limit 400 --json berichte/sweep.json
+```
+
+| Schalter | Wirkung |
+|---|---|
+| `--sweep` | `conf` und NMS-IoU durchsuchen, Optimum nach **F1** (auf einem Split ohne Boxen nach `fp/Bild`) |
+| `--sweep-limit 400` | Bilder für die Suche (0 = alle). Speicher: rund 2 MB je Bild, weil die Rohausgaben gehalten werden |
+| `--sweep-conf 0.15:0.60:0.05` | Bereich `start:ende:schritt` der confidence |
+| `--sweep-nms 0.40:0.70:0.05` | Bereich der NMS-IoU |
+
+Aufbau: das Netz läuft **einmal** (die Rohausgaben je Stufe werden als `float16` gehalten).
+Je `conf` wird einmal `decode_level` je Stufe gerechnet – das ist der teure Teil – und je
+NMS-Paar nur noch `nms` + Zuordnung. Deshalb sind 10 × 7 = 70 Kombinationen in Sekunden
+möglich statt in 70 Netzlaufzeiten. Die Ausgabe ist ein F1-Gitter, das Optimum und der
+Vergleich gegen den bisherigen Wert (0,25 / 0,45) stehen darunter; alles landet in
+`berichte/sweep.json` und von dort in `kaggle_report.json`.
+
+### 5.4 Selbsttest: kann das Netz ein Bild überfitten?
 
 ```
 python tools/selfcheck.py
