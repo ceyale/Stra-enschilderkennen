@@ -26,7 +26,7 @@ print("GT:", [(b["label"], round((b["cx"] - b["w"] / 2) * size), round((b["cy"] 
 x = torch.from_numpy(np.ascontiguousarray(arr.transpose(2, 0, 1))).float().div(255.0)[None]
 _, tgt, _ = td.collate([(x[0], torch.from_numpy(xyxy), torch.from_numpy(labels))], size)
 
-model = build_model(NetCfg(tr_global=("p5",), tr_window=()))
+model = build_model(NetCfg(catm=("p5", "p4")))
 crit = td.DetLoss(size=size)
 opt = torch.optim.AdamW(model.parameters(), lr=3e-3)
 for i in range(120):

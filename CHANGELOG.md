@@ -1,6 +1,29 @@
 # Changelog
 
 ## 0.5.0 – 2026-10-03 (in Arbeit)
+- **Architektur umgebaut** (`tools/hybrid_net.py`): die fensterbasierte Selbstattention ist
+  durch den **CATM** (Convolutional Additive Token Mixer) aus CAS-ViT ersetzt
+  (arXiv:2408.03703) – `out = proj(dwc(q + k) * v)`, additiv statt `q@k`, ohne Softmax, ohne
+  Fenster. Die FPN-lite ist durch eine **LGP-FPN** ersetzt (granulare Wahrnehmung mit
+  Tiefenconvs 3×3 **und** 5×5 additiv, plus Kontextbezug über den globalen Mittelwert); die
+  seitlichen Verbindungen bleiben 1×1. Gemessen (Preset `breit`, 320×320): **2,20 Mio.
+  Parameter / 1 057 MFLOPs** gegen 1,88 Mio. / 1 180 vorher – mehr Parameter, **10 % weniger
+  Rechnung**. CATM sitzt jetzt auch auf `p3` (bisher CNN), weil er pro Zelle konstant teuer
+  ist; genau dort landen kleine Schilder. Konfigurationsfeld `catm` (vorher `tr_global`/
+  `tr_window`/`tr_heads`/`win`), CLI `--catm p5,p4,p3`.
+  * **Herkunft, offen benannt:** CATM ist eine Übernahme der Referenzumsetzung. Für die
+    **LGP-FPN** (Yan Zhang u. a., „A lightweight granular perception feature pyramid network
+    with context-awareness for small traffic sign detection", Expert Systems with
+    Applications 317:131885, 2026) ist **keine Referenzumsetzung öffentlich**; die Umsetzung
+    hier folgt dem Namen und der Aufgabenstellung und ist im Quelltext als solche
+    gekennzeichnet.
+- **INT8 im Frontend**: `tools/export_onnx.py --int8` wird jetzt im Kaggle-Lauf benutzt
+  (`--calib-data data/det --calib-n 200`, QDQ, Kalibrierung auf den echten Bildern des
+  Datensatzes). Davor wird **Conv+BN verschmolzen** (`quant_pre_process`) – ohne diesen Schritt
+  warnte der Quantisierer bei jeder Faltung („Expected bias … to be an initializer"), weil das
+  Netz mit `bias=False` gebaut ist. Gemessen an einem Prüfmodell: **8,75 MB → 2,67 MB (−69 %)**,
+  max. Tensorabweichung 1,06·10⁻². `src/model.js` lädt INT8 zuerst und **fällt auf FP32
+  zurück**, wenn es scheitert; welches läuft, steht im Status (`int8 wasm ×4`).
 - **Drei Fehler behoben**, die den Kaggle-Lauf vom 03.10. **nach 28 Minuten**
   Datensatzvorbereitung beendet haben (`kaggle/train_kernel.py`, `tools/real_negatives.py`):
   * Der Katalogordner heißt `kataloge/`, im Werkzeugaufruf stand aber `catalogs/` –

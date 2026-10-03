@@ -4,7 +4,7 @@ Erkennt einfache deutsche Verkehrszeichen live mit der Handykamera – direkt im
 ohne Server, ohne Installation.
 
 Standardmäßig arbeitet eine **Heuristik ohne jede Bibliothek** (Farbe + Form, `src/detector.js`).
-Optional rechnet ein **kleines trainiertes Netz** (CNN mit Transformer-Stufen, ONNX Runtime
+Optional rechnet ein **kleines trainiertes Netz** (CNN mit CATM-Stufen, ONNX Runtime
 Web, `src/model.js`), das Position und Art in einem Durchlauf findet – siehe `docs/TRAINING.md`.
 Ist kein Modell vorhanden oder die Laufzeit nicht verfügbar, bleibt die Heuristik aktiv.
 
@@ -29,8 +29,10 @@ Dann `http://localhost:8000` öffnen. `localhost` gilt als sicher, die Webcam fu
 
 Ein kleines Netz sagt **Position und Art** in einem Durchlauf voraus (anchor-free, vier
 Stufen, 9 Typen) – trainiert mit `tools/`, ausgeliefert als ONNX und im Browser gerechnet.
-Einzelne tiefe Stufen sind **Transformer-Blöcke** statt CNN-Schichten; mehr dazu und alle
-gemessenen Zahlen in [`docs/TRAINING.md`](docs/TRAINING.md).
+Einzelne tiefe Stufen sind **CATM-Blöcke** (Convolutional Additive Token Mixer, CAS-ViT) statt
+CNN-Schichten, die Merkmalspyramide ist eine **LGP-FPN**; ausgeliefert wird ein **INT8**-Modell
+mit FP32-Rückfall. Mehr dazu und alle gemessenen Zahlen in
+[`docs/TRAINING.md`](docs/TRAINING.md).
 
 **Aktueller Stand (gemessen, `docs/TRAINING.md` §5):** 1 300 360 Parameter, 878 MFLOPs,
 5,23 MB ONNX – auf 2 000 Validierungsbildern **P = 0,883 / R = 0,796 / F1 = 0,837**,

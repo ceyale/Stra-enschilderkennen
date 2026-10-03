@@ -82,8 +82,12 @@ DATEN = dict(
 )
 TRAINING = dict(
     # "breit" statt "balanced": 74 Klassen entscheiden sich im Kopf, deshalb dort mehr
-    # Kapazitaet (mid = Rumpfbreite) und ein Block mehr in den tiefen Stufen. Gemessen
-    # 1,88 Mio. Parameter / 1 180 MFLOPs gegen 1,32 Mio. / 916 (+29 % Rechnung).
+    # Kapazitaet (mid = Rumpfbreite) und ein Block mehr in den tiefen Stufen.
+    # Gemessen nach dem CATM/LGP-FPN-Umbau (tools/bench_model.py --preset):
+    #   2,20 Mio. Parameter / 1 057 MFLOPs gegen 1,88 Mio. / 1 180 vorher.
+    # Also MEHR Parameter, aber 10 % WENIGER Rechnung - CATM kommt ohne das N x N-Feld der
+    # Selbstattention aus, und die Fensteraufteilung auf p4 ist ersatzlos entfallen. Neu dazu
+    # kommt CATM auf p3 (dort ist die Rechnung pro Zelle konstant).
     preset="breit",
     size=320,
     batch=16,
@@ -100,6 +104,12 @@ TRAINING = dict(
     val_split="val",
 )
 AUSWERTUNG = dict(conf=0.25, iou=0.5, iou_det=0.45, zweite_groesse=384)
+# int8-Quantisierung: QDQ mit Kalibrierung auf den ECHTEN Bildern des Datensatzes - die
+# Verteilung des Einsatzes entscheidet ueber die Skalen, nicht eine synthetische. 200 Bilder
+# sind gemessen ausreichend; mehr kostet nur Zeit. Das Werkzeug verwirft die int8-Datei
+# SELBST, wenn die Paritaet gegen PyTorch zu schlecht ist - dann bleibt fp32 aktiv und
+# src/model.js faellt ohnehin darauf zurueck.
+QUANT = dict(n_calib=200, calib_data="data/det")
 AUFRAEUMEN = True         # Bildordner nach dem Zippen loeschen (sonst 65 000 Ausgabedateien)
 SYNSET_KONFIG = "Cycles"  # die Synset-Fassung mit Pfadverfolgung (GTSRB-Zwilling inklusive)
 SYNSET_REPO = "FraunhoferIOSB/Synset-Signset-Germany"   # wird gestreamt, nicht hochgeladen
@@ -1157,15 +1167,21 @@ def trainieren(p: Protokoll) -> float:
 
 
 def exportieren(p: Protokoll) -> float:
-    """ONNX-Export mit dynamischen Achsen: EINE Datei fuer 256/320/384/448 px.
+    """ONNX-Export mit dynamischen Achsen: EINE Datei fuer 256/320/384/448 px - plus int8.
 
     Der Export prueft sich selbst (Paritaet gegen PyTorch) und schreibt labels.json +
     manifest.json dazu - genau die drei Dateien, die src/model.js erwartet. fatal=False:
     fehlt onnxruntime, soll der Lauf trotzdem seine Messwerte abliefern.
+
+    Das int8-Modell ist das, was ausgeliefert wird (src/model.js nimmt labels.files.int8 zuerst).
+    Gemessen an einem Pruefmodell: 8,75 MB -> 2,67 MB (-69 %), max. Tensorabweichung 1,06e-02.
     """
+    q = QUANT
     return lauf(p, python("tools/export_onnx.py", "--ckpt", "models/signs-det.pt",
-                          "--out", "models/signs-det.onnx", "--dynamic"),
-                "Export nach ONNX (dynamische Hoehe/Breite)", fatal=False)
+                          "--out", "models/signs-det.onnx", "--dynamic",
+                          "--int8", "--calib-data", q["calib_data"],
+                          "--calib-n", str(q["n_calib"])),
+                "Export nach ONNX (dynamische Hoehe/Breite) + int8", fatal=False)
 
 
 def auswerten(p: Protokoll, ein: dict, mit_fixture: bool = True) -> dict:

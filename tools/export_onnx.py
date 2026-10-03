@@ -170,10 +170,32 @@ def parity_check(model, sess, size: int, n: int = 6, seed: int = 99) -> dict:
 
 
 def quantize_int8(src: Path, dst: Path, size: int, n_calib: int, data_dir: str | None = None) -> None:
+    """Statische int8-Quantisierung (QDQ) mit Kalibrierbildern.
+
+    Vorverarbeitung zuerst: Conv+BatchNorm verschmelzen und die Formen ableiten. Ohne diesen
+    Schritt warnt der Quantisierer bei JEDER Faltung unseres Netzes
+    ("Expected bias 'onnx::Conv_1304' to be an initializer"), weil hier alle Faltungen mit
+    bias=False gebaut und die Verschiebung von der BatchNorm beigesteuert wird. Nach dem
+    Verschmelzen traegt die Faltung die Verschiebung selbst - das ist genau die Form, fuer die
+    die QDQ-Kalibrierung gedacht ist, und verbessert die Genauigkeit des int8-Modells.
+    """
     from onnxruntime.quantization import QuantFormat, QuantType, quantize_static
 
-    quantize_static(str(src), str(dst), CalibReader(size, n_calib, data_dir),
-                    quant_format=QuantFormat.QDQ, weight_type=QuantType.QInt8)
+    quelle = src
+    vor = dst.with_name(dst.stem + "-pre.onnx")
+    try:
+        from onnxruntime.quantization.shape_inference import quant_pre_process
+
+        quant_pre_process(str(src), str(vor), skip_symbolic_shape=False)
+        quelle = vor
+    except Exception as fehler:                      # noqa: BLE001 - Vorverarbeitung ist Wahl
+        print(f"[int8] Vorverarbeitung uebersprungen ({type(fehler).__name__}: {fehler})")
+
+    try:
+        quantize_static(str(quelle), str(dst), CalibReader(size, n_calib, data_dir),
+                        quant_format=QuantFormat.QDQ, weight_type=QuantType.QInt8)
+    finally:
+        vor.unlink(missing_ok=True)
 
 
 def main() -> None:

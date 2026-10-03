@@ -20,15 +20,14 @@ from torch.utils.flop_counter import FlopCounterMode
 
 from hybrid_net import PRESETS, NetCfg, build_model, n_params, preset_cfg
 
-# Varianten: zeigt, was der Transformer an welcher Stelle kostet
+# Varianten: zeigt, was CATM an welcher Stelle kostet (catm = Stufen mit CATM-Block)
 VARIANTS = {
-    "cnn-only":        dict(tr_global=(), tr_window=()),
-    "p5-global":       dict(tr_global=("p5",), tr_window=()),
-    "p5g+p4window":    dict(tr_global=("p5",), tr_window=("p4",)),
-    "p4g+p5g":         dict(tr_global=("p4", "p5"), tr_window=()),
-    "p5g+p4w+lnnorm":  dict(tr_global=("p5",), tr_window=("p4",), tr_norm="ln"),
-    "p5g+p4w+p3w":     dict(tr_global=("p5",), tr_window=("p4", "p3")),
-    "p5g-hardswish":   dict(tr_global=("p5",), tr_window=(), act="hardswish"),
+    "cnn-only":        dict(catm=()),
+    "p5-catm":         dict(catm=("p5",)),
+    "p5+p4":           dict(catm=("p5", "p4")),
+    "p5+p4+p3":        dict(catm=("p5", "p4", "p3")),
+    "p5+p4+lnnorm":    dict(catm=("p5", "p4"), tr_norm="ln"),
+    "p5+p4-hardswish": dict(catm=("p5", "p4"), act="hardswish"),
 }
 
 
@@ -94,8 +93,8 @@ def main() -> None:
     # Skalierung der Attention: gleiche Variante, andere Eingabegroesse
     print("\nSkalierung der Attention (gleiche Variante, andere Eingabegroesse):")
     for size in (192, 320, 416):
-        a = measure(NetCfg(tr_global=(), tr_window=()), size, 4)
-        b = measure(NetCfg(tr_global=("p5",), tr_window=("p4",)), size, 4)
+        a = measure(NetCfg(catm=()), size, 4)
+        b = measure(NetCfg(catm=("p5", "p4")), size, 4)
         print(f"  {size:3d}px: cnn-only {a['ms']:6.1f} ms | +p5g+p4w {b['ms']:6.1f} ms "
               f"(+{100*(b['ms']/a['ms']-1):5.1f} %) | Tokens p4={(size//16)**2:4d} p5={(size//32)**2:3d}")
 

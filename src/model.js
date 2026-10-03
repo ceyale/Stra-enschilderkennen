@@ -154,20 +154,36 @@
     ort.env.wasm.numThreads = faeden;
     if (o.wasmPaths && ort.env.wasm) ort.env.wasm.wasmPaths = o.wasmPaths;
 
-    const file = labels.files.int8 || labels.files.onnx;
-    const url = o.modelUrl || ('models/' + file);
+    // Zuerst das quantisierte Modell (int8): gemessen 2,67 MB gegen 8,75 MB und auf schwachen
+    // Geraeten deutlich schneller. Scheitert es - etwa weil eine Laufzeitumgebung die
+    // QDQ-Operationen nicht kennt -, wird auf fp32 zurueckgefallen. Ein fehlendes int8 darf
+    // die Seite nicht lahmlegen, und welche Fassung laeuft, steht im Status.
+    const dateien = [];
+    if (o.modelUrl) {
+      dateien.push(o.modelUrl);
+    } else {
+      if (labels.files.int8) dateien.push('models/' + labels.files.int8);
+      if (labels.files.onnx) dateien.push('models/' + labels.files.onnx);
+    }
     let session = null, backend = '';
-    for (const eps of [['webgpu', 'wasm'], ['wasm']]) {
-      try {
-        session = await ort.InferenceSession.create(url, {
-          executionProviders: eps,
-          graphOptimizationLevel: 'all',
-        });
-        backend = eps.join('→') + (faeden > 1 ? ' ×' + faeden : '');
-        break;
-      } catch (err) {
-        if (eps.length === 1) return { ok: false, reason: 'Modell nicht ladbar: ' + err.message };
+    for (const datei of dateien) {
+      for (const eps of [['webgpu', 'wasm'], ['wasm']]) {
+        try {
+          session = await ort.InferenceSession.create(datei, {
+            executionProviders: eps,
+            graphOptimizationLevel: 'all',
+          });
+          backend = (datei.includes('int8') ? 'int8 ' : 'fp32 ') +
+            eps.join('→') + (faeden > 1 ? ' ×' + faeden : '');
+          break;
+        } catch (err) {
+          // naechste Ausfuehrungsart, danach naechste Datei versuchen
+        }
       }
+      if (session) break;
+    }
+    if (!session) {
+      return { ok: false, reason: 'Modell nicht ladbar: ' + (dateien.join(', ') || 'keine Datei') };
     }
 
     const size = labels.size;

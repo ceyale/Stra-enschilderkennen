@@ -299,8 +299,8 @@ def cfg_from_args(args) -> NetCfg:
     # und die Variante waere langsamer als gemessen.
     if getattr(args, "preset", ""):
         return preset_cfg(args.preset)
-    return NetCfg(tr_global=parse_list(args.tr_global), tr_window=parse_list(args.tr_window),
-                  act=args.act, tr_ffn=args.ffn, tr_norm=args.norm, tr_heads=args.heads)
+    return NetCfg(catm=parse_list(args.catm), act=args.act,
+                  tr_ffn=args.ffn, tr_norm=args.norm)
 
 
 def make_loader(root: str, size: int, split: str, batch: int, shuffle: bool,
@@ -329,14 +329,14 @@ def main() -> None:
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"],
                     help="Rechengeraet; 'auto' = CUDA wenn vorhanden, sonst CPU")
     ap.add_argument("--workers", type=int, default=2, help="Ladeprozesse (0 = im Hauptprozess)")
-    ap.add_argument("--tr-global", default="p5", help="globale Transformer-Stufen, z.B. p5 oder p4,p5 oder -")
-    ap.add_argument("--tr-window", default="-", help="lokale Transformer-Stufen, z.B. p4 oder -")
+    ap.add_argument("--catm", default="p5,p4",
+                    help="Stufen mit CATM (Convolutional Additive Token Mixer), z.B. p5,p4 "
+                         "oder p5,p4,p3 oder - fuer reines CNN")
     ap.add_argument("--act", default="silu", choices=["silu", "hardswish"])
     ap.add_argument("--preset", default="", choices=["", "fast", "balanced", "quality", "breit"],
                     help="Größenvariante aus tools/hybrid_net.py (überschreibt Breiten/Tiefen)")
-    ap.add_argument("--ffn", type=float, default=2.0, help="FFN-Expansion im Transformer-Block")
+    ap.add_argument("--ffn", type=float, default=2.0, help="FFN-Expansion im CATM-Block")
     ap.add_argument("--norm", default="gn", choices=["gn", "ln"])
-    ap.add_argument("--heads", type=int, default=4)
     ap.add_argument("--degrade", type=float, default=0.6, help="Anteil kuenstlich verschlechterter Bilder")
     ap.add_argument("--zoom", type=float, default=0.0,
                     help="Anteil Trainingsbilder mit Skalenschnitt (Mehrskaligkeit, z.B. 0.5)")

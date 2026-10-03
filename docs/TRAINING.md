@@ -22,11 +22,11 @@ Fehlt das Modell oder kann die Laufzeit es nicht laden, arbeitet die App wie bis
 | Stufe /8 → `p3` | 2 × IR-Block, 64 Kanäle |
 | Stufe /16 → `p4` | 2 × IR-Block, 128 Kanäle |
 | Stufe /32 → `p5` | 2 × IR-Block, 256 Kanäle |
-| **Transformer** | `p5` global (10×10 = 100 Tokens), optional `p4` (20×20 = 400) lokal/windowed oder global |
-| Fusion | FPN-lite: 1×1 lateral + Nearest-Upsample + Add + 3×3 Fuse, von grob nach fein über alle Stufen |
-| Köpfe | je Stufe: 3×3 Depthwise → 1×1 (gemeinsamer Stamm), dann **zwei 1×1-Zweige** – 5 Kanäle (`tx,ty,tw,th,obj`) und 9 Kanäle (`cls0..cls8`) |
+| **Token-Mischer** | CATM (CAS-ViT) auf `p5`, `p4` und `p3` – additiv, ohne N×N-Feld, ohne Fenster (siehe unten) |
+| Fusion | **LGP-FPN**: 1×1 lateral + Nearest-Upsample + Add, dann je Stufe granulare Wahrnehmung (Tiefenconv 3×3 + 5×5, additiv) und Kontextbezug (globaler Mittelwert) |
+| Köpfe | je Stufe: 3×3 Depthwise → 1×1 (gemeinsamer Stamm), dann **zwei 1×1-Zweige** – 5 Kanäle (`tx,ty,tw,th,obj`) und 74 Kanäle (`cls0..cls73`) |
 
-Kopf-Layout je Zelle: `[tx, ty, tw, th, obj, cls0..cls8]` (14 Kanäle), Dekodierung
+Kopf-Layout je Zelle: `[tx, ty, tw, th, obj, cls0..cls73]` (79 Kanäle), Dekodierung
 (Python wie JS):
 
 ```
@@ -52,22 +52,39 @@ Ein-Zellen-Regel presste den Offset auf 0,999 fest – bei großen Schildern (Me
 Lokalisierungsfehler: 125 px Diagonale) musste also eine einzige Zelle die Box mehrere
 Zellen weit regressieren.
 
-**Warum Transformer nur in den tiefen Stufen?** Attention kostet O(N²) in der Tokenzahl
-N = (H/stride)·(W/stride). Bei 320×320 ergibt das:
+**Warum CATM und keine Selbstattention?** Die frühere Fassung setzte auf Mehrkopf-Selbst­attention
+und musste deshalb nach Tokenzahl staffeln: globale Attention kostet O(N²) in
+N = (H/stride)·(W/stride), und bei 320×320 heißt das für `p3` (40×40 = 1600 Tokens)
+2 560 000 Paare pro Kopf – unbezahlbar. Deshalb saß global nur auf `p5` (100 Tokens) und lokal
+(windowed, 5×5) auf `p4`, und `p3` blieb CNN.
 
-| Stufe | Raster | Tokens | Nachbarschaft bei globaler Attention |
-|---|---|---|---|
-| /4 (`p2`) | 80×80 | 6400 | 40 960 000 Paare → unbezahlbar |
-| /8 (`p3`) | 40×40 | 1600 | 2 560 000 Paare → unbezahlbar |
-| /16 (`p4`) | 20×20 | 400 | 160 000 Paare → nur lokal sinnvoll |
-| /32 (`p5`) | 10×10 | 100 | 10 000 Paare → praktisch gratis |
+Der **Convolutional Additive Token Mixer (CATM)** aus CAS-ViT (arXiv:2408.03703) löst dieselbe
+Aufgabe ohne dieses N×N-Feld:
 
-Deshalb: **globaler** Block nur auf `p5` (dort kann das Netz Beziehungen über das ganze
-Bild sehen – Schild + Mast + Umgebung, Verdecker einordnen), **lokale** (windowed)
-Blöcke mittig, und die feinen Stufen bleiben CNN (dort steckt die Detailinformation für
-kleine Schilder, und eine Attention wäre dort am teuersten).
+```
+q, k, v = 1×1(x)
+q = ChannelOperation(SpatialOperation(q))     # Ortsgewicht (Sigmoid-Karte) + Kanalgewicht (GAP)
+k = ChannelOperation(SpatialOperation(k))
+y = 3×3-Tiefenconv(proj) (dwc(q + k) * v)     # ADDITIV statt q@k, kein Softmax
+```
 
-Der Block selbst (`HybridEncoder`) ist MobileViT-artig und exportfreundlich:
+Die Verknüpfung ist eine **Addition** (q + k) statt eines Skalarprodukts aller Tokenpaare. Damit
+ist die Rechnung pro Zelle konstant – unabhängig von der Rastergröße. Zwei Folgen, die beide
+direkt messbar sind:
+
+* **`p3` ist jetzt bezahlbar**: derselbe Block kostet auf 40×40 so viel pro Zelle wie auf 10×10.
+  Das Preset `breit` setzt ihn deshalb auf `p5`, `p4` **und** `p3` – genau die Stufe, auf der
+  kleine Schilder (unter 32 px) landen.
+* **Rein konvolutional**: die frühere Fensterteilung musste auf `(-H) % win` auffüllen. Dieser
+  Zwang ist ersatzlos entfallen, die dynamische Höhe/Breite im ONNX-Graph bleibt sauber.
+
+Gemessen (Preset `breit`, 320×320): **2,20 Mio. Parameter / 1 057 MFLOPs** gegen vorher
+1,88 Mio. / 1 180. Also mehr Parameter, aber **10 % weniger Rechnung** – die Fenster-Reshapes und
+das N×N-Feld kosten mehr, als die zusätzliche Kapazität auf `p3` hinzufügt.
+
+Der Block selbst (`CatmBlock`) ist CAS-ViT-artig: `x = x + local(x)` (lokale Wahrnehmung als
+Restzweig, `LocalIntegration`), dann CATM, dann FFN – davor Pre-Norm; die Ortsinformation trägt
+weiterhin eine Depthwise-Convolution (CPE).
 Pre-Norm, MHSA per MatMul/Softmax (kein Sonderop), **CPE** = Depthwise-Conv als
 Positionsersatz (damit funktioniert derselbe Block bei jeder Auflösung),
 FFN als 1×1 → Depthwise 3×3 → 1×1, LayerScale (γ = 0,01) und Restverbindungen.
@@ -333,8 +350,7 @@ python tools/train_det.py --data data/det --size 320 --preset balanced \
 |---|---|
 | `--preset fast\|balanced\|quality` | Größe komplett aus `tools/hybrid_net.py` (überschreibt Breiten/Tiefen) |
 | `--device auto\|cpu\|cuda` | `auto` nimmt CUDA, wenn vorhanden – sonst läuft dasselbe Kommando auf der CPU |
-| `--tr-global p5,p4` | Transformer-Stufen (global). `-` schaltet ab (reines CNN) |
-| `--tr-window p4` | lokale Transformer-Stufen |
+| `--catm p5,p4,p3` | Stufen mit CATM. `-` schaltet ab (reines CNN) |
 | `--act silu\|hardswish` | Hardswish war in der Messung ~6 % schneller |
 | `--norm gn\|ln` | GroupNorm (schnell) oder LayerNorm je Token (genauer, teurer) |
 | `--degrade 0…1` | Anteil künstlich verschlechterter Bilder (zusätzlich zur Erzeugung) |

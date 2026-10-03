@@ -11,20 +11,58 @@ schickte ein 30-px-Schild auf stride 32, wo nur 10x10 Zellen zur Verfuegung steh
 Stride 4 kostet rund ein Viertel mehr Rechnung (siehe tools/bench_model.py), deshalb
 wird dort nur die feinste Stufe bedient (siehe tools/detmath.py, ASSIGN_MAX_SIDE).
 
-Warum Transformer nur in den TIEFEN Stufen?
-    Attention kostet O(N^2) in der Tokenzahl N = (H/stride) * (W/stride).
-    320x320 ergibt:  stride 4  -> 80x80 = 6400 Tokens
-                     stride 8  -> 40x40 = 1600 Tokens
-                     stride 16 -> 20x20 =  400 Tokens
-                     stride 32 -> 10x10 =  100 Tokens
-    Ein globaler Block auf stride 8 waere ~256x teurer als auf stride 32.
-    Deshalb: globaler Transformer NUR auf stride 32 (dort praktisch gratis),
-    lokale (windowed) Bloecke auf stride 16, und die feinen Stufen bleiben CNN.
-    Gemessene Kosten pro Variante: siehe tools/bench_model.py / docs/TRAINING.md
+Token-Mischer: CATM statt Selbstattention
+    In den tiefen/mittleren Stufen sitzt jetzt der Convolutional Additive Token Mixer
+    (CATM) aus CAS-ViT (arXiv:2408.03703, Zhang u. a., "Convolutional Additive
+    Self-attention Vision Transformers for Efficient Mobile Applications"). Er ersetzt die
+    beiden frueheren Aufmerksamkeitsvarianten (global auf p5, Fenster 5x5 auf p4) durch
+    EINE gemeinsame Zelle:
 
-Kein gelerntes Positions-Embedding: die Position liefert eine Depthwise-Convolution
-(CPE, "conditional positional encoding" im Geist von CvT/LeViT). Damit funktioniert
-derselbe Block bei jeder Aufloesung und die Export-Graphen bleiben statisch.
+        q, k, v = 1x1(x)                 # ein gemeinsamer 1x1-Projektor auf 3*dim
+        q = ChannelOperation(SpatialOperation(q))
+        k = ChannelOperation(SpatialOperation(k))
+        y = 3x3-Tiefenconv(proj) (dwc(q + k) * v)
+
+    Warum das hier besser passt als Attention:
+      * ADDITIV statt multiplikativ: (q + k) gewichtet Merkmale, ohne dass ein
+        N x N-Aehnlichkeitsfeld entsteht. Kein Softmax, kein MatMul ueber Tokens.
+      * Damit faellt die O(N^2)-Kurve weg, die vorher die Stufenwahl bestimmt hat: derselbe
+        Block ist auf stride 8 (1600 Tokens), 16 (400) und 32 (100) gleich teuer pro Zelle.
+        Die frueher noetige Fensteraufteilung (win=5) ist ersatzlos entfallen.
+      * Rein konvolutional -> BELIEBIGE Eingabegroessen. Die Fensterteilung musste vorher
+        auf (-H) % win auffuellen; dieser Zwang und die damit verbundenen Randbedingungen im
+        ONNX-Graph sind hier verschwunden, dynamische Hoehe/Breite bleibt sauber erhalten.
+      * SpatialOperation ist ein Aufmerksamkeitsgewicht ueber den ORT (dwc + 1 Kanal +
+        Sigmoid), ChannelOperation eines ueber die KANAELE (globaler Mittelwert + 1x1 +
+        Sigmoid). Zusammen also Ort- und Kanalgewichtung - genau die zwei Achsen, die eine
+        Merkmalskarte hat.
+
+Objektivitaet: Vor jeder CATM-Zelle steht - wie in CAS-ViT - eine lokale Wahrnehmung
+(LocalIntegration, Tiefenconv 3x3 zwischen zwei 1x1) als Restzweig. Pre-Norm und
+LayerScale (kleines gamma) bleiben aus dem Vorgaenger erhalten, weil sie auch hier das
+Anlaufen stabilisieren.
+
+Merkmalsverarbeitung: LGP-FPN statt FPN-lite
+    Statt "1x1 hochziehen + 3x3 glaetten" (FPN-lite) sitzt jetzt eine leichtgewichtige
+    granulare Wahrnehmungs-Pyramide (LGP-FPN). Aufbau je Stufe:
+      * GranularPerception: dieselbe Stufe parallel mit Tiefenconvs mehrerer Koernungen
+        (3x3 und 5x5), additiv zusammengefuehrt (1x1). "Granular" heisst hier: ein Merkmal
+        wird gleichzeitig in mehreren Kornungen betrachtet - das ist fuer kleine Schilder
+        entscheidend, weil deren Umriss bei 3x3 noch Form ist und bei 5x5 schon Umgebung.
+      * ContextAware: globaler Mittelwert je Kanal + 1x1, additiv zurueck - der Kontextbezug
+        aus dem Namen des Verfahrens.
+      * Seitliche Verbindungen sind 1x1 (leichtgewichtig), es gibt keine 3x3-Faltung im
+        Top-down-Weg.
+
+Hinweis zur Herkunft der LGP-FPN: das Verfahren stammt aus Yan Zhang u. a., "A lightweight
+granular perception feature pyramid network with context-awareness for small traffic sign
+detection", Expert Systems with Applications 317:131885 (2026). Eine Referenzumsetzung ist
+NICHT oeffentlich; die Umsetzung hier folgt dem Namen und der Aufgabenstellung (leicht-
+gewichtig, granulare Mehrkornung, Kontextbezug) und ist als solche gekennzeichnet - sie ist
+keine 1:1-Uebernahme des Originalmoduls.
+
+Kein gelerntes Positions-Embedding: die Position liefert weiterhin eine Depthwise-Convolution
+(CPE, "conditional positional encoding" im Geist von CvT/LeViT).
 
 Dieses Modul ist reines Training/Export-Werkzeug (Python, PyTorch) und wird NICHT
 an den Browser ausgeliefert. Ausgeliefert wird nur models/signs-det.onnx.
@@ -55,12 +93,10 @@ class NetCfg:
     width: tuple = (32, 64, 128, 256)     # Kanaele nach stride 4/8/16/32
     depth: tuple = (1, 2, 2, 2)           # IR-Bloecke pro Stufe
     act: str = "silu"                     # "silu" (genauer) | "hardswish" (auf ARM schneller)
-    tr_global: tuple = ("p5",)            # globale Transformer-Stufen
-    tr_window: tuple = ("p4",)            # windowed Transformer-Stufen
-    tr_heads: int = 4
-    tr_ffn: float = 2.0                   # FFN-Expansion im Transformer-Block
+    catm: tuple = ("p5", "p4")            # Stufen mit CATM-Block (AdditiveTokenMixer)
+    tr_ffn: float = 2.0                   # FFN-Expansion im CATM-Block
     tr_norm: str = "gn"                   # "gn" = GroupNorm(1,C) schnell | "ln" = LayerNorm je Token
-    win: int = 5                          # Fenstergroesse fuer windowed Attention
+    lgp_ctx: bool = True                  # Kontextzweig der LGP-FPN (globale Sicht)
     levels: tuple = (4, 8, 16, 32)        # Erkennungsstufen (stride) fuer die Koepfe
     mid: tuple = (32, 32, 64, 128)        # Kopfbreite je Stufe (gleiche Reihenfolge)
 
@@ -70,23 +106,25 @@ class NetCfg:
         return d
 
     def name(self) -> str:
-        tg = "".join(s.upper() for s in self.tr_global) or "-"
-        tw = "".join(s.upper() for s in self.tr_window) or "-"
-        return f"hybridnano_g{tg}_w{tw}_{self.act}"
+        catm = "".join(s.upper() for s in self.catm) or "-"
+        return f"hybridnano_catm{catm}_lgp_{self.act}"
 
 
-# Fertige Groessen: schneller heisst hier schmaler UND flacher UND weniger Transformer.
+# Fertige Groessen: schneller heisst hier schmaler UND flacher UND weniger CATM-Stufen.
 # Gemessen mit tools/bench_model.py --preset <name> (siehe docs/TRAINING.md).
+# catm nennt die STUFEN mit CATM-Block. Weil CATM pro Zelle konstant teuer ist (kein
+# N x N-Feld, siehe Kopf dieser Datei), ist auch stride 8 (p3) vertretbar - stride 4 (p2)
+# bleibt trotzdem aussen vor: dort sind es 6400 Zellen.
 PRESETS: dict[str, dict] = {
     # kleinste Variante: ~1/4 der Rechnung von "balanced", Hardswish, ein schmaler Kopf
     "fast": dict(width=(24, 48, 96, 192), depth=(1, 1, 1, 1), mid=(24, 24, 48, 96),
-                 tr_global=("p5",), tr_window=(), act="hardswish"),
-    # Standard: volle Breiten, 2 Bloecke je tiefer Stufe, globaler Block nur auf p5
+                 catm=("p5",), act="hardswish"),
+    # Standard: volle Breiten, 2 Bloecke je tiefer Stufe, CATM auf p5 und p4
     "balanced": dict(width=(32, 64, 128, 256), depth=(1, 2, 2, 2), mid=(32, 32, 64, 128),
-                     tr_global=("p5",), tr_window=(), act="silu"),
-    # mehr Kontext (p4 zusaetzlich), dafuer teurer
+                     catm=("p5", "p4"), act="silu"),
+    # mehr Kontext: CATM zusaetzlich auf p3 (mittlere Aufloesung), dafuer teurer
     "quality": dict(width=(32, 64, 128, 256), depth=(1, 2, 2, 2), mid=(32, 32, 64, 128),
-                    tr_global=("p5", "p4"), tr_window=("p4",), act="silu"),
+                    catm=("p5", "p4", "p3"), act="silu"),
     # Fuer die erweiterte Taxonomie (74 Klassen, tools/signmap.py). Warum genau so:
     #  * mid = Rumpfbreite. Der Kopf beginnt mit einer TIEFENCONVOLUTION (cba(cin, mid, g=mid)),
     #    deshalb muss mid die Rumpfbreite TEILEN - und der groesste zulaessige Wert ist die
@@ -95,12 +133,11 @@ PRESETS: dict[str, dict] = {
     #  * depth=(1,2,3,3): ein Block mehr in den tiefen Stufen. Dort stehen wenige Zellen
     #    (20x20 und 10x10), ein Block kostet also fast nichts, vergroessert aber das
     #    receptive Feld - noetig, um ein Schild von seiner Umgebung zu trennen.
-    #  * tr_window=("p4",) statt tr_global=("p5","p4") wie in "quality": lokale Attention ist
-    #    billig (Fenster 5x5), globale auf stride 8 waere rund 256x teurer (siehe Kopf dieser
-    #    Datei). Gemessen: 1,88 Mio. Parameter / 1 180 MFLOPs gegen 1,32 Mio. / 916 bei
-    #    "balanced" (+42 % / +29 %) - der letzte Lauf brauchte 70 von 540 Kaggle-Minuten.
+    #  * catm=("p5","p4","p3"): p3 ist NEU gegenueber dem Vorgaenger. Vorher war dort keine
+    #    Aufmerksamkeit moeglich (Fenster/global), jetzt kostet CATM pro Zelle gleich viel -
+    #    und p3 ist genau die Stufe, auf der kleine Schilder (unter 32 px) landen.
     "breit": dict(width=(32, 64, 128, 256), depth=(1, 2, 3, 3), mid=(32, 64, 128, 256),
-                  tr_global=("p5",), tr_window=("p4",), act="silu"),
+                  catm=("p5", "p4", "p3"), act="silu"),
 }
 
 
@@ -111,9 +148,8 @@ def preset_cfg(preset: str, **overrides) -> "NetCfg":
     base = dict(PRESETS[preset])
     base.update(overrides)
     cfg = NetCfg(**base)
-    for dim in (cfg.width[3], cfg.width[2]):
-        if dim % cfg.tr_heads:
-            raise ValueError(f"Kanalzahl {dim} muss durch tr_heads={cfg.tr_heads} teilbar sein")
+    # Keine Teilbarkeitspruefung mehr: CATM hat keine Koepfe mehr (frueher tr_heads), die eine
+    # Kanalzahl teilten. Der einzige harte Zwang kommt aus tools/detmath.py (Stufen 4/8/16/32).
     return cfg
 
 
@@ -179,72 +215,123 @@ class TokenNorm(nn.Module):
         return x.permute(0, 3, 1, 2)
 
 
-class Attention(nn.Module):
-    """Mehrkopf-Selbstattention auf (B, C, H, W).
+class SpatialOperation(nn.Module):
+    """Ortgewichtung: ein Aufmerksamkeitsgewicht ueber (H, W), je Kanal gemeinsam.
 
-    window = 0  -> global (alle Zellen sehen alle Zellen)
-    window > 0  -> lokal in Fenstern (win x win), Kosten steigen nur linear mit H*W
-    Bewusst per MatMul/Softmax statt F.scaled_dot_product_attention geschrieben:
-    dieser Graph ist als ONNX stabil und laeuft in ONNX Runtime Web ohne Sonderop.
+    Tiefenconv 3x3 -> BN -> ReLU -> 1x1 auf EINEN Kanal -> Sigmoid. Das Ergebnis ist eine
+    Gewichtskarte, die auf alle Kanaele multipliziert wird. Uebernommen aus CAS-ViT
+    (detection/model/rcvit.py, SpatialOperation) - dort genau so definiert.
     """
 
-    def __init__(self, dim: int, heads: int = 4, window: int = 0):
+    def __init__(self, dim: int):
         super().__init__()
-        if dim % heads:
-            raise ValueError("dim muss durch heads teilbar sein")
-        self.dim, self.h, self.win = dim, heads, window
-        self.scale = float((dim // heads) ** -0.5)
-        self.qkv = nn.Conv2d(dim, dim * 3, 1)
-        self.proj = nn.Conv2d(dim, dim, 1)
-
-    @staticmethod
-    def _to_win(t: torch.Tensor, w: int) -> torch.Tensor:      # (B,C,H,W) -> (B*G, C, w*w)
-        B, C, H, W = t.shape
-        nh, nw = H // w, W // w
-        return t.view(B, C, nh, w, nw, w).permute(0, 2, 4, 1, 3, 5).reshape(B * nh * nw, C, w * w)
-
-    @staticmethod
-    def _from_win(t: torch.Tensor, w: int, B: int, C: int, H: int, W: int) -> torch.Tensor:
-        nh, nw = H // w, W // w
-        return t.view(B, nh, nw, C, w, w).permute(0, 3, 1, 4, 2, 5).reshape(B, C, H, W)
-
-    def _attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        B, C, N = q.shape
-        d = C // self.h
-        q = q.view(B, self.h, d, N).permute(0, 1, 3, 2)        # (B,h,N,d)
-        k = k.view(B, self.h, d, N)                            # (B,h,d,N)
-        v = v.view(B, self.h, d, N).permute(0, 1, 3, 2)        # (B,h,N,d)
-        att = torch.softmax(q @ k * self.scale, dim=-1)        # (B,h,N,N)
-        return (att @ v).permute(0, 1, 3, 2).reshape(B, C, N)
+        self.block = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, 1, 1, groups=dim),
+            nn.BatchNorm2d(dim),
+            nn.ReLU(True),
+            nn.Conv2d(dim, 1, 1, 1, 0, bias=False),
+            nn.Sigmoid(),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-        pad_h = (-H) % self.win if self.win else 0
-        pad_w = (-W) % self.win if self.win else 0
-        if pad_h or pad_w:
-            x = F.pad(x, (0, pad_w, 0, pad_h))
-        Hp, Wp = x.shape[2], x.shape[3]
-        q, k, v = self.qkv(x).chunk(3, dim=1)
-        if self.win:
-            o = self._attend(self._to_win(q, self.win), self._to_win(k, self.win), self._to_win(v, self.win))
-            y = self._from_win(o, self.win, B, C, Hp, Wp)
-        else:
-            y = self._attend(q.flatten(2), k.flatten(2), v.flatten(2)).view(B, C, Hp, Wp)
-        return self.proj(y)[:, :, :H, :W]
+        return x * self.block(x)
 
 
-class HybridEncoder(nn.Module):
-    """Ein Hybrid-Block: CPE + Attention + FFN (MobileViT-artig).
+class ChannelOperation(nn.Module):
+    """Kanalgewichtung: ein Aufmerksamkeitsgewicht ueber die Kanaele, je Bild gemeinsam.
 
-    Pre-Norm, LayerScale (kleines gamma) und Restverbindungen - damit trainieren
-    solche Hybridnetze stabil, ohne dass eine Stufe die Vortrainingsgewichte zerstoert.
-    CPE = Depthwise 3x3 auf dem Attention-Ausgang (ersetzt Positions-Embeddings).
+    Globaler Mittelwert -> 1x1 -> Sigmoid (SE-artig, ohne Engstelle). Uebernommen aus
+    CAS-ViT (ChannelOperation). Der globale Mittelwert ist als ONNX unkritisch und
+    funktioniert bei dynamischer Hoehe/Breite ohne Sonderfall.
     """
 
-    def __init__(self, dim: int, cfg: NetCfg, window: int = 0):
+    def __init__(self, dim: int):
         super().__init__()
+        self.block = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Conv2d(dim, dim, 1, 1, 0, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.block(x)
+
+
+class CATM(nn.Module):
+    """Convolutional Additive Token Mixer (CAS-ViT, arXiv:2408.03703).
+
+    Uebernommen aus der Referenzumsetzung (detection/model/rcvit.py, AdditiveTokenMixer),
+    nur Schreibweise und Kommentare angepasst. Der Kern ist die ADDITIVE Verknuepfung:
+
+        out = proj(dwc(q + k) * v)
+
+    Statt eines N x N-Aehnlichkeitsfeldes (q @ k, Softmax) wird hier ADDiert. Deshalb gibt es
+    weder Softmax noch MatMul ueber Tokens noch Fenster - und damit auch kein Auffuellen auf
+    ein Vielfaches der Fenstergroesse. Der Graph ist rein konvolutional und bleibt bei
+    beliebiger Hoehe/Breite gueltig.
+
+    Ablauf: ein gemeinsamer 1x1-Projektor erzeugt q, k, v. q und k laufen durch
+    (Ortgewichtung, Kanalgewichtung), werden addiert, mit v multipliziert, durch eine
+    Tiefenconv 3x3 und zuletzt durch eine 3x3-Tiefenconv als Ausgangsprojektion geschickt.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.qkv = nn.Conv2d(dim, 3 * dim, 1, stride=1, padding=0, bias=False)
+        self.oper_q = nn.Sequential(SpatialOperation(dim), ChannelOperation(dim))
+        self.oper_k = nn.Sequential(SpatialOperation(dim), ChannelOperation(dim))
+        self.dwc = nn.Conv2d(dim, dim, 3, 1, 1, groups=dim)
+        self.proj = nn.Conv2d(dim, dim, 3, 1, 1, groups=dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        q, k, v = self.qkv(x).chunk(3, dim=1)
+        q = self.oper_q(q)
+        k = self.oper_k(k)
+        return self.proj(self.dwc(q + k) * v)
+
+
+class LocalIntegration(nn.Module):
+    """Lokale Wahrnehmung als Restzweig (CAS-ViT, LocalIntegration).
+
+    1x1 -> Aktivierung -> Tiefenconv 3x3 -> Aktivierung -> 1x1. Das ist der Zweig, der in
+    CAS-ViT VOR jedem Token-Mischer liegt (x = x + local(x)): er sammelt die Nachbarschaft,
+    bevor der Mischer globale/kanalweise Gewichte setzt.
+    """
+
+    def __init__(self, dim: int, ratio: float = 1.0, act: str = "silu"):
+        super().__init__()
+        mid = max(8, int(round(dim * ratio / 8)) * 8)
+        self.network = nn.Sequential(
+            nn.Conv2d(dim, mid, 1, 1, 0, bias=False), nn.BatchNorm2d(mid), act_layer(act),
+            nn.Conv2d(mid, mid, 3, 1, 1, groups=mid, bias=False), nn.BatchNorm2d(mid),
+            act_layer(act),
+            nn.Conv2d(mid, dim, 1, 1, 0, bias=False), nn.BatchNorm2d(dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.network(x)
+
+
+class CatmBlock(nn.Module):
+    """Ein Block mit CATM statt Selbstattention: lokale Wahrnehmung + Mischer + FFN.
+
+    Aufbau wie AdditiveBlock in CAS-ViT:
+
+        x = x + local(x)
+        x = x + drop_path(mix(norm1(x)))
+        x = x + drop_path(ffn(norm2(x)))
+
+    Beibehalten aus dem Vorgaenger (HybridEncoder) sind Pre-Norm, LayerScale (kleines gamma)
+    und die optionale CPE-Tiefenconv. Die CPE traegt weiter die Ortsinformation bei: die
+    Gewichtungen in CATM sind ortsabhaengig, aber translationsinvariant - ohne die CPE
+    koennte der Block eine Position nicht von einer gleich aussehenden anderen unterscheiden.
+    """
+
+    def __init__(self, dim: int, cfg: NetCfg):
+        super().__init__()
+        self.local = LocalIntegration(dim, 1.0, cfg.act)
         self.norm1 = TokenNorm(dim, cfg.tr_norm)
-        self.attn = Attention(dim, cfg.tr_heads, window)
+        self.mix = CATM(dim)
         self.cpe = nn.Conv2d(dim, dim, 3, 1, 1, groups=dim)
         self.gamma1 = nn.Parameter(torch.full((1, dim, 1, 1), 1e-2))
         self.norm2 = TokenNorm(dim, cfg.tr_norm)
@@ -257,7 +344,8 @@ class HybridEncoder(nn.Module):
         self.gamma2 = nn.Parameter(torch.full((1, dim, 1, 1), 1e-2))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.gamma1 * self.cpe(self.attn(self.norm1(x)))
+        x = x + self.local(x)
+        x = x + self.gamma1 * self.cpe(self.mix(self.norm1(x)))
         return x + self.gamma2 * self.ffn(self.norm2(x))
 
 
@@ -288,11 +376,56 @@ class Head(nn.Module):
         return torch.cat([self.obj(y), self.cls(y)], dim=1)
 
 
+class GranularPerception(nn.Module):
+    """Granulare Wahrnehmung: dieselbe Stufe in mehreren Koernungen gleichzeitig.
+
+    Zwei parallele Tiefenconvs (3x3 und 5x5) auf demselben Eingang, beide mit BN und
+    Aktivierung, danach additiv zusammengefuehrt und mit 1x1 gemischt. Warum das fuer
+    Verkehrszeichen hilft: ein Schild von 15-30 px ist bei 3x3 noch reine Form (Kreis,
+    Dreieck, Raute), bei 5x5 dagegen schon Form MIT Umgebung. Beides gleichzeitig zu sehen
+    ist genau die Information, die zwischen "roter Kreis" und "rotes Rad am Auto"
+    unterscheidet.
+
+    Leichtgewichtig ist das, weil beide Zweige TIEFENconvs sind (groups=dim): die Rechnung
+    waechst mit der Kernelbreite, nicht mit dim^2. Der 3x3-Zweig ist restverbunden, damit die
+    Stufe nicht schlechter wird als ohne dieses Modul.
+    """
+
+    def __init__(self, dim: int, act: str = "silu"):
+        super().__init__()
+        self.dw3 = cba(dim, dim, 3, 1, g=dim, act=act)
+        self.dw5 = cba(dim, dim, 5, 1, g=dim, act=act)
+        self.mix = cba(dim, dim, 1, 1, act="")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.mix(self.dw3(x) + self.dw5(x))
+
+
+class ContextAware(nn.Module):
+    """Kontextbezug: globale Sicht je Kanal, additiv zurueckgelegt.
+
+    Globaler Mittelwert -> 1x1 -> addieren. Das ist der Kontextzweig aus dem Namen des
+    Verfahrens ("with context-awareness") und entspricht der ChannelOperation aus CAS-ViT,
+    nur ohne Sigmoid: hier soll der Kontext ADDIERT werden, nicht als Tor dienen.
+
+    Der globale Mittelwert ist als ONNX unproblematisch und bleibt bei dynamischer Hoehe und
+    Breite gueltig (AdaptiveAvgPool auf 1x1).
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Conv2d(dim, dim, 1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.fc(self.pool(x))
+
+
 class HybridNano(nn.Module):
-    """Ein Netz fuer Ort und Art: CNN-Backbone, optional Transformer-Stufen, FPN-lite, je Stufe ein Kopf.
+    """Ein Netz fuer Ort und Art: CNN-Backbone, CATM-Stufen, LGP-FPN, je Stufe ein Kopf.
 
     Eingang: (B, 3, 320, 320), Werte 0..1 (RGB).
-    Ausgang: ein Tensor je Stufe, fein -> grob, je (B, 14, H/stride, W/stride).
+    Ausgang: ein Tensor je Stufe, fein -> grob, je (B, 79, H/stride, W/stride).
              Reihenfolge wie LEVELS in tools/detmath.py und wie die ONNX-Ausgaenge
              os4/os8/os16/os32 (siehe tools/export_onnx.py).
     """
@@ -314,24 +447,28 @@ class HybridNano(nn.Module):
         self.stage3 = self._stage(w[1], w[2], c.depth[2], c.act)    # /16  -> p4
         self.stage4 = self._stage(w[2], w[3], c.depth[3], c.act)    # /32  -> p5
 
-        # Transformer-Bloecke: tief = global, mittig = lokal (windowed). tr_plan haelt die
-        # Reihenfolge fest, in der die Abgriffe bearbeitet werden (grob -> fein).
-        self.tr, self.tr_plan = nn.ModuleDict(), []
+        # CATM-Bloecke auf den gewaehlten Stufen. catm_plan haelt die Reihenfolge fest
+        # (grob -> fein). Anders als die frueheren Fensterbloecke gibt es KEINE Fenstergroesse
+        # und keine Auffuellung - der Block ist rein konvolutional.
+        self.catm_blocks, self.catm_plan = nn.ModuleDict(), []
         for name, stride in (("p5", 32), ("p4", 16), ("p3", 8), ("p2", 4)):
-            if stride not in c.levels:
+            if stride not in c.levels or name not in c.catm:
                 continue
             pos = c.levels.index(stride)
-            if name in c.tr_global:
-                self.tr[name] = HybridEncoder(w[self.taps[pos]], c, window=0)
-                self.tr_plan.append((pos, name))
-            if name in c.tr_window:
-                self.tr[name + "w"] = HybridEncoder(w[self.taps[pos]], c, window=c.win)
-                self.tr_plan.append((pos, name + "w"))
+            self.catm_blocks[name] = CatmBlock(w[self.taps[pos]], c)
+            self.catm_plan.append((pos, name))
 
-        # FPN-lite: lat[i] holt die groebere Stufe hoch, fuse[i] glaettet die Summe.
-        # Die groebste Stufe wird nicht gefiltert - sie hat nichts ueber sich.
+        # LGP-FPN: seitliche 1x1-Verbindungen (leichtgewichtig) und je zusammengefuehrter
+        # Stufe eine granulare Wahrnehmung mit optionalem Kontextbezug. Die groebste Stufe hat
+        # nichts ueber sich und bekommt deshalb nur diese Nachbearbeitung.
         self.lat = nn.ModuleList([cba(w[t + 1], w[t], 1, 1, act="") for t in self.taps[:-1]])
-        self.fuse = nn.ModuleList([cba(w[t], w[t], 3, 1, act=c.act) for t in self.taps[:-1]])
+        self.lgp = nn.ModuleList([
+            nn.Sequential(GranularPerception(w[t], c.act),
+                          *((ContextAware(w[t]),) if c.lgp_ctx else ()))
+            for t in self.taps[:-1]])
+        self.lgp_top = nn.Sequential(
+            GranularPerception(w[self.taps[-1]], c.act),
+            *((ContextAware(w[self.taps[-1]]),) if c.lgp_ctx else ()))
         self.heads = nn.ModuleList([Head(w[t], c.mid[i], c.act)
                                     for i, t in enumerate(self.taps)])
         self._init_weights()
@@ -363,18 +500,19 @@ class HybridNano(nn.Module):
         feats.append(self.stage2(feats[-1]))        # /8  (p3)
         feats.append(self.stage3(feats[-1]))        # /16 (p4)
         feats.append(self.stage4(feats[-1]))        # /32 (p5)
-        # Transformer-Bloecke anwenden (Reihenfolge wie beim Bau, grob -> fein)
-        for pos, name in self.tr_plan:
+        # CATM-Bloecke anwenden (Reihenfolge wie beim Bau, grob -> fein)
+        for pos, name in self.catm_plan:
             tap = self.taps[pos]
-            feats[tap] = self.tr[name](feats[tap])
-        # FPN-lite von grob nach fein: jede Stufe bekommt die hochgezogene groebere Stufe
+            feats[tap] = self.catm_blocks[name](feats[tap])
+        # LGP-FPN von grob nach fein: seitliche 1x1-Verbindung hochziehen, addieren, dann auf
+        # der zusammengefuehrten Stufe granulare Wahrnehmung (und Kontextbezug).
         out: list[torch.Tensor | None] = [None] * len(self.taps)
-        out[-1] = feats[self.taps[-1]]
+        out[-1] = self.lgp_top(feats[self.taps[-1]])
         for i in range(len(self.taps) - 2, -1, -1):
             tap = self.taps[i]
             up = F.interpolate(self.lat[i](out[i + 1]), size=feats[tap].shape[-2:],
                                mode="nearest")
-            out[i] = self.fuse[i](feats[tap] + up)
+            out[i] = self.lgp[i](feats[tap] + up)
         # Reihenfolge fein -> grob (stride 4, 8, 16, 32): identisch zu tools/detmath.LEVELS
         return [head(o) for head, o in zip(self.heads, out)]
 
@@ -389,9 +527,10 @@ def n_params(model: nn.Module) -> int:
 
 
 if __name__ == "__main__":
-    for cfg in (NetCfg(tr_global=(), tr_window=()), NetCfg(), NetCfg(tr_window=(), tr_global=("p4", "p5"))):
+    # Drei Varianten zum Vergleich: ohne CATM (reines CNN), Standard, und CATM bis p3.
+    for cfg in (NetCfg(catm=()), NetCfg(), NetCfg(catm=("p5", "p4", "p3"))):
         m = build_model(cfg).eval()
         with torch.no_grad():
             outs = m(torch.zeros(1, 3, 320, 320))
         shapes = " | ".join(str(tuple(o.shape)) for o in outs)
-        print(f"{cfg.name():34s} params={n_params(m):8d}  out: {shapes}")
+        print(f"{cfg.name():36s} params={n_params(m):8d}  out: {shapes}")

@@ -145,11 +145,14 @@ ist klein, nicht die Dateizahl.
    * **Ehrlich gemeldet**: von 383 GTSDB-Trainingsbildern hatten 50 nur Zeichen unter 6 px
      nach dem Einpassen auf 320 px. Das Werkzeug schreibt das in den Bericht, statt es zu
      verschweigen.
-   * **Architektur (neu: Preset `breit`)**: 74 Klassen entscheiden sich im Kopf → `mid =
-     Rumpfbreite` (der Kopf beginnt mit einer Tiefenconvolution, `mid` muss die Rumpfbreite
-     teilen, die Rumpfbreite ist der größte zulässige Wert), `depth=(1,2,3,3)`, lokale
-     Attention auf p4 statt global. Gemessen 1,88 Mio. Parameter / 1 180 MFLOPs gegen
-     1,32 Mio. / 916. Die Rechnung ist aus `tools/bench_model.py`, nicht geschätzt.
+   * **Architektur (Preset `breit`, nach dem CATM/LGP-FPN-Umbau)**: 74 Klassen entscheiden sich
+     im Kopf → `mid = Rumpfbreite` (der Kopf beginnt mit einer Tiefenconvolution, `mid` muss die
+     Rumpfbreite teilen, die Rumpfbreite ist der größte zulässige Wert), `depth=(1,2,3,3)`,
+     Token-Mischer CATM auf `p5`, `p4`, `p3`. Gemessen 2,20 Mio. Parameter / **1 057 MFLOPs**
+     gegen 1,88 Mio. / 1 180 vorher – mehr Parameter, aber 10 % weniger Rechnung, weil CATM
+     ohne das N×N-Feld der Selbstattention auskommt. Die Rechnung ist aus
+     `tools/bench_model.py`, nicht geschätzt. Ausgeliefert wird **INT8** (2,67 MB gegen
+     8,75 MB FP32), mit Rückfall auf FP32 in `src/model.js`.
 
 2. **Kachelmodus in die App**: `src/model.js` + `src/app.js` – Foto in N×N überlappende
    Kacheln, Treffer verschieben, NMS über die Kachelgrenzen, **höhere Schwelle** im Kachelmodus
