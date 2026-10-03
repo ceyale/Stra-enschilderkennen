@@ -263,6 +263,12 @@ ihn **abholen, solange der Lauf existiert** – ein neuer Push überschreibt den
 
 ### Die Reihenfolge der nächsten Schritte
 
+0. **Architektur (erledigt in dieser Runde, gemessen):** der TCN im Kopf hat jetzt eine
+   Engstelle statt vier voller 1×1-Faltungen – `breit` **2016 → 1866 MFLOPs**, **2785k → 2611k
+   Parameter**, Kopf p2 206 → 169 MFLOPs. Messwerkzeuge: `tools/flops_wo.py` (FLOPs je Modul),
+   `tools/gp_messung.py` (eine verworfene Sparmaßnahme mit Zahlen), `tools/bench_model.py`
+   (Presets). **Erst messen, dann sparen** – eine Sparmaßnahme ohne Netz-Messung ändert
+   manchmal 0,9 % und kostet 12 % Laufzeit.
 1. **v8 abwarten und auswerten** (Kennzahlen oben). Ist die Klassifikation noch schwach, ist
    der nächste Hebel **nicht** die Architektur, sondern:
    * `LEHRER["distill"]` von 0,25 auf 0,5 heben (der Klassifikationsverlust ist noch nicht
