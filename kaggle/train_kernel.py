@@ -188,7 +188,7 @@ SYNSET_REPO = "FraunhoferIOSB/Synset-Signset-Germany"   # wird gestreamt, nicht 
 # Code-Aenderung NICHT der 700-MB-Datensatz neu hochgeladen werden - nur dieses Skript
 # (50 KB). kaggle/run.ps1 -Step push setzt WERKZEUGE_SHA auf den aktuellen Commit.
 REPO_SLUG = "ceyale/Stra-enschilderkennen"
-WERKZEUGE_SHA = "2ba80c06eec60b7c59940d16887095b14bc66557"
+WERKZEUGE_SHA = "a075241d7e6b05f21927c2040f83e270fcf6dd10"
 HUGGING = "https://huggingface.co/datasets/miriamcarnot/GTSIGN-220/resolve/main/"
 # Der veroeffentlichte Vergleichs-Checkpoint hat 9 Klassen, dieser Lauf trainiert 74
 # (tools/signmap.py). Die Gegenprobe "alter gegen neuer Checkpoint auf derselben Messlatte"
