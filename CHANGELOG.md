@@ -20,6 +20,12 @@
     Rezept gerechnet – fehlende Wahlquellen (etwa die eigenen Negative, wenn ihr Upload
     scheitert) beenden den Lauf nicht mehr. Nachgerechnet und geprüft mit
     `python data/_kernel_probe.py`: 36 283 / 2 662 / 1 500.
+  * Eine **leere Quelle** sprengte den Datensatzbau: `compose()` zieht jede Quelle mit ihrem
+    Gewicht, und `rng.randrange(0)` wirft `ValueError`. Jetzt wird sie mit Warnzeile
+    ausgelassen (`tools/crops_dataset.py`). Auslöser kann ein falsches Archiv sein – die
+    GTSRB-**Test-Labels** enthalten keine Bilder und liegen trotzdem als `*.zip` bereit
+    (gemessen: `gtsrb-test-gt.zip` → 0 Bilder, `GTSRB_Final_Training_Images.zip` → 39 209
+    Bilder / 36 Klassen).
 - **74 Klassen statt 9** (neu: [`tools/signmap.py`](tools/signmap.py)). Angelpunkt ist die
   Zuordnung: GTSRB liefert eine `ClassId`, GTSIGN-220 die **StVO-Nummer** (`274-70`), Synset
   Signset Germany den **deutschen Namen** (`Geschwindigkeit70`), GTSDB englische

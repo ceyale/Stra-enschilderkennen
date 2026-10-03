@@ -367,6 +367,18 @@ def main() -> None:
                              "(--scenes mit --neg-share 1.0)")
 
     szenen = SzenenQuelle(Path(args.scenes)) if args.scenes else None
+    # Eine Quelle ohne ein einziges brauchbares Bild darf den Lauf nicht sprengen: compose()
+    # zieht jede Quelle mit ihrem Gewicht, und rng.randrange(0) wirft dann ValueError. Ursache
+    # ist meist ein falsches Archiv - die GTSRB-Test-LABELS enthalten zum Beispiel gar keine
+    # Bilder und stehen trotzdem als *.zip bereit.
+    leer = [q for q in quellen if not len(q)]
+    if leer:
+        for q in leer:
+            print(f"[warnung] Quelle ohne Bilder, wird ausgelassen: {q.name} "
+                  f"({q.verworfen} Eintraege ohne passendes Label)")
+        quellen = [q for q in quellen if len(q)]
+        if not quellen and not (args.scenes and args.neg_share >= 1.0):
+            raise SystemExit("alle uebergebenen Quellen sind leer - siehe Warnungen oben")
     zahlen(quellen, szenen)
     if args.nur_zaehlen:
         return
