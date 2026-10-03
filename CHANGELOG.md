@@ -23,7 +23,8 @@
   weil dilatierte Faltungen dort schlechter vektorisieren. Messung: `tools/gp_messung.py`,
   Ergebnis als Kommentar im Quelltext – damit die nächste Entscheidung nicht geraten wird.
 - **Zwei Doku-Dateien waren durch mein eigenes Werkzeug beschädigt** (`Get-Content -Raw` +
-  `Set-Content -Encoding utf8` liest UTF-8 als ANSI → „außerdem" wurde „auÃŸerdem", 239 Stellen
+  `Set-Content -Encoding utf8` liest UTF-8 als ANSI → aus jedem Umlaut wird ein Byte-Paar
+  (mojibake-beispiel), 239 Stellen
   in `CHANGELOG.md`, dazu `docs/TRAINING.md`): repariert mit `tools/reparatur_mojibake.py`,
   und `tools/mojibake_pruefen.py` prüft seitdem **alle** versionierten Textdateien
   (Ergebnis: 47 Dateien, 0 Funde). Das Werkzeug überspringt eine Zeile, die sich nicht

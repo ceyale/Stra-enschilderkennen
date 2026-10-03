@@ -17,6 +17,10 @@ ROOT = Path(__file__).resolve().parent.parent
 # UTF-8-Zeichens, das als Windows-1252 gelesen und erneut als UTF-8 geschrieben wurde.
 SPUREN = ["\u00c3", "\u00e2\u20ac", "\u00c2\u00b0", "\u00e2\u0082\u00ac"]
 ENDUNGEN = {".md", ".py", ".js", ".json", ".html", ".css", ".ps1", ".txt", ".yml", ".yaml"}
+# Eine Zeile mit dieser Markierung wird NICHT geprueft. Grund: eine Doku, die den Fehler
+# BESCHREIBT, muss ihn zeigen duerfen - sonst kann man den Pruefer nicht mehr dokumentieren,
+# ohne ihn zu blenden. Die Markierung ist absichtlich ein gewoehnliches Wort im Kommentar.
+AUSNAHME = "mojibake-beispiel"
 
 
 def dateien() -> list[Path]:
@@ -38,6 +42,7 @@ def main() -> int:
             print(f"[FEHLER] {f.relative_to(ROOT)}: kein gueltiges UTF-8 ({e})")
             fehler += 1
             continue
+        text = "\n".join(z for z in text.split("\n") if AUSNAHME not in z)
         for spur in SPUREN:
             if spur in text:
                 stellen = text.count(spur)
