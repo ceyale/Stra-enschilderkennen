@@ -107,14 +107,15 @@ SYNSET_REPO = "FraunhoferIOSB/Synset-Signset-Germany"   # wird gestreamt, nicht 
 # Code-Aenderung NICHT der 700-MB-Datensatz neu hochgeladen werden - nur dieses Skript
 # (50 KB). kaggle/run.ps1 -Step push setzt WERKZEUGE_SHA auf den aktuellen Commit.
 REPO_SLUG = "ceyale/Stra-enschilderkennen"
-WERKZEUGE_SHA = "fc38200"
+WERKZEUGE_SHA = "fd26b7330d66ade1b2b5bad43a50a4537645b437"
 HUGGING = "https://huggingface.co/datasets/miriamcarnot/GTSIGN-220/resolve/main/"
 # Der veroeffentlichte Vergleichs-Checkpoint hat 9 Klassen, dieser Lauf trainiert 74
 # (tools/signmap.py). Die Gegenprobe "alter gegen neuer Checkpoint auf derselben Messlatte"
 # ist damit nicht moeglich - das alte Netz kann die neuen Klassen nicht ausgeben. Erst ein
 # naechster Lauf auf derselben Taxonomie kann diesen Vergleich wieder fuehren.
 ALT_VERGLEICH = False
-ERWARTET = {"train": 36283, "val": 2662, "neg": 1900}   # siehe Summenpruefung unten
+# Erwartete Bildzahlen stehen absichtlich NICHT hier: datensatz_bauen rechnet sie aus dem
+# Rezept (siehe dort). Wahlquellen duerfen fehlen, ohne dass die Pruefung den Lauf beendet.
 FEHLER: list[str] = []        # Schritte, die trotz "nicht toedlich" schiefgingen (fuer den Bericht)
 
 
@@ -710,7 +711,10 @@ def gtsdb_bereitstellen(p: Protokoll, roh: Path, ziel: Path) -> dict:
             if (vorbereitet / name).exists():
                 shutil.copytree(vorbereitet / name, ziel / name, dirs_exist_ok=True)
         p.zeile(f"[gtsdb] vorbereitete Szenen aus {vorbereitet} uebernommen")
-        return {"gefunden": True, "teile": {n: (ziel / n).exists() for n in teile}}
+        # Echte Bildzahlen statt blosser Ja/Nein-Werte: aus ihnen wird unten die erwartete
+        # Groesse der Messlatte berechnet (die Szenen zaehlen als eigene Bilder dazu).
+        return {"gefunden": True,
+                "teile": {n: len(list((ziel / n).glob("*.jpg"))) for n in teile}}
 
     import urllib.request
     import zipfile
@@ -936,7 +940,7 @@ def einrichten(p: Protokoll, roh: Path) -> dict:
 
 
 
-def datensatz_bauen(p: Protokoll, ein: dict) -> dict:
+def datensatz_bauen(p: Protokoll, ein: dict) -> tuple[dict, dict]:
     """Den Detektor-Datensatz bauen - jetzt aus vier Quellen mit Quellen-Upsampling.
 
     Aufbau (PLAN.md, Block 6): erst die Kataloge fuer Training und Messlatte getrennt, dann
@@ -961,17 +965,53 @@ def datensatz_bauen(p: Protokoll, ein: dict) -> dict:
     coco_pfad = ein.get("coco128") or ""
     coco_args = (["--coco", coco_pfad, "--coco-test-n", str(d["coco_test_n"])]
                  if coco_pfad else [])
-    kataloge = ["--gtsign", "catalogs/GTSIGN-220.zip",
-                "--gtsign-csv", "catalogs/class_descriptions_and_stvo.csv"]
+    # Nur was WIRKLICH da ist, wird als Quelle uebergeben. Alle Reader werfen bei fehlendem
+    # Pfad sofort (GtsignQuelle: zipfile.FileNotFoundError, OrdnerQuelle/SzenenQuelle:
+    # FileNotFoundError aus iterdir) - eine fehlende Quelle soll aber nur DIESE Quelle
+    # kosten, nicht den ganzen Lauf.
+    def da(relativ: str) -> bool:
+        return (WORK / relativ).exists()
+
+    def fehlt(was: str, relativ: str) -> list[str]:
+        p.zeile(f"[hinweis] {was} fehlt ({relativ}) - Quelle entfaellt")
+        return []
+
+    # ACHTUNG: hier stand einmal "catalogs/" mit c. gtsign_bereitstellen legt den Ordner aber
+    # als WORK/kataloge an, und die Werkzeuge laufen mit cwd=WORK. Der Lauf vom 03.10. brach
+    # deshalb NACH 28 Minuten Datensatzvorbereitung mit
+    # FileNotFoundError: catalogs/GTSIGN-220.zip ab - genau das verhindert der Vergleich unten.
+    kataloge = (["--gtsign", "kataloge/GTSIGN-220.zip",
+                 "--gtsign-csv", "kataloge/class_descriptions_and_stvo.csv"]
+                if da("kataloge/GTSIGN-220.zip") and da("kataloge/class_descriptions_and_stvo.csv")
+                else fehlt("GTSIGN-220", "kataloge/GTSIGN-220.zip"))
+    # GTSRB stand bis zum 03.10. nur im Vorbereitungsschritt: 39 253 Bilder wurden gepackt
+    # (280 MB, 3 min) und dann nie als --gtsrb uebergeben - 12 nutzbare Klassen lagen brach.
+    # Die Messlatte des Test-Sets bleibt dagegen absichtlich draussen: sie bestand frueher NUR
+    # aus GTSRB-Material und liess die Bewertung mit 0,90 gut aussehen, waehrend dasselbe
+    # Modell auf echten Szenen 0,00 lieferte (PLAN.md §1). Gelernt wird daraus trotzdem.
+    gtsrb_train = (["--gtsrb", "gtsrb/train.zip"] if da("gtsrb/train.zip")
+                   else fehlt("GTSRB", "gtsrb/train.zip"))
+    syn_train_q = (["--synset", "crops/synset-train"] if da("crops/synset-train")
+                   else fehlt("Synset (Training)", "crops/synset-train"))
+    syn_val_q = (["--synset", "crops/synset-val"] if da("crops/synset-val")
+                 else fehlt("Synset (Messlatte)", "crops/synset-val"))
+    szene_train_q = (["--scenes", "oi-train"] if da("oi-train")
+                     else fehlt("Open Images (Training)", "oi-train"))
+    szene_val_q = (["--scenes", "oi-val"] if da("oi-val")
+                   else fehlt("Open Images (Messlatte)", "oi-val"))
+    # Der reine Negativ-Split BRAUCHT die Szenen (er besteht nur aus ihnen), deshalb wird der
+    # Schritt unten ganz weggelassen, wenn der Ordner fehlt - sonst bricht der Lauf dort ab.
+    szene_neg_q = (["--scenes", "oi-neg"] if da("oi-neg")
+                   else fehlt("Open Images (Negative)", "oi-neg"))
 
     schritte = [
         # 1. Training: die Kataloge + echte Fotos aus Open Images als Umgebung und Negative
         ("kataloge train", python("tools/crops_dataset.py", "--out", "data/det",
                                   "--n", str(d["n_train"]), "--split", "train",
                                   "--size", str(d["size"]), "--seed", "0", "--balance",
-                                  *kataloge,
-                                  "--synset", "crops/synset-train",
-                                  "--scenes", "oi-train",
+                                  *kataloge, *gtsrb_train,
+                                  *syn_train_q,
+                                  *szene_train_q,
                                   "--neg-share", str(d["neg_share_train"]),
                                   *g_gewichte)),
         # 2. Messlatte: die SPLITS der Kataloge - Bilder, die im Training nicht vorkommen
@@ -979,8 +1019,8 @@ def datensatz_bauen(p: Protokoll, ein: dict) -> dict:
                                 "--n", str(d["n_val"]), "--split", "val",
                                 "--size", str(d["size"]), "--seed", "1",
                                 *kataloge,
-                                "--synset", "crops/synset-val",
-                                "--scenes", "oi-val",
+                                *syn_val_q,
+                                *szene_val_q,
                                 "--neg-share", str(d["neg_share_val"]))),
         # 3. Synthetische Negative (gezeichnete Stoererflaechen, Anzeigen, Nacht)
         ("synthetische negative", python("tools/synth_negatives.py", "--out", "data/det",
@@ -992,11 +1032,14 @@ def datensatz_bauen(p: Protokoll, ein: dict) -> dict:
                                   "--train-region", "0,0,1,0.5",
                                   *coco_args,
                                   "--user-share", str(d["user_share_train"]))),
-        # 5. Die Gegenprobe auf Fehlalarme: nur Bilder OHNE Schild, aus dem dritten OI-Topf
-        ("negative messlatte", python("tools/crops_dataset.py", "--out", "data/det",
-                                      "--n", str(d["n_neg"]), "--split", "neg",
-                                      "--size", str(d["size"]), "--seed", "2",
-                                      "--scenes", "oi-neg", "--neg-share", "1.0")),
+        # 5. Die Gegenprobe auf Fehlalarme: nur Bilder OHNE Schild, aus dem dritten OI-Topf.
+        #    Ohne diese Szenen ist der Schritt sinnlos (er besteht nur aus ihnen) - dann faellt
+        #    er weg, statt mit FileNotFoundError den Lauf zu beenden.
+        *([("negative messlatte", python("tools/crops_dataset.py", "--out", "data/det",
+                                        "--n", str(d["n_neg"]), "--split", "neg",
+                                        "--size", str(d["size"]), "--seed", "2",
+                                        *szene_neg_q, "--neg-share", "1.0"))]
+          if szene_neg_q else []),
         ("synthetische negative (Messlatte)", python("tools/synth_negatives.py", "--out", "data/det",
                                                      "--n", str(d["n_neg_synth"]), "--split", "neg")),
         # 6. GTSDB: die einzigen ECHTEN Szenen (Schild klein im Bild). Trainingssplit ins
@@ -1022,6 +1065,10 @@ def datensatz_bauen(p: Protokoll, ein: dict) -> dict:
         schritte.append(("eigene negative (Training)",
                          python("tools/real_negatives.py", "--out", "data/det",
                                 "--n", str(d["n_eigene_train"]), "--split", "train",
+                                # Eigenes Kennzeichen: sonst haette dieser Aufruf die 3 600
+                                # echten Negative des Schritts darueber geloescht (gleicher
+                                # src "echt (Negativ)" und gleicher Split = Ersetzen).
+                                "--src", "eigene (Negativ)",
                                 "--real-train", *eigene_train,
                                 *coco_args,
                                 "--user-share", str(d["eigene_share"]))))
@@ -1029,17 +1076,40 @@ def datensatz_bauen(p: Protokoll, ein: dict) -> dict:
         schritte.append(("eigene negative (Messlatte)",
                          python("tools/real_negatives.py", "--out", "data/det",
                                 "--n", str(d["n_eigene_neg"]), "--split", "neg",
+                                "--src", "eigene (Negativ)",
                                 "--real-test", *eigene_neg)))
     for was, cmd in schritte:
         dauer[was] = lauf(p, cmd, f"Datensatz: {was}")
-    return dauer
+
+    # Die erwarteten Bildzahlen werden aus dem Rezept SELBST gerechnet, nicht fest
+    # eingetragen. Grund: die eigenen Negative des Nutzers liegen nur dann im Rohdatensatz,
+    # wenn ihr Upload geklappt hat - im Lauf vom 03.10. fehlten sie, und eine feste Zahl
+    # haette den Lauf nach 30 Minuten Datensatzvorbereitung beendet, obwohl alles in Ordnung
+    # war. Geprueft wird damit weiterhin genau das, was schiefgehen kann: dass ein Schritt
+    # weniger Bilder schreibt, als er zugesagt hat.
+    teile = (ein.get("gtsdb") or {}).get("teile") or {}
+    gtsdb_train = int(teile.get("train") or 0)
+    gtsdb_val = int(teile.get("valid") or 0) + int(teile.get("test") or 0)
+    erwartet = {
+        "train": (d["n_train"] + d["n_neg_synth"] + d["n_echt_train"] + gtsdb_train
+                  + (d["n_eigene_train"] if eigene_train else 0)),
+        "val": d["n_val"] + gtsdb_val,
+        "neg": (d["n_neg"] if szene_neg_q else 0) + d["n_neg_synth"]
+               + (d["n_eigene_neg"] if eigene_neg else 0),
+    }
+    p.zeile("[daten] erwartet aus dem Rezept: "
+            + ", ".join(f"{k}={v}" for k, v in erwartet.items()))
+    return dauer, erwartet
 
 
-def zahlen_pruefen(p: Protokoll) -> dict:
+def zahlen_pruefen(p: Protokoll, erwartet: dict) -> dict:
     """Die Bildzahlen des Manifests gegen die Erwartung stellen.
 
     Ein Tippfehler im Rezept faellt sonst erst nach zwei Stunden Training auf - und dann
     sieht man nur eine schlechtere Zahl, nicht die Ursache. Deshalb wird hier hart geprueft.
+    Die Erwartung kommt aus datensatz_bauen und wird dort aus dem Rezept gerechnet; fehlt
+    eine Wahlquelle (etwa die eigenen Negative, wenn ihr Upload nicht geklappt hat), passt
+    sie sich an, statt den Lauf zu beenden.
     """
     manifest = json.loads((WORK / "data" / "det" / "manifest.json").read_text(encoding="utf-8"))
     zahlen: dict[str, int] = {}
@@ -1055,7 +1125,7 @@ def zahlen_pruefen(p: Protokoll) -> dict:
     # nicht mehr wegen ein paar Bildern.
     grenze = 0.02
     falsch, ungenau = {}, {}
-    for k, soll in ERWARTET.items():
+    for k, soll in erwartet.items():
         ist = zahlen.get(k, 0)
         if ist == soll:
             continue
@@ -1241,8 +1311,9 @@ def main() -> None:
 
     dauer: dict[str, float] = {"einrichten": 0.0}
     ein = einrichten(p, roh)
-    dauer.update(datensatz_bauen(p, ein))
-    zahlen = {} if PROBE else zahlen_pruefen(p)
+    dauer_bauen, erwartet = datensatz_bauen(p, ein)
+    dauer.update(dauer_bauen)
+    zahlen = {} if PROBE else zahlen_pruefen(p, erwartet)
     dauer["training"] = trainieren(p)
 
     if hat_ort:

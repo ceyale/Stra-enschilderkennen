@@ -131,6 +131,13 @@ def main() -> None:
     ap.add_argument("--n", type=int, default=3000)
     ap.add_argument("--size", type=int, default=320)
     ap.add_argument("--split", default="train", choices=["train", "neg"])
+    # Herkunftskennzeichen im Manifest. Es entscheidet, WELCHE frueheren Eintraege dieser
+    # Aufruf ersetzt: gleicher src UND gleicher split = Ersetzen, sonst Hinzufuegen. Zwei
+    # Negative-Aufrufe auf denselben Split addieren sich also nur mit unterschiedlichem src -
+    # ohne eigene Kennung haette der zweite Aufruf die Bilder des ersten stillschweigend
+    # geloescht (so stand der Lauf vom 03.10. bei 32 683 statt 36 283 Trainingsbildern).
+    ap.add_argument("--src", default=SRC,
+                    help="Herkunftskennzeichen im Manifest (Standard: 'echt (Negativ)')")
     ap.add_argument("--seed", type=int, default=21)
     ap.add_argument("--real-train", nargs="*", default=[], help="eigene Fotos fuers Training")
     ap.add_argument("--real-test", nargs="*", default=[], help="eigene Fotos fuer die Messlatte")
@@ -146,6 +153,7 @@ def main() -> None:
     args = ap.parse_args()
 
     rng = random.Random(args.seed)
+    kennung = "".join(z for z in args.src.lower() if z.isalnum())[:8] or "neg"
     nutzer_pfade = args.real_train if args.split == "train" else args.real_test
     region = args.train_region if args.split == "train" else args.test_region
     nutzer: list[tuple[Path, tuple[int, int, int, int], str]] = []
@@ -183,14 +191,18 @@ def main() -> None:
         crop = ausschnitt(np.asarray(im), rng, args.vollbild, *args.fenster)
         bild = Image.fromarray(crop).resize((args.size, args.size), Image.BICUBIC)
         bild, tags = verschlechtere(bild, rng, args.size)
-        stem = f"{args.split}_r{i:06d}"
+        # Der Dateiname traegt die Herkunft mit: ohne sie schreiben zwei Aufrufe auf denselben
+        # Split dieselben Namen (train_r000000 ...) und ueberschreiben einander, waehrend das
+        # Manifest beide Eintraege behaelt - zwei Eintraege, eine Datei. Genau so entstehen
+        # doppelte Bilder im Datensatz.
+        stem = f"{args.split}_{kennung}_r{i:06d}"
         bild.save(out / "images" / f"{stem}.jpg", quality=rng.randrange(58, 92))
         # Leeres Label: kein Objekt im Bild (YOLO-Konvention, siehe tools/synth_negatives.py).
         (out / "labels" / f"{stem}.txt").write_text("\n", encoding="utf-8")
         if len(zellen) < 24:
             zellen.append(bild.copy())
         arten[art] = arten.get(art, 0) + 1
-        entries.append({"id": stem, "src": SRC,
+        entries.append({"id": stem, "src": args.src,
                         "license": "COCO 2017 (CC BY 4.0) / eigene Aufnahme",
                         "scene": "echt", "conditions": sorted(set(["negativ", "echt"] + tags)),
                         "split": args.split, "width": args.size, "height": args.size,
@@ -201,8 +213,12 @@ def main() -> None:
         {"format": "yolo-txt", "classes": SIGN_LABELS, "source": "tools/real_negatives.py",
          "images": []}
     manifest["images"] = [e for e in manifest.get("images", [])
-                          if not (e.get("src") == SRC and e.get("split") == args.split)] + entries
-    manifest["echte_negative"] = {**manifest.get("echte_negative", {}), args.split:
+                          if not (e.get("src") == args.src
+                                  and e.get("split") == args.split)] + entries
+    # Schluessel aus Split UND Kennung: sonst ueberschreibt der zweite Aufruf auf denselben
+    # Split die Aufzeichnung des ersten.
+    manifest["echte_negative"] = {**manifest.get("echte_negative", {}),
+                                  f"{args.split}|{args.src}":
                                   {"n": args.n, "arten": arten, "coco_test_n": args.coco_test_n,
                                    "region": region}}
     path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")

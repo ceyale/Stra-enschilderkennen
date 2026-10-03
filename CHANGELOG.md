@@ -1,6 +1,25 @@
 # Changelog
 
 ## 0.5.0 – 2026-10-03 (in Arbeit)
+- **Drei Fehler behoben**, die den Kaggle-Lauf vom 03.10. **nach 28 Minuten**
+  Datensatzvorbereitung beendet haben (`kaggle/train_kernel.py`, `tools/real_negatives.py`):
+  * Der Katalogordner heißt `kataloge/`, im Werkzeugaufruf stand aber `catalogs/` –
+    `crops_dataset.py` brach mit `FileNotFoundError: catalogs/GTSIGN-220.zip` ab, obwohl der
+    Download einwandfrei gelaufen war. Der Pfad wird jetzt geprüft; fehlt eine Quelle, entfällt
+    **sie einzeln** (mit Hinweiszeile) statt den ganzen Lauf zu beenden.
+  * **GTSRB wurde gepackt und nie benutzt**: 39 253 Bilder in 280 MB, 3 Minuten Packzeit – und
+    kein `--gtsrb` im Trainingsaufruf, 12 nutzbare Klassen lagen brach. Jetzt:
+    `--gtsrb gtsrb/train.zip` im Training (die Test-Messlatte bleibt draußen, damit die
+    Bewertung nicht wieder auf GTSRB-Material aufgeht).
+  * **Zwei Negative-Aufrufe auf denselben Split ersetzten einander** (gleicher `src`): der
+    zweite Aufruf löschte die 3 600 echten Negative des ersten, und beide schrieben dieselben
+    Dateinamen (`train_r000000 …`) – im Manifest standen danach zwei Einträge für eine Datei.
+    Genau so entstehen doppelte Bilder. Neu: `--src` kennzeichnet die Herkunft, die Dateinamen
+    tragen sie mit.
+  * Die erwarteten Bildzahlen stehen **nicht mehr fest im Skript**, sondern werden aus dem
+    Rezept gerechnet – fehlende Wahlquellen (etwa die eigenen Negative, wenn ihr Upload
+    scheitert) beenden den Lauf nicht mehr. Nachgerechnet und geprüft mit
+    `python data/_kernel_probe.py`: 36 283 / 2 662 / 1 500.
 - **74 Klassen statt 9** (neu: [`tools/signmap.py`](tools/signmap.py)). Angelpunkt ist die
   Zuordnung: GTSRB liefert eine `ClassId`, GTSIGN-220 die **StVO-Nummer** (`274-70`), Synset
   Signset Germany den **deutschen Namen** (`Geschwindigkeit70`), GTSDB englische
