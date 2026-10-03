@@ -278,7 +278,8 @@ def main() -> None:
     manifest = {"arch": cfg.as_dict(), "params": n_params(model), "size": size, "classes": SIGN_LABELS,
                 "trained_epoch": ck.get("epoch"), "train_metrics": ck.get("metrics"),
                 "parity": par, "dynamic": dyn, "ort_cpu_ms": round(ms, 2), "files": files,
-                "sha256": {k: sha256(out_path.parent / v) for k, v in files.items() if k.endswith("onnx")},
+                "sha256": {k: sha256(out_path.parent / v) for k, v in files.items()
+                           if k in ("onnx", "int8")},
                 "torch": torch.__version__}
     (out_path.parent / "manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
