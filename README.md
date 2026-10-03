@@ -39,6 +39,14 @@ Der hierarchische Kopf ist der Grund, warum die Anzeige eine Herkunft nennen kan
 Erkennung kennt ihre **Familie** (`labels.json` → `hierarchy`), z. B. „Tempolimit → tempo70".
 Die Klassenliste aller 74 Zeichen steht in `tools/signmap.py`.
 
+Trainiert wird mit **Wissens-Distillation**: ein ViT-Lehrer (`vit_gtsign_all_classes`, auf 220
+deutschen StVO-Klassen, veröffentlicht mit Accuracy 0,973) gibt je Schild eine weiche
+Verteilung vor, die das kleine Netz zusätzlich zur harten Klasse nachbilden muss – genau gegen
+den Fehler des v6-Laufs, in dem die Boxen saßen, die Arten aber nicht. Der Lehrer läuft dabei
+**einmal** über die Trainingsboxen (`tools/teacher.py`, Ergebnis als Cache), nicht in jedem
+Lernschritt. Herkunft und Lizenz (**CC BY-SA 4.0**) stehen in
+[`docs/TRAINING.md` §5.0](docs/TRAINING.md).
+
 **Aktueller Stand (gemessen, `docs/TRAINING.md` §5):** 1 300 360 Parameter, 878 MFLOPs,
 5,23 MB ONNX – auf 2 000 Validierungsbildern **P = 0,883 / R = 0,796 / F1 = 0,837**,
 alle neun Typen inklusive `hinweis` und `ortstafel`. Vor der Überarbeitung waren es
@@ -168,7 +176,7 @@ Drei Dinge, die man beim Hosten kennen sollte:
 | `tests/detector.test.js` | Test der Heuristik mit synthetisch gezeichneten Schildern |
 | `tests/model.test.js` | Test der Modell-Mathematik inkl. Gegenprobe gegen die Python-Seite |
 | `tests/fixtures/` | Fixture mit echten ONNX-Ausgaben für diese Gegenprobe |
-| `tools/` | Python-Werkzeuge: Modell, Training (`train_det.py`), Klassen (`signmap.py`), Daten (`crops_dataset.py`, `gtsdb_dataset.py`, `gtsrb_dataset.py`, `synth_data.py`), Auswertung (`eval_conditions.py`), Export, Doku-Hilfen (nicht ausgeliefert) |
+| `tools/` | Python-Werkzeuge: Modell, Training (`train_det.py`), Klassen (`signmap.py`), Daten (`crops_dataset.py`, `gtsdb_dataset.py`, `gtsrb_dataset.py`, `synth_data.py`), **Lehrer für die Wissens-Distillation (`teacher.py`)**, Auswertung (`eval_conditions.py`), Export, Doku-Hilfen (nicht ausgeliefert) |
 | `kaggle/` | Trainingslauf auf Kaggle (Datensatz bauen + trainieren + exportieren), siehe [`kaggle/README.md`](kaggle/README.md) – nötig, weil die Windows-Anwendungssteuerung PyTorch lokal blockiert |
 | `models/` | Zielort der Modell-Dateien (lokal erzeugt, nicht im Git) |
 | `docs/DOKUMENTATION.md` | Ausführliche Doku: Algorithmus, Schwellwerte, Grenzen, Erweiterungen |

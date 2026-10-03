@@ -174,6 +174,27 @@ ist klein, nicht die Dateizahl.
      die dynamische Gegenprobe kann den Export nicht mehr mitreißen (Rückfall auf statisch,
      Grund in `labels.json`).
 
+     **Nachtrag (03.10., dritter Teil) – Wissens-Distillation.** Der v6-Lauf ist durchgelaufen
+     und liefert den entscheidenden Befund: **die Boxen sitzen, die Arten nicht.**
+     Objektivitätsverlust 253 → 0,2, Box 18,7 → 0,4, aber der Klassifikationsverlust blieb bei
+     **3,4** (Zufall bei 74 Klassen wäre ln 74 ≈ 4,3); val-F1 **0,056** bei P 0,077 / R 0,044.
+     Genau dazu passt die Fehlerzerlegung: 195 von 226 Fehlalarmen lagen auf *echten* Schildern
+     mit falscher Klasse. Der nächste Hebel ist deshalb **nicht** eine größere Architektur,
+     sondern ein Lehrer, der die Arten besser kennt.
+
+     Gewählt: `vit_gtsign_all_classes` aus GTSIGN-220 (`google/vit-base-patch16-224`
+     feinjustiert, 86 Mio. Parameter, **220 StVO-Klassen**, veröffentlicht mit Accuracy 0,973 /
+     P 0,911 / R 0,930 – `eval_results.json` des Repos). Ein auf COCO trainierter Detektor kennt
+     dagegen nur *eine* Klasse „stop sign"; die Zuordnung dieses Lehrers ist über die
+     **StVO-Nummer** ein Nachschlagen und keine Vermutung (211 von 220 Klassen zuordenbar, deckt
+     **68 der 74** unserer Typen). Umsetzung: `tools/teacher.py` cacht die auf 74 Klassen
+     **marginalisierten** Verteilungen je Grundwahrheitsbox (Trainingssplit *nur* – `val` und
+     `neg` bleiben Messlatte), `tools/train_det.py --teacher/--distill/--temperature` zieht die
+     Klassifikations-Logits per KL×T² auf diese Verteilung. Gewicht **0,25**, weil gemessen eine
+     positive Zelle 2–9 beiträgt und der Klassifikationsverlust nur 0,1–0,3 – mit 1,0 hätte der
+     Lehrer die übrigen Verluste überstimmt. Lizenz des Lehrers: **CC BY-SA 4.0** (Weitergabe
+     nennen, ShareAlike beachten).
+
 2. **Kachelmodus in die App**: `src/model.js` + `src/app.js` – Foto in N×N überlappende
    Kacheln, Treffer verschieben, NMS über die Kachelgrenzen, **höhere Schwelle** im Kachelmodus
    (Messung: conf 0,3 → 40 statt 115 Treffer auf dem Poster, aber 5 statt 22 FP auf `Nothing`).

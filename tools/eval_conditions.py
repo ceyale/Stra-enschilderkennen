@@ -103,7 +103,7 @@ def diagnose(model, loader, ds, device, conf: float, iou: float) -> dict:
     groesse: dict[str, list[float]] = {"obj_miss": [], "loc": []}
     confusion: dict[tuple[str, str], int] = defaultdict(int)
     with torch.no_grad():
-        for x, _tgt, meta in loader:
+        for x, _tgt, meta, _lehrer in loader:
             outs = [o.cpu().numpy() for o in model(x.to(device))]
             for bi in range(len(meta)):
                 dets = dm.decode_multi([o[bi] for o in outs], dm.LEVELS, conf, iou_thres=0.45)
@@ -225,7 +225,7 @@ def sweep(model, loader, ds, device, confs: list[float], nms_list: list[float],
     roh: list[list[np.ndarray]] = []
     ziel: list[tuple[np.ndarray, np.ndarray]] = []
     with torch.no_grad():
-        for x, _tgt, meta in loader:
+        for x, _tgt, meta, _lehrer in loader:
             outs = [o.cpu().numpy() for o in model(x.to(device))]
             for bi in range(len(meta)):
                 if len(roh) >= limit:
@@ -321,7 +321,7 @@ def main() -> None:
     je_klasse: dict[int, dict] = defaultdict(lambda: defaultdict(int))
     seen = 0
     with torch.no_grad():
-        for x, _tgt, meta in loader:
+        for x, _tgt, meta, _lehrer in loader:
             outs = [o.cpu().numpy() for o in model(x.to(device))]
             for bi in range(len(meta)):
                 if args.limit and seen >= args.limit:

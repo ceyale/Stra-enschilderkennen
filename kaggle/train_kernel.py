@@ -145,6 +145,29 @@ TRAINING = dict(
 # Vergleichswert im Bericht); der Sweep schreibt sein Optimum nach berichte/sweep.json.
 AUSWERTUNG = dict(conf=0.25, iou=0.5, iou_det=0.45, zweite_groesse=448,
                   sweep_limit=400)
+# Wissens-Distillation (tools/teacher.py + tools/train_det.py --teacher/--distill):
+# Der Lehrer ist ein ViT-base, der auf den 220 deutschen StVO-Klassen des GTSIGN-220-Datensatzes
+# trainiert wurde - veroeffentlicht mit Accuracy 0,973 / P 0,911 / R 0,930. Er kennt also genau
+# die Zeichen, um die es geht, nur feiner unterteilt (220 statt 74 Typen). Seine Verteilungen
+# werden EINMAL je Grundwahrheitsbox gerechnet, auf unsere 74 Klassen marginalisiert und
+# gecacht; das Training selbst sieht nur noch den Cache (kein ViT im Lernschritt).
+# Warum das der wirksamste Einzelhebel ist: im v6-Lauf hat das Netz die BOXEN gelernt
+# (Objektivitaet 253 -> 0,2) und die ART nicht (Klassifikationsverlust blieb bei 3,4, Zufall
+# waere 4,3) - 195 von 226 Fehlalarmen waren echte Schilder mit falscher Klasse.
+LEHRER = dict(
+    an=True,
+    split="train",          # nur der Trainingssplit - val/neg bleiben unberuehrt (Messlatte)
+    distill=0.25,           # Gewicht des Lehrer-Verlusts. GEMESSEN: eine positive Zelle
+                              # traegt KL(Lehrer||Schueler) x T^2 von rund 2 bis 9, je
+                              # nachdem wie scharf der Lehrer entscheidet (Pruefung mit
+                              # einem kuenstlichen Ziel: 9,02). Zum Vergleich: der
+                              # Klassifikationsverlust liegt bei 0,1-0,3, der Box-Verlust
+                              # bei rund 5. Mit Faktor 0,25 wird der Lehrer damit ein
+                              # kraeftiges, aber nicht uebermaechtiges Signal - mit 1,0
+                              # haette er die uebrigen Verluste ueberstimmt.
+    temperature=2.0,
+    limit=0,                # 0 = alle Bilder; >0 nur zum Testen
+)
 # int8-Quantisierung: QDQ mit Kalibrierung auf den ECHTEN Bildern des Datensatzes - die
 # Verteilung des Einsatzes entscheidet ueber die Skalen, nicht eine synthetische. 200 Bilder
 # sind gemessen ausreichend; mehr kostet nur Zeit. Das Werkzeug verwirft die int8-Datei
@@ -402,6 +425,79 @@ def datasets_sichern(p: Protokoll) -> bool:
         return False
     p.zeile("[lib] datasets installiert")
     return True
+
+
+def transformers_sichern(p: Protokoll) -> bool:
+    """`transformers` + `safetensors` fuer das LEHRER-Modell (Wissens-Distillation).
+
+    Der Lehrer ist ein ViT-base aus dem GTSIGN-220-Datensatz und wird ueber `transformers`
+    geladen. Kaggle bringt `transformers` meist mit, aber nicht garantiert - deshalb dieselbe
+    Absicherung wie bei onnxruntime und datasets. Fehlt es, faellt NUR die Distillation aus
+    (der Lauf trainiert weiter, dann eben ohne Lehrer) - das ist kein Grund, den Lauf zu
+    verwerfen, aber es soll sichtbar im Protokoll stehen.
+    """
+    try:
+        import transformers  # noqa: F401
+        p.zeile(f"[lib] transformers ist vorhanden")
+        return True
+    except ImportError:
+        pass
+    if PROBE:
+        p.zeile("[probe] pip install transformers safetensors (waere noetig)")
+        return True
+    p.zeile("[lib] transformers fehlt - pip install transformers safetensors (Lehrer-Modell)")
+    rc = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-input",
+                         "transformers", "safetensors"], capture_output=True, text=True)
+    if rc.returncode != 0:
+        p.zeile(f"[lib] Installation fehlgeschlagen: {(rc.stderr or rc.stdout).strip()[-300:]}")
+        p.zeile("[warnung] Wissens-Distillation wird uebersprungen (Lehrer nicht ladbar)")
+        return False
+    p.zeile("[lib] transformers installiert")
+    return True
+
+
+def lehrer_cache(p: Protokoll, roh: Path, hat_tr: bool) -> bool:
+    """Die Lehrer-Verteilungen EINMAL cachen (tools/teacher.py).
+
+    Warum als eigener Schritt und nicht im Training: der ViT-base hat 86 Mio. Parameter und
+    wuerde in jedem Lernschritt mitlaufen - bei 33 000 Bildern und 220 Epochen waere das um
+    Groessenordnungen teurer als das Training selbst. Der Cache macht aus ihm eine reine
+    Datenvorbereitung: einmal etwa 400 000 Ausschnitte durch den Lehrer (auf der T4 in
+    Minuten), danach liest das Training nur noch eine Datei.
+
+    Der Cache traegt die Lehrer-Verteilung JE GRUNDWAHRHEITSBOX, nicht je Klasse - zwei
+    Schilder derselben Klasse koennen verschieden aussehen (andere StVO-Nummer, anderes
+    Symbol), und der Lehrer kennt den Unterschied.
+
+    Nur der TRAININGSsplit: val und neg sind die Messlatte und bleiben unberuehrt.
+    """
+    l = LEHRER
+    if not l["an"] or not hat_tr:
+        p.zeile(f"[lehrer] uebersprungen (an={l['an']}, transformers={hat_tr})")
+        return False
+    # Die StVO-Tabelle liegt je nach Lauf an zwei Stellen: im Rohdaten-Datensatz (kataloge/)
+    # oder in der Arbeitskopie (WORK/kataloge/, von gtsign_bereitstellen angelegt). Beide
+    # werden geprueft - ein falscher Pfad liesse den Cache leer und damit die Distillation aus.
+    kandidaten = [WORK / "kataloge" / "class_descriptions_and_stvo.csv",
+                  roh / "kataloge" / "class_descriptions_and_stvo.csv"]
+    csv = next((k for k in kandidaten if k.exists()), None)
+    if csv is None:
+        p.zeile(f"[lehrer] StVO-Tabelle fehlt ({' | '.join(str(k) for k in kandidaten)}) - "
+                "Distillation uebersprungen")
+        return False
+    args = ["--data", "data/det", "--out", "data/teacher", "--split", l["split"],
+            "--csv", str(csv)]
+    if l["limit"]:
+        args += ["--limit", str(l["limit"])]
+    lauf(p, python("tools/teacher.py", *args),
+         "Lehrer-Cache (vit-base/GTSIGN-220) fuer den Trainingssplit", fatal=False)
+    # Nicht die Dauer entscheidet, sondern die Datei: nur wenn der Cache wirklich da ist,
+    # bekommt das Training --teacher (sonst wuerde es ohne Cache laufen und das Rezept
+    # behauptete das Gegenteil).
+    da = (WORK / "data" / "teacher" / f"teacher_{l['split']}.npz").exists()
+    p.zeile(f"[lehrer] Cache {'bereit' if da else 'FEHLT'} "
+            f"(data/teacher/teacher_{l['split']}.npz)")
+    return da
 
 
 def onnxruntime_sichern(p: Protokoll) -> bool:
@@ -1197,26 +1293,34 @@ def zahlen_pruefen(p: Protokoll, erwartet: dict) -> dict:
     return zahlen
 
 
-def trainieren(p: Protokoll) -> float:
+def trainieren(p: Protokoll, hat_lehrer: bool = False) -> float:
     """Das Netz trainieren - Aufruf wie docs/TRAINING.md §5, Wort fuer Wort."""
-    t = TRAINING
-    cmd = python("tools/train_det.py", "--data", "data/det", "--size", str(t["size"]),
-                 "--preset", t["preset"], "--batch", str(t["batch"]),
-                 "--epochs", str(t["epochs"]), "--steps", str(t["steps"]),
-                 "--lr", str(t["lr"]), "--degrade", str(t["degrade"]), "--zoom", str(t["zoom"]),
-                 "--workers", str(t["workers"]), "--eval-every", str(t["eval_every"]),
-                 "--save-every", str(t["save_every"]), "--obj-norm", t["obj_norm"],
-                 "--val-split", t["val_split"], "--out", "models/signs-det.pt",
-                 # Verlust und Kopf: Focal im Klassifikationskopf, Klassengewichte,
-                 # Label-Smoothing, hierarchischer Kopf mit direkt ueberwachter Familie.
-                 "--focal-gamma", str(t["focal_gamma"]),
-                 "--focal-alpha", str(t["focal_alpha"]),
-                 "--cls-w", str(t["cls_w"]),
-                 "--smooth", str(t["smooth"]),
-                 "--hier-aux", str(t["hier_aux"]),
-                 "--seed", str(t["seed"]))
-    return lauf(p, cmd, f"Training: {t['epochs']} Epochen x {t['steps']} Schritte "
-                        f"x {t['batch']} Bilder (Merksatz: 1 Epoche = {t['steps']*t['batch']} Bilder)")
+    t, l = TRAINING, LEHRER
+    args = ["tools/train_det.py", "--data", "data/det", "--size", str(t["size"]),
+            "--preset", t["preset"], "--batch", str(t["batch"]),
+            "--epochs", str(t["epochs"]), "--steps", str(t["steps"]),
+            "--lr", str(t["lr"]), "--degrade", str(t["degrade"]), "--zoom", str(t["zoom"]),
+            "--workers", str(t["workers"]), "--eval-every", str(t["eval_every"]),
+            "--save-every", str(t["save_every"]), "--obj-norm", t["obj_norm"],
+            "--val-split", t["val_split"], "--out", "models/signs-det.pt",
+            # Verlust und Kopf: Focal im Klassifikationskopf, Klassengewichte,
+            # Label-Smoothing, hierarchischer Kopf mit direkt ueberwachter Familie.
+            "--focal-gamma", str(t["focal_gamma"]),
+            "--focal-alpha", str(t["focal_alpha"]),
+            "--cls-w", str(t["cls_w"]),
+            "--smooth", str(t["smooth"]),
+            "--hier-aux", str(t["hier_aux"]),
+            "--seed", str(t["seed"])]
+    if hat_lehrer:
+        # Wissens-Distillation: der Verlust zieht die Klassifikations-Logits zusaetzlich auf
+        # die (auf 74 Klassen marginalisierte) Verteilung des ViT-Lehrers. Genau dort lag der
+        # Fehler - das Netz fand die Boxen, entschied aber falsch (v6: cls-Verlust 3,4).
+        args += ["--teacher", "data/teacher", "--distill", str(l["distill"]),
+                 "--temperature", str(l["temperature"])]
+    return lauf(p, python(*args), f"Training: {t['epochs']} Epochen x {t['steps']} Schritte "
+                                  f"x {t['batch']} Bilder (Merksatz: 1 Epoche = "
+                                  f"{t['steps']*t['batch']} Bilder)"
+                                  + (f", Distillation mit {l['distill']}" if hat_lehrer else ""))
 
 
 def exportieren(p: Protokoll) -> float:
@@ -1352,11 +1456,21 @@ def kurzfassung(p: Protokoll, geraetname: str, ein: dict, dauer: dict, zahlen: d
                 for name in ("val.json", "neg.json", "val384.json", "val_block4.json",
                              "sweep.json", "model-out.json")}
     dateien = {f.name: f.stat().st_size for f in sorted((WORK / "models").glob("*")) if f.is_file()}
+    # Der Lehrer-Cache bringt seine eigene Beschreibung mit (Modell, Lizenz, Zuordnung,
+    # Anzahl der Boxen). Sie kommt mit in den Bericht, damit nachvollziehbar bleibt, WOMIT
+    # trainiert wurde - die Lizenz ist CC BY-SA und muss weitergegeben werden.
+    lehrer = lade(WORK / "data" / "teacher" / f"teacher_{LEHRER['split']}.json")
+    if lehrer:
+        lehrer = {k: v for k, v in lehrer.items() if k != "ids"}
+        lehrer["gewuenscht"] = {"an": LEHRER["an"], "distill": LEHRER["distill"],
+                                "temperature": LEHRER["temperature"]}
     report = {
         "stand": time.strftime("%Y-%m-%d %H:%M"),
         "geraet": geraetname,
         "eingang": ein,
-        "rezept": {"daten": DATEN, "training": TRAINING, "auswertung": AUSWERTUNG},
+        "rezept": {"daten": DATEN, "training": TRAINING, "auswertung": AUSWERTUNG,
+                   "lehrer": LEHRER},
+        "lehrer": lehrer,
         "bilder": zahlen,
         "archiv": archiv,
         "dauer_min": {k: round(v / 60, 1) for k, v in dauer.items()},
@@ -1381,6 +1495,7 @@ def main() -> None:
     # Ohne diese Vorbereitung riss der erste Lauf die gesamte Ausgabe mit (43 min Training weg).
     hat_ort = onnxruntime_sichern(p)
     hat_ds = datasets_sichern(p)
+    hat_tr = transformers_sichern(p)
     roh = eingang_finden()
     p.zeile(f"[eingang] Rohdaten-Datensatz: {roh}")
 
@@ -1389,7 +1504,18 @@ def main() -> None:
     dauer_bauen, erwartet = datensatz_bauen(p, ein)
     dauer.update(dauer_bauen)
     zahlen = {} if PROBE else zahlen_pruefen(p, erwartet)
-    dauer["training"] = trainieren(p)
+    # Der Lehrer-Cache wird NACH dem Datensatz gebaut (er braucht dessen Boxen) und VOR dem
+    # Training (er ist dessen Eingabe). Bewusst als eigener Abschnitt im Protokoll, mit
+    # eigener Zeit - die Gesamtdauer enthaelt ihn natuerlich.
+    dauer["lehrer"] = 0.0
+    t_lehrer = time.perf_counter()
+    hat_lehrer = lehrer_cache(p, roh, hat_tr)
+    dauer["lehrer"] = time.perf_counter() - t_lehrer
+    if not hat_lehrer and not PROBE:
+        # Kein Abbruch (der Lauf trainiert sonst eben ohne Lehrer), aber sichtbar: sonst
+        # stuende im Bericht ein Rezept MIT Distillation und daneben ein Modell ohne.
+        FEHLER.append("Lehrer-Cache (Distillation ohne Wirkung)")
+    dauer["training"] = trainieren(p, hat_lehrer)
 
     if hat_ort:
         dauer["export"] = exportieren(p)
@@ -1417,6 +1543,13 @@ def main() -> None:
             f"int8 {report['modelldateien'].get('signs-det-int8.onnx', 0)/1e6:.2f} MB "
             f"(das liefert der Browser aus), "
             f"Checkpoint {report['modelldateien'].get('signs-det.pt', 0)/1e6:.1f} MB")
+    if report.get("lehrer"):
+        lr = report["lehrer"]
+        p.zeile(f"[ergebnis] Lehrer: {lr['lehrer']} - {lr['boxen_gesamt']} Boxen aus "
+                f"{lr['bilder']} Bildern, {lr['klassen_lehrer']} Lehrer-Klassen -> "
+                f"{lr['klassen_schueler']} unserer; Distillation {lr['gewuenscht']['distill']} "
+                f"bei T={lr['gewuenscht']['temperature']}")
+        p.zeile(f"[lizenz] {lr['lizenz']}")
     if FEHLER:
         p.zeile()
         p.zeile("[warnung] nicht gelaufen: " + ", ".join(FEHLER))

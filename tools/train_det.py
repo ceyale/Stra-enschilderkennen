@@ -49,7 +49,8 @@ class SignDataset(torch.utils.data.Dataset):
 
     def __init__(self, root: str, size: int = 320, split: str = "train",
                  synth_len: int = 200, seed: int = 0, degrade_prob: float = 0.6,
-                 zoom: float = 0.0, zoom_lo: float = 0.7, zoom_hi: float = 1.5):
+                 zoom: float = 0.0, zoom_lo: float = 0.7, zoom_hi: float = 1.5,
+                 teacher_dir: str = ""):
         self.size, self.split, self.seed = size, split, seed
         self.degrade_prob = degrade_prob
         # Mehrskaligkeit nur im Training - die Validierung soll dieselbe Messlatte bleiben.
@@ -58,6 +59,12 @@ class SignDataset(torch.utils.data.Dataset):
         self.items: list[tuple[Path, Path, dict]] = []
         self.manifest: dict = {}
         self.synth_len = synth_len
+        # Wissens-Distillation: Lehrer-Verteilungen je Grundwahrheitsbox (tools/teacher.py).
+        # Gespeichert wird NICHT nach Bildindex, sondern nach Bildnamen - der Lehrer-Cache
+        # ueberspringt Bilder ohne Labeldatei, die Liste hier nicht. Ein Indexvergleich
+        # wuerde also still verrutschen, sobald ein Bild fehlt.
+        self.t_index: dict[str, tuple[int, int]] = {}
+        self.t_logits = None
         p = Path(root)
         if root != "synth" and (p / "manifest.json").exists():
             self.manifest = json.loads((p / "manifest.json").read_text(encoding="utf-8"))
@@ -70,6 +77,35 @@ class SignDataset(torch.utils.data.Dataset):
                     self.items.append((img, lab, e))
         if not self.items:
             self.manifest = {"classes": SIGN_LABELS, "source": "synthetisch (on-the-fly)"}
+        if teacher_dir and self.split == "train" and self.items:
+            self._lehrer_laden(Path(teacher_dir))
+
+    def _lehrer_laden(self, ordner: Path) -> None:
+        """Lehrer-Cache laden und den Bildnamen zuordnen.
+
+        Der Cache haelt (logits, offset): Bild k besitzt die Boxen offset[k]..offset[k+1].
+        Die `ids`-Liste im JSON ist die Bruecke - ueber den Bildnamen, nicht ueber den
+        Index (siehe __init__). Stimmt die Boxzahl eines Bildes nicht mit der Labeldatei
+        ueberein, wird der Eintrag verworfen statt falsch zugeordnet.
+        """
+        pfad = ordner / f"teacher_{self.split}.npz"
+        json_pfad = ordner / f"teacher_{self.split}.json"
+        if not pfad.exists() or not json_pfad.exists():
+            print(f"[lehrer] kein Cache unter {pfad} - Training ohne Distillation")
+            return
+        daten = np.load(pfad)
+        self.t_logits = daten["logits"].astype(np.float32)   # float16 gespeichert (Groesse)
+        offset, ids = daten["offset"], json.loads(json_pfad.read_text(encoding="utf-8"))["ids"]
+        self.t_index = {stem: (int(offset[i]), int(offset[i + 1])) for i, stem in enumerate(ids)}
+        print(f"[lehrer] Cache {pfad.name}: {len(ids)} Bilder, {self.t_logits.shape[0]} Boxen, "
+              f"{self.t_logits.shape[1]} Klassen, Temperatur "
+              f"{json.loads(json_pfad.read_text(encoding='utf-8'))['temperatur']}")
+
+    def lehrer_zeilen(self, i: int) -> tuple[int, int] | None:
+        """(von, bis) in t_logits fuer Bild i - oder None, wenn es keinen Eintrag hat."""
+        if self.t_logits is None or not self.items:
+            return None
+        return self.t_index.get(self.items[i][0].stem)
 
     def __len__(self) -> int:
         return len(self.items) if self.items else self.synth_len
@@ -167,29 +203,58 @@ class SignDataset(torch.utils.data.Dataset):
             if self.zoom and rng.random() < self.zoom:
                 arr, xyxy, labels = self._zoom_sample(arr, xyxy, labels, rng)
         x = torch.from_numpy(np.ascontiguousarray(arr.transpose(2, 0, 1))).float().div_(255.0)
-        return x, torch.from_numpy(np.asarray(xyxy, np.float32)), torch.from_numpy(np.asarray(labels, np.int64))
+        zeilen = self.lehrer_zeilen(i) if self.t_logits is not None else None
+        # Das Augmentieren (Zoom) aendert die Boxliste - die Lehrer-Verteilungen sind an die
+        # urspruenglichen Boxen gebunden und wuerden dann falsch zugeordnet. Bei Zoom wird
+        # dieses Bild deshalb OHNE Distillation gerechnet (nicht mit falscher Zuordnung).
+        if zeilen is not None and len(xyxy) == zeilen[1] - zeilen[0]:
+            lehrer = torch.from_numpy(self.t_logits[zeilen[0]:zeilen[1]])
+        else:
+            lehrer = torch.zeros((0, N_CLASSES), dtype=torch.float32)
+        return (x, torch.from_numpy(np.asarray(xyxy, np.float32)),
+                torch.from_numpy(np.asarray(labels, np.int64)), lehrer)
 
 
 def collate(batch, size: int):
     xs = torch.stack([b[0] for b in batch])
-    targets = {"obj": [], "cls": [], "box": [], "pos": []}
+    targets = {"obj": [], "cls": [], "box": [], "pos": [], "tcls": []}
     for lvl in range(len(dm.LEVELS)):
         g = size // dm.LEVELS[lvl]
         targets["obj"].append(torch.zeros(len(batch), g, g))
         targets["cls"].append(torch.zeros(len(batch), g, g, dtype=torch.long))
         targets["box"].append(torch.zeros(len(batch), g, g, 4))
         targets["pos"].append(torch.zeros(len(batch), g, g, dtype=torch.bool))
+        # Lehrer-Verteilung je ZELLE (Distillation). Der Index ist die Boxnummer des Bildes;
+        # -1 bedeutet "keine" und wird im Verlust verworfen (Zellen mit Hintergrund).
+        targets["tcls"].append(torch.full((len(batch), g, g), -1, dtype=torch.long))
+    # Lehrer-Verteilungen als GEPOLSTERTER Block (B, max_n, C): die Boxzahl ist je Bild
+    # verschieden, und der Zugriff im Verlust laeuft ueber die Boxnummer der Zelle
+    # (targets["tcls"]). Gepolsterte Zeilen werden nie ausgewaehlt - boxidx zeigt immer auf
+    # eine echte Box des Bildes - deshalb braucht es keine Maske, nur den Nullzeilen-Sinn
+    # "keine Lehre".
+    max_n = max((b[3].shape[0] for b in batch), default=0)
+    lehrer = torch.zeros(len(batch), max_n, N_CLASSES)
     meta = []
-    for bi, (_, boxes, labels) in enumerate(batch):
+    for bi, (_, boxes, labels, lb) in enumerate(batch):
         meta.append((boxes, labels))
-        if len(boxes) == 0:
-            continue
-        for lvl, t in enumerate(dm.assign_targets(boxes.numpy(), labels.numpy(), size)):
-            targets["obj"][lvl][bi] = torch.from_numpy(t["obj"])
-            targets["cls"][lvl][bi] = torch.from_numpy(t["cls"])
-            targets["box"][lvl][bi] = torch.from_numpy(t["box"])
-            targets["pos"][lvl][bi] = torch.from_numpy(t["pos"])
-    return xs, targets, meta
+        # ZIELE ZUERST - unabhängig vom Lehrer. (Ein früher `continue` an dieser Stelle hat
+        # vorübergehend die gesamte Zielzuweisung übersprungen: pos blieb 0, der Verlust
+        # bestand nur aus Objektivität. Das darf nicht an einer Distillations-Bedingung hängen.)
+        if len(boxes):
+            for lvl, t in enumerate(dm.assign_targets(boxes.numpy(), labels.numpy(), size)):
+                targets["obj"][lvl][bi] = torch.from_numpy(t["obj"])
+                targets["cls"][lvl][bi] = torch.from_numpy(t["cls"])
+                targets["box"][lvl][bi] = torch.from_numpy(t["box"])
+                targets["pos"][lvl][bi] = torch.from_numpy(t["pos"])
+                idx = torch.from_numpy(t["boxidx"])
+                idx = torch.where(idx < lehrer.shape[1], idx, torch.full_like(idx, -1))
+                targets["tcls"][lvl][bi] = idx
+        # Lehrer-Verteilungen: nur wenn der Cache zu DIESEM Bild passt (gleiche Boxzahl).
+        # Fehlt er oder weicht die Zahl ab, bleiben die Zeilen Null - der Verlust springt sie
+        # ueber (siehe kd_verlust). Lieber keine Lehre als eine verschobene.
+        if lb.shape[0] and lb.shape[0] == len(boxes):
+            lehrer[bi, :lb.shape[0]] = lb
+    return xs, targets, meta, lehrer
 
 
 def class_frequencies(ds, n_klassen: int = N_CLASSES) -> np.ndarray:
@@ -281,6 +346,35 @@ def focal_cross_entropy(logits: torch.Tensor, target: torch.Tensor, gamma: float
     return verlust.sum()
 
 
+def kd_verlust(schueler_logits: torch.Tensor, lehrer_p: torch.Tensor,
+               temperatur: float = 2.0) -> torch.Tensor:
+    """Wissens-Distillation: KL(Lehrer||Schueler) auf den positiven Zellen, Summe.
+
+    Warum als KL gegen die LEHRER-VERTEILUNG und nicht als hartes Ziel: genau darum geht es
+    bei der Distillation. Der Lehrer weiss mehr als die eine wahre Klasse - er kennt die
+    Aehnlichkeiten (40er und 50er Schild sehen fast gleich aus, ein Aufhebungszeichen ist
+    "Tempo ohne Zahl"). Diese Information steckt in den relativen Wahrscheinlichkeiten und
+    geht bei einem harten Ziel verloren.
+
+    Der Faktor T^2 hebt die Verkleinerung der Gradienten durch die Temperatur wieder auf
+    (Hinton u. a., 2015) - ohne ihn waere die Distillation mit T=2 nur ein Viertel so stark
+    wie beabsichtigt, und der Gewichts-Parameter im Rezept bedeutet etwas anderes als er sagt.
+
+    Uebersprungen werden Zeilen, deren Summe 0 ist: das sind Bilder, fuer die kein
+    Lehrer-Cache vorlag (siehe collate). Eine Nullzeile als Ziel waere ein Ziel, das
+    "keine Klasse" behauptet - das waere falsche Lehre.
+    """
+    gueltig = lehrer_p.sum(dim=-1) > 0.0
+    if not bool(gueltig.any()):
+        return torch.zeros((), dtype=torch.float32, device=schueler_logits.device)
+    ziel = lehrer_p[gueltig]
+    # log q: die Wahrscheinlichkeiten des Lehrers sind bereits normiert (Softmax seiner
+    # Logits, marginalisiert) - deshalb nur der Logarithmus, kein erneutes Softmax.
+    log_q = torch.log(ziel.clamp_min(1e-9))
+    log_p = F.log_softmax(schueler_logits[gueltig] / temperatur, dim=-1)
+    return (ziel * (log_q - log_p)).sum() * (temperatur ** 2)
+
+
 class DetLoss(nn.Module):
     """Verlust: Objektivitaet (fokal), Art (fokal, klassengewichtet, geglaettet), Box (L1, groessengewichtet).
 
@@ -305,7 +399,8 @@ class DetLoss(nn.Module):
                  obj_norm: str = "pos", cls_gamma: float = 2.0, cls_alpha: float = 1.0,
                  class_weights: np.ndarray | None = None, hier_aux: float = 0.0,
                  super_of: np.ndarray | None = None,
-                 super_weights: np.ndarray | None = None):
+                 super_weights: np.ndarray | None = None,
+                 distill: float = 0.0, temper: float = 2.0):
         super().__init__()
         self.size, self.alpha, self.gamma = size, alpha, gamma
         self.w_obj, self.w_cls, self.w_box, self.smooth = w_obj, w_cls, w_box, smooth
@@ -324,13 +419,21 @@ class DetLoss(nn.Module):
             np.asarray(super_of, dtype=np.int64))
         self.super_weights = None if super_weights is None else torch.as_tensor(
             np.asarray(super_weights, dtype=np.float32))
+        # Wissens-Distillation: Gewicht des Lehrer-Verlusts und die Temperatur. 0 schaltet
+        # sie ab (dann wird auch kein Lehrer-Block gerechnet, siehe will_kd).
+        self.distill, self.temper = distill, temper
+
+    @property
+    def will_kd(self) -> bool:
+        """Braucht der Verlauf einen Lehrer-Block? (sonst ueberspringt der Lader ihn)"""
+        return self.distill > 0.0
 
     @property
     def will_aux(self) -> bool:
         """Braucht der Verlust den Familien-Ausgang? (dann want_aux=True im Vorwaertslauf)"""
         return self.hier_aux > 0.0 and self.super_of is not None
 
-    def forward(self, preds, targets: dict) -> tuple[torch.Tensor, dict]:
+    def forward(self, preds, targets: dict, lehrer=None) -> tuple[torch.Tensor, dict]:
         # Der hierarchische Verlustlauf liefert ein Paar (Ausgaenge, Familien-Logits);
         # die Auswertung ruft das Netz ohne want_aux und bekommt nur die Ausgaenge.
         familie = None
@@ -339,6 +442,7 @@ class DetLoss(nn.Module):
         zero = torch.zeros((), dtype=torch.float32)
         obj_t, cls_t, box_t = zero, zero.clone(), zero.clone()
         fam_t = zero.clone()
+        kd_t = zero.clone()
         n_pos = 0
         for lvl, p in enumerate(preds):
             t_obj = targets["obj"][lvl]
@@ -373,6 +477,18 @@ class DetLoss(nn.Module):
             wh_px = torch.exp(tb[:, 2:]) * dm.LEVELS[lvl]
             gain = (2.0 - (wh_px[:, 0] * wh_px[:, 1]) / (self.size * self.size)).clamp(0.5, 2.0)
             box_t = box_t + (F.l1_loss(pred, tb, reduction="none").sum(-1) * gain).sum()
+            if lehrer is not None and self.will_kd and "tcls" in targets:
+                # Lehrer-Verteilung DIESER Zelle: tcls haelt die Boxnummer, `lehrer` ist der
+                # gepolsterte Block (B, max_n, C). Der Zugriff laeuft ueber (Bild, Zelle),
+                # nicht ueber die flache Position - sonst wuerde die Zuordnung bei
+                # ungleichen Bildgroessen im Batch verrutschen.
+                b_idx, c_idx = pos.reshape(pos.shape[0], -1).nonzero(as_tuple=True)
+                bnr = targets["tcls"][lvl].reshape(pos.shape[0], -1)[b_idx, c_idx]
+                gueltig = (bnr >= 0) & (bnr < lehrer.shape[1])
+                if bool(gueltig.any()):
+                    kd_t = kd_t + kd_verlust(cls_logits[gueltig], lehrer[b_idx[gueltig],
+                                                                       bnr[gueltig]],
+                                              self.temper)
         n = float(n_pos)
         if self.obj_norm == "sqrt":
             n = math.sqrt(max(n, 1.0))
@@ -381,9 +497,12 @@ class DetLoss(nn.Module):
         # durch alle Zellen. Sonst waeren die wenigen Schilder im Lernschritt verdunnt.
         obj, cls, box = obj_t / n, cls_t / n, box_t / n
         fam = fam_t / n
-        loss = self.w_obj * obj + self.w_cls * cls + self.w_box * box + self.hier_aux * fam
+        kd = kd_t / n
+        loss = (self.w_obj * obj + self.w_cls * cls + self.w_box * box
+                + self.hier_aux * fam + self.distill * kd)
         return loss, {"obj": float(obj.detach()), "cls": float(cls.detach()),
-                      "box": float(box.detach()), "fam": float(fam.detach()), "n_pos": n_pos}
+                      "box": float(box.detach()), "fam": float(fam.detach()),
+                      "kd": float(kd.detach()), "n_pos": n_pos}
 
 
 METRIC_KEYS = ("precision", "recall", "f1", "tp", "fp", "fn", "fp_bild")
@@ -395,7 +514,7 @@ def evaluate(model: nn.Module, loader, conf: float = 0.25, iou: float = 0.5) -> 
     model.eval()
     dev = next(model.parameters()).device
     tp = fp = fn = 0
-    for x, _, meta in loader:
+    for x, _, meta, _ in loader:
         outs = [o.cpu().numpy() for o in model(x.to(dev))]
         for bi in range(x.shape[0]):
             dets = dm.decode_multi([o[bi] for o in outs], dm.LEVELS, conf, iou_thres=0.45)
@@ -443,9 +562,10 @@ def cfg_from_args(args) -> NetCfg:
 
 def make_loader(root: str, size: int, split: str, batch: int, shuffle: bool,
                 n_synth: int, seed: int, degrade: float, workers: int = 0,
-                zoom: float = 0.0, zoom_lo: float = 0.7, zoom_hi: float = 1.5):
+                zoom: float = 0.0, zoom_lo: float = 0.7, zoom_hi: float = 1.5,
+                teacher_dir: str = ""):
     ds = SignDataset(root, size, split, synth_len=n_synth, seed=seed, degrade_prob=degrade,
-                     zoom=zoom, zoom_lo=zoom_lo, zoom_hi=zoom_hi)
+                     zoom=zoom, zoom_lo=zoom_lo, zoom_hi=zoom_hi, teacher_dir=teacher_dir)
     # functools.partial statt lambda: Lambdas sind unter Windows nicht picklebar und
     # lassen den Worker-Start mit EOFError abbrechen.
     return torch.utils.data.DataLoader(
@@ -500,6 +620,15 @@ def main() -> None:
                     help="flacher Klassifikationskopf statt Ober-/Unterkategorien")
     ap.add_argument("--hier-aux", type=float, default=0.3,
                     help="Gewicht des Hilfsverlusts auf der FAMILIE (0 = aus)")
+    ap.add_argument("--teacher", default="", help="Ordner mit dem Lehrer-Cache "
+                    "(tools/teacher.py) - aktiviert die Wissens-Distillation")
+    ap.add_argument("--distill", type=float, default=0.0,
+                    help="Gewicht des Lehrer-Verlusts (KL gegen die Lehrer-Verteilung, mit T^2 "
+                         "skaliert); 0 = aus. Gemessen traegt eine positive Zelle 2-9 bei, "
+                         "waehrend der Klassifikationsverlust bei 0,1-0,3 liegt - deshalb sind "
+                         "kleine Werte richtig (das Rezept nutzt 0,25), nicht 1")
+    ap.add_argument("--temperature", type=float, default=2.0,
+                    help="Temperatur der Distillation (Hinton u. a.; 2 ist der Standardwert)")
     ap.add_argument("--val-split", default="val", choices=["val", "neg"],
                     help="Split fuer die Auswertung; 'neg' ist die Gegenprobe auf Fehlalarme")
     ap.add_argument("--synth-train", type=int, default=400)
@@ -544,9 +673,14 @@ def main() -> None:
                         st[k] = v.to(device)
     model.to(device)
 
+    lehrer_dir = args.teacher if args.distill > 0 else ""
+    if args.distill > 0 and not args.teacher:
+        print("[lehrer] --distill ohne --teacher: Distillation bleibt aus (kein Cache angegeben)")
+    if args.teacher and args.distill <= 0:
+        print("[lehrer] --teacher ohne --distill: Distillation bleibt aus (Gewicht 0)")
     loader, train_ds = make_loader(args.data, args.size, "train", args.batch, True,
                                    args.synth_train, args.seed, args.degrade, args.workers,
-                                   args.zoom, args.zoom_lo, args.zoom_hi)
+                                   args.zoom, args.zoom_lo, args.zoom_hi, lehrer_dir)
     vloader, val_ds = make_loader(args.data, args.size, args.val_split, args.batch, False,
                                   args.synth_val, args.seed + 999, 0.0, args.workers)
 
@@ -577,7 +711,8 @@ def main() -> None:
     crit = DetLoss(size=args.size, w_box=args.box_w, w_cls=args.cls_w, obj_norm=args.obj_norm,
                    cls_gamma=args.focal_gamma, cls_alpha=args.focal_alpha,
                    class_weights=cls_weights, smooth=args.smooth,
-                   hier_aux=hier_aux, super_of=super_of, super_weights=fam_weights)
+                   hier_aux=hier_aux, super_of=super_of, super_weights=fam_weights,
+                   distill=(args.distill if lehrer_dir else 0.0), temper=args.temperature)
     if args.hier_aux > 0 and hier_aux == 0.0:
         print("[hierarchie] Hilfsverlust abgeschaltet - er wirkt nur mit dem "
               "hierarchischen TGADHead (--head tgad ohne --no-hier)")
@@ -592,7 +727,8 @@ def main() -> None:
           f"hier={'aus' if args.no_hier else 'an'} "
           f"cls=fokal(gamma={args.focal_gamma} alpha={args.focal_alpha} "
           f"w={args.cls_w} smooth={args.smooth} gewichte={'an' if cls_weights is not None else 'aus'}) "
-          f"fam-hilfsverlust={hier_aux}"
+          f"fam-hilfsverlust={hier_aux} "
+          f"distill={crit.distill} (T={crit.temper}, cache={'an' if lehrer_dir else 'aus'})"
           + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     history = list(ckpt.get("history", [])) if ckpt else []
@@ -601,13 +737,14 @@ def main() -> None:
     for epoch in range(start_epoch, args.epochs):
         model.train()
         t0, run = time.perf_counter(), None
-        for step, (x, tgt, meta) in enumerate(loader):
+        for step, (x, tgt, meta, lehrer) in enumerate(loader):
             if step >= args.steps:
                 break
             x = x.to(device, non_blocking=True)
             tgt = {k: [t.to(device, non_blocking=True) for t in v] for k, v in tgt.items()}
+            lehrer = lehrer.to(device, non_blocking=True) if crit.will_kd else None
             preds = model.forward_aux(x, want_aux=crit.will_aux)
-            loss, parts = crit(preds, tgt)
+            loss, parts = crit(preds, tgt, lehrer)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
@@ -617,7 +754,7 @@ def main() -> None:
             if step % args.log_every == 0:
                 print(f"  e{epoch} {step:4d}/{args.steps} loss={float(loss.detach()):7.3f} "
                       f"obj={parts['obj']:.3f} cls={parts['cls']:.3f} box={parts['box']:.3f} "
-                      f"fam={parts['fam']:.3f} "
+                      f"fam={parts['fam']:.3f} kd={parts['kd']:.3f} "
                       f"pos={parts['n_pos']} n={len(x)} ({time.perf_counter()-t0:.0f}s)", flush=True)
         # Auswertung ist teuer (jede val-Bild durch das Netz + NMS in numpy): nur alle
         # --eval-every Epochen und immer in der letzten - sonst steht im Log nichts Belastbares.

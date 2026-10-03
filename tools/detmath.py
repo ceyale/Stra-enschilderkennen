@@ -140,8 +140,13 @@ def assign_targets(boxes_xyxy: np.ndarray, labels: np.ndarray, size: int,
             "cls": np.zeros((g, g), dtype=np.int64),
             "box": np.zeros((g, g, 4), dtype=np.float32),
             "pos": np.zeros((g, g), dtype=bool),
+            # Welche BOX (Index in `boxes_xyxy`) diese Zelle traegt, -1 = keine. Braucht nur
+            # die Wissens-Distillation (tools/teacher.py): die Lehrer-Verteilung haengt am
+            # Objekt, nicht an der Klasse - zwei Schilder derselben Klasse koennen eine
+            # verschiedene Verteilung haben, und die Zelle muss ihre eigene bekommen.
+            "boxidx": np.full((g, g), -1, dtype=np.int64),
         })
-    for (x0, y0, x1, y1), lab in zip(boxes, labels):
+    for box_nr, ((x0, y0, x1, y1), lab) in enumerate(zip(boxes, labels)):
         w, h = float(x1 - x0), float(y1 - y0)
         cx, cy = float((x0 + x1) / 2), float((y0 + y1) / 2)
         side = max(w, h)
@@ -171,6 +176,7 @@ def assign_targets(boxes_xyxy: np.ndarray, labels: np.ndarray, size: int,
                 t["pos"][cell_y, cell_x] = True
                 t["obj"][cell_y, cell_x] = 1.0
                 t["cls"][cell_y, cell_x] = lab
+                t["boxidx"][cell_y, cell_x] = box_nr
                 t["box"][cell_y, cell_x] = [
                     np.clip(cx / s - cell_x, 0.0, 0.999), np.clip(cy / s - cell_y, 0.0, 0.999),
                     math.log(max(w / s, 1e-3)), math.log(max(h / s, 1e-3)),

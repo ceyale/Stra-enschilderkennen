@@ -24,7 +24,8 @@ print("GT:", [(b["label"], round((b["cx"] - b["w"] / 2) * size), round((b["cy"] 
                round((b["cx"] + b["w"] / 2) * size), round((b["cy"] + b["h"] / 2) * size)) for b in boxes], tags)
 
 x = torch.from_numpy(np.ascontiguousarray(arr.transpose(2, 0, 1))).float().div(255.0)[None]
-_, tgt, _ = td.collate([(x[0], torch.from_numpy(xyxy), torch.from_numpy(labels))], size)
+_, tgt, _, _ = td.collate([(x[0], torch.from_numpy(xyxy), torch.from_numpy(labels),
+                            torch.zeros((0, len(SIGN_LABELS))))], size)
 
 model = build_model(NetCfg(catm=("p5", "p4")))
 crit = td.DetLoss(size=size)

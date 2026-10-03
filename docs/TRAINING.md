@@ -395,9 +395,64 @@ python tools/train_det.py --data synth --epochs 30 --steps 100 --batch 8   # on-
 python tools/train_det.py --data data/det --size 384 --preset breit \
     --batch 16 --epochs 220 --steps 150 --lr 1.5e-3 --degrade 0.4 --zoom 0.3 \
     --focal-gamma 2 --focal-alpha 0.25 --cls-w 4 --smooth 0.075 --hier-aux 0.3 \
+    --teacher data/teacher --distill 0.25 --temperature 2 \
     --workers 4 --eval-every 10 --save-every 10 \
     --out models/signs-det.pt --seed 7
 ```
+
+### 5.0 Wissens-Distillation (Lehrer)
+
+Warum: der Lauf vom 03.10. hat die **Boxen gelernt und die Arten nicht** –
+Objektivitätsverlust 253 → 0,2, Box 18,7 → 0,4, aber der Klassifikationsverlust blieb bei
+**3,4** (Zufall bei 74 Klassen wäre ln 74 ≈ 4,3). Und 195 von 226 Fehlalarmen lagen auf
+**echten** Schildern mit falscher Klasse (`tools/eval_conditions.py --diagnose`). Genau dort
+setzt der Lehrer an – nicht an der Netzgröße.
+
+| Punkt | Wert |
+|---|---|
+| Lehrer | `vit_gtsign_all_classes` (GTSIGN-220), `google/vit-base-patch16-224` feinjustiert |
+| Größe | 86 Mio. Parameter, 344 MB `model.safetensors` |
+| Klassen | **220 deutsche StVO-Typen** (wir führen 74) |
+| Veröffentlichte Güte | Accuracy **0,973**, P 0,911, R 0,930 (aus `eval_results.json` des Repos) |
+| Zuordnung | über die **StVO-Nummer** – 211 von 220 Klassen zuordenbar, deckt **68 der 74** unserer Klassen |
+| Ohne Lehrer | `tempo110`, `zone20`, `mindestgeschwindigkeit`, `gebotLinks`, `gebotGeradeaus`, `umleitung` |
+| Lizenz | **CC BY-SA 4.0** (GTSIGN-220 → Mapillary) – Herkunft nennen, ShareAlike beachten |
+| Gewicht (Rezept) | **0,25**, Temperatur 2 |
+
+Warum dieser Lehrer und kein auf COCO trainierter Detektor: COCO kennt **eine** Klasse „stop
+sign". Dieser kennt dieselben deutschen Zeichen wie wir, nur feiner unterteilt – deshalb ist
+die Zuordnung ein **Nachschlagen**, keine Vermutung.
+
+```powershell
+# 1. Einmalig: Lehrer-Verteilungen je Grundwahrheitsbox cachen (nur Trainingssplit)
+python tools/teacher.py --data data/det --out data/teacher --split train
+python tools/teacher.py --mapping      # Zuordnung pruefen, ohne Download
+
+# 2. Training mit Distillation (tools/train_det.py --teacher/--distill/--temperature)
+```
+
+Zwei Eigenschaften, die beim Bauen wichtig waren:
+
+* **Marginalisieren statt Maximum.** Mehrere Lehrer-Klassen können auf denselben unserer Typen
+  fallen (Z 205 und Z 208 → beide `vorfahrtGewaehren`). Die Wahrscheinlichkeit unseres Typs ist
+  die **Summe** seiner Feinklassen – sonst summierte sich die Verteilung nicht mehr auf 1 und
+  der KL-Verlust zöge gegen eine zu kleine Masse.
+* **Rand um die Box.** Der Lehrer ist auf Schildausschnitten trainiert; die Box schneidet sonst
+  Achtkant-Ecken und Dreiecksspitzen ab – genau die Formmerkmale, an denen seine Entscheidung
+  hängt. Der Ausschnitt wird deshalb um **25 %** je Seite vergrößert.
+
+**Gewicht gemessen, nicht geraten:** eine positive Zelle trägt KL×T² von **2–9** bei (Prüfung
+mit künstlichem Ziel: **9,02**), der Klassifikationsverlust liegt bei 0,1–0,3, der Box-Verlust
+bei ~5. Faktor **0,25** macht den Lehrer kräftig, aber nicht übermächtig; mit 1,0 hätte er die
+übrigen Verluste überstimmt. Der Faktor **T²** (Hinton u. a. 2015) hebt die Verkleinerung der
+Gradienten durch die Temperatur auf – ohne ihn bedeutete „Distillation mit Gewicht 1" bei T=2
+in Wahrheit ein Viertel davon.
+
+Drei Fallen, die beim Bauen aufgefallen sind (alle in `CHANGELOG.md` 0.7.0 beschrieben):
+das Modell liegt in einem **Dataset**-Repo (`hf_hub_download(..., repo_type="dataset")`),
+das Repo liefert **keine** Bildvorverarbeitung (`preprocessor_config.json` → 404, Ersatz aus
+dem Basismodell), und ein zu früh gesetztes `continue` in `collate()` übersprang die
+Zielzuweisung, sobald kein Cache vorlag.
 
 | Schalter | Wirkung |
 |---|---|
@@ -405,6 +460,9 @@ python tools/train_det.py --data data/det --size 384 --preset breit \
 | **`--head tgad\|plain`** | `tgad` = TGADHead (Standard), `plain` = Vorgängerkopf mit gemeinsamem Stamm |
 | **`--no-hier`** | flacher Klassifikationskopf statt Ober-/Unterkategorien |
 | **`--hier-aux 0…1`** | Gewicht des Hilfsverlusts auf der **Familie** (0 = aus; wirkt nur mit `--head tgad` ohne `--no-hier`) |
+| **`--teacher <ordner>`** | Ordner mit dem Lehrer-Cache (`tools/teacher.py`) – schaltet die Wissens-Distillation ein |
+| **`--distill 0…1`** | Gewicht des Lehrer-Verlusts (KL×T² auf den positiven Zellen). Gemessen trägt eine Zelle 2–9 bei → **0,25** ist richtig, 1,0 überstimmt die übrigen Verluste |
+| **`--temperature`** | Temperatur der Distillation (2 = Standard nach Hinton u. a.) |
 | **`--focal-gamma`** | `γ` des Focal Loss im Klassifikationskopf (0 = reine Kreuzentropie) |
 | **`--focal-alpha`** | konstanter Faktor des Klassifikations-Focal-Loss. Der RetinaNet-Wert 0,25 drosselt den Kopf auf ein Viertel – dann mit `--cls-w 4` ausgleichen |
 | **`--cls-w`** | Gewicht des Klassifikationsverlusts |

@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.7.0 – 2026-10-03
+- **Wissens-Distillation von einem ViT-Lehrer** – der wirksamste Einzelhebel gegen den
+  eigentlichen Fehler des v6-Laufs (Boxen gelernt, Arten nicht: Klassifikationsverlust blieb
+  bei 3,4, Zufall wäre ln 74 ≈ 4,3; 195 von 226 Fehlalarmen lagen auf *echten* Schildern mit
+  falscher Klasse).
+  * **Lehrer:** `vit_gtsign_all_classes` aus dem GTSIGN-220-Datensatz – `google/vit-base-patch16-224`,
+    86 Mio. Parameter, feinjustiert auf **220 deutsche StVO-Klassen**, veröffentlicht mit
+    Accuracy 0,973 / P 0,911 / R 0,930 (Werte aus `eval_results.json` des Repos gelesen, nicht
+    geschätzt). Lizenz **CC BY-SA 4.0** – die Weitergabe-Bedingung steht im Bericht
+    (`kaggle_report.json → lehrer.lizenz`) und in `docs/TRAINING.md`.
+  * **Warum genau dieser Lehrer:** ein auf COCO trainierter Detektor kennt nur „stop sign"
+    (eine Klasse). Dieser kennt dieselben Zeichen wie wir, nur feiner geteilt (220 statt 74) –
+    deshalb ist seine Zuordnung ein **Nachschlagen der StVO-Nummer** und keine Vermutung:
+    **211 von 220** Lehrer-Klassen lassen sich zuordnen, sie decken **68 der 74** unserer
+    Klassen ab. Ohne Lehrer bleiben: `tempo110`, `zone20`, `mindestgeschwindigkeit`,
+    `gebotLinks`, `gebotGeradeaus`, `umleitung`.
+  * **Neu `tools/teacher.py`:** rechnet die Lehrer-Verteilung **einmal je Grundwahrheitsbox**
+    (Ausschnitt +25 % Rand, damit Achtkant-Ecken und Dreiecksspitzen nicht abgeschnitten
+    werden), marginalisiert auf unsere 74 Klassen (Summe der Feinklassen – nicht Maximum, sonst
+    ginge Masse verloren) und legt sie als `data/teacher/teacher_<split>.npz` (+ `.json` mit
+    Modell, Lizenz, Zuordnung) ab. Nur der **Trainings**split – `val`/`neg` bleiben Messlatte.
+  * **Neu `tools/train_det.py --teacher --distill --temperature`:** KL(Lehrer‖Schüler) auf den
+    positiven Zellen, mit **T²** skaliert (Hinton u. a. 2015 – ohne T² wäre die Wirkung bei
+    T=2 nur ein Viertel und die Gewichtsangabe bedeutete etwas anderes als sie sagt). Die
+    Zuordnung Zelle→Box läuft über die neue `boxidx`-Ebene in `tools/detmath.py`, damit zwei
+    Schilder derselben Klasse ihre **eigene** Verteilung bekommen können.
+  * **Gewicht gemessen statt geraten:** eine positive Zelle trägt KL×T² von **2–9** bei
+    (Prüfung mit künstlichem Ziel: 9,02), während der Klassifikationsverlust bei 0,1–0,3 und der
+    Box-Verlust bei ~5 liegt. Deshalb **0,25** und nicht 1,0 – mit 1,0 hätte der Lehrer die
+    übrigen Verluste überstimmt.
+  * **Zwei Fehler dabei gefunden und behoben** (beide vor dem Kaggle-Lauf, mit Nachweis):
+    `ViTForImageClassification.from_pretrained(<repo-URL>)` scheitert, weil das Modell in einem
+    **Dataset**-Repo liegt (`hf_hub_download(repo_type="dataset")` nötig); und das Repo liefert
+    **keine** Bildvorverarbeitung (`preprocessor_config.json` fehlt, 404) – sie kommt jetzt von
+    `google/vit-base-patch16-224` mit festen Werten als letzter Stufe.
+  * **Regression im eigenen Umbau gefunden und behoben:** ein zu früh gesetztes `continue` in
+    `collate()` übersprang die *gesamte* Zielzuweisung, sobald kein Lehrer-Cache vorlag
+    (`pos = 0`). Die Ziele werden jetzt **vor** allem Lehrer-Zeug gesetzt. Beweis:
+    `pos je Stufe [0, 6, 2, 8]`, `obj je Stufe [0.0, 6.0, 2.0, 8.0]`.
+- **Lokale Rezeptprüfung erweitert** (`data/_kernel_probe.py`, Teil 3): sie prüft jetzt auch,
+  dass der Cache gefunden wird, `--teacher/--distill/--temperature` im Trainingsbefehl stehen
+  (und *ohne* Cache nicht), dass das Gewicht im sinnvollen Bereich liegt und jeder Eingabepfad
+  unter `WORK` existiert. Alle drei Teile grün: `alle Pruefungen bestanden`.
+
 ## 0.6.0 – 2026-10-03
 - **Erkennungskopf ersetzt: TGADHead** (`tools/hybrid_net.py`) – aufgabengeführter,
   entkoppelter Kopf aus Zuo, Liu, Chen, Fu, Wang, *„TGADHead: An efficient and accurate
