@@ -169,6 +169,27 @@ def parity_check(model, sess, size: int, n: int = 6, seed: int = 99) -> dict:
     return {"max_tensor_diff": max_diff, "det_ref": n_ref, "det_onnx": n_onnx, "matched_iou95": n_match}
 
 
+def quantize_fp16(src: Path, dst: Path) -> None:
+    """fp16-Fassung schreiben (fuer WebGPU).
+
+    Warum eigene Datei und nicht das fp32: der WebGPU-Treiber rechnet fp16 nativ und laedt
+    halb so viele Bytes. Der WASM-Treiber dagegen kann fp16 NICHT nativ - er rechnet es
+    langsam nach, deshalb ist fp16 dort die falsche Wahl (src/model.js waehlt die Datei
+    deshalb je Ausfuehrungsart, nicht global).
+
+    `keep_io_types=True` laesst Ein- und Ausgang fp32: sonst muesste der Browser seine
+    Eingabetensoren in fp16 liefern (eine weitere Stelle, an der etwas stillschweigend
+    schiefgehen kann) - und die Ausgangskanaele os4/os8/os16/os32 bleiben so wie im
+    uebrigen Code erwartet. Die Umrechnung im Graphen ist ein Cast, also billig.
+    """
+    import onnx
+    from onnxruntime.transformers.float16 import convert_float_to_float16
+
+    modell = onnx.load(str(src))
+    halb = convert_float_to_float16(modell, keep_io_types=True)
+    onnx.save(halb, str(dst))
+
+
 def quantize_int8(src: Path, dst: Path, size: int, n_calib: int, data_dir: str | None = None) -> None:
     """Statische int8-Quantisierung (QDQ) mit Kalibrierbildern.
 
@@ -203,6 +224,9 @@ def main() -> None:
     ap.add_argument("--ckpt", default="models/signs-det.pt")
     ap.add_argument("--out", default="models/signs-det.onnx")
     ap.add_argument("--int8", action="store_true", help="zusaetzlich statisch quantisieren")
+    ap.add_argument("--fp16", action="store_true",
+                    help="zusaetzlich eine fp16-Fassung schreiben (fuer den WebGPU-Treiber; "
+                         "der WASM-Treiber rechnet fp16 nicht nativ)")
     ap.add_argument("--calib-n", type=int, default=8, help="Kalibrierbilder fuer int8 (mehr = besser)")
     ap.add_argument("--calib-data", default="", help="Ordner mit echten Bildern (z.B. data/det) fuer die Kalibrierung")
     ap.add_argument("--parity-n", type=int, default=6)
@@ -292,6 +316,27 @@ def main() -> None:
                   "QuantFormat.QOperator oder fp16 versuchen. Solange bleibt fp32 aktiv.")
             q.unlink(missing_ok=True)
 
+    if args.fp16:
+        # fp16 fuer den WebGPU-Treiber: halb so grosse Datei, native Rechnung. Der
+        # WASM-Treiber kann fp16 nicht nativ - deshalb waehlt src/model.js die Datei je
+        # Ausfuehrungsart und nicht global.
+        h = out_path.with_name(out_path.stem + "-fp16.onnx")
+        quantize_fp16(out_path, h)
+        sess_h = ort_session(h)
+        par_h = parity_check(model, sess_h, size, max(2, args.parity_n // 2))
+        ok_h = par_h["max_tensor_diff"] <= 0.05
+        print(f"[fp16] {h}  {h.stat().st_size/1e6:.2f} MB  "
+              f"max. Tensorabweichung={par_h['max_tensor_diff']:.2e}  "
+              f"Erkennungen matched={par_h['matched_iou95']}/{par_h['det_ref']}  "
+              f"-> {'VERWENDET' if ok_h else 'VERWORFEN (Paritaet zu schlecht)'}")
+        if ok_h:
+            files["fp16"] = h.name
+            files["fp16_bytes"] = h.stat().st_size
+        else:
+            print("[fp16] Hinweis: fp16 haelt die Genauigkeit hier nicht - es bleibt bei fp32. "
+                  "Der WebGPU-Weg verliert damit nur Groesse, nicht Korrektheit.")
+            h.unlink(missing_ok=True)
+
     labels = {"format": "signs-det/1", "classes": SIGN_LABELS, "size": size, "levels": list(dm.LEVELS),
               "channels": dm.N_CH, "layout": f"tx,ty,tw,th,obj,cls0..cls{N_CLASSES - 1}",
               "score": "sigmoid(obj)*max(sigmoid(cls))", "dynamic": bool(args.dynamic),
@@ -318,7 +363,7 @@ def main() -> None:
                 "parity": par, "dynamic": dyn, "ort_cpu_ms": round(ms, 2), "files": files,
                 "dynamic_fallback": ({"grund": grund, "feste_groesse": size} if rueckfall else None),
                 "sha256": {k: sha256(out_path.parent / v) for k, v in files.items()
-                           if k in ("onnx", "int8")},
+                           if k in ("onnx", "int8", "fp16")},
                 "torch": torch.__version__}
     (out_path.parent / "manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")

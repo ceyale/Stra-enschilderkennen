@@ -229,3 +229,65 @@ ist klein, nicht die Dateizahl.
   zu langsam für Live); sinnvoll wäre 2×2 oder nur der Foto-Modus.
 * **Sollen falsch erkannte Typen wichtiger sein als verpasste?** Das steuert, ob wir im
   Kachelmodus die Schwelle hochziehen (weniger Fehlalarme, weniger Treffer).
+
+## 6. Stand 03.10.2026 – hier weitermachen
+
+### Was gerade läuft
+
+Der Kaggle-Kernel `raphbre/schilder-scanner-detektor-trainieren-gtsrb` läuft mit
+`WERKZEUGE_SHA = 2ba80c0` (Rezept: 384 px, TGADHead + Hierarchie, Focal Loss, **Distillation
+mit dem GTSIGN-220-Lehrer**, Gewicht 0,25, T=2, int8 **und** fp16 im Export).
+
+```powershell
+.\kaggle\run.ps1 -Step status    # läuft es?
+.\kaggle\run.ps1 -Step logs      # Protokoll (vorsichtig: überschreibt data\v7log.txt)
+.\kaggle\run.ps1 -Step pull      # wenn COMPLETE
+.\kaggle\run.ps1 -Step install   # Modelle + Fixture übernehmen
+```
+
+**Achtung, gemessene Grenze der Werkzeuge:** `kaggle kernels logs` liefert bei einem
+**laufenden** Kernel über die CLI keine brauchbaren Zeilen (mehrfach 0 Zeilen / Auslassungen);
+der Fortschritt ist nur im Browser unter *View Log* zu sehen. Wer den Log sichern will, muss
+ihn **abholen, solange der Lauf existiert** – ein neuer Push überschreibt den alten Log
+(genau so ist der v7-Log verloren gegangen).
+
+### Woran man den Erfolg erkennt (die Schwellen, die vorher festgelegt wurden)
+
+| Kennzahl im Bericht | v6 (vor der Distillation) | Ziel |
+|---|---|---|
+| Klassifikationsverlust am Ende | **3,4** (Zufall wäre ln 74 ≈ 4,3) | deutlich unter 1,0 |
+| `[ergebnis] val (Messlatte)` F1 | **0,056** (P 0,077 / R 0,044) | ≥ 0,5 |
+| `[ergebnis] neg (Fehlalarme)` | – | FP/Bild kleiner als v6 |
+| `[schwellen]` Optimum | – | conf/NMS aus dem Sweep übernehmen |
+| `[int8]`/`[fp16]` | int8 vorhanden | beide „VERWENDET" |
+
+### Die Reihenfolge der nächsten Schritte
+
+1. **v8 abwarten und auswerten** (Kennzahlen oben). Ist die Klassifikation noch schwach, ist
+   der nächste Hebel **nicht** die Architektur, sondern:
+   * `LEHRER["distill"]` von 0,25 auf 0,5 heben (der Klassifikationsverlust ist noch nicht
+     dort, wo er sein soll), **oder**
+   * **zweiter Lehrer an** (`LEHRER["zweiter"] = True`, siehe §5.0 „Zweiter Lehrer" in
+     `docs/TRAINING.md`): der GTSRB-ViT (MIT, Acc 0,985) wird 0,5/0,5 dazu gemittelt, aber nur
+     bei Boxen, deren Klasse er kennt (36 von 74). Kosten: ein zweiter Durchlauf über den
+     Trainingssplit, +330 MB Download – auf der T4 wenige Minuten.
+   * Erst danach hartes Negativ-Nachschärfen (Riesenboxen auf Anzeigen sind noch offen).
+2. **Kachelmodus in die App** (`src/model.js`/`src/app.js`): Messung steht (§1),
+   Regel „eine Rechnung, zwei Sprachen" beachten.
+3. **Geschwindigkeit im Browser**: WebGPU ist eingebaut, aber **nie auf echter Hardware
+   gemessen** (die Prüfmaschine hat kein `navigator.gpu`). Offen: eine Messseite, die
+   fp16/webgpu gegen int8/wasm gegen fp32 stellt, Web Worker gegen Ruckeln, „Preprocessing im
+   Graphen" als letzte Stufe.
+
+### Lokale Prüfungen (alle grün, ohne Netz und ohne Kaggle lauffähig)
+
+```powershell
+python data\_kernel_probe.py     # Rezept + Pfade + Distillation + Auslieferung (Teile 1–4)
+python data\_teacher_probe.py    # Lehrer-Mittelung: 2 von 4 Boxen, tempo40 unverändert
+node tests\model.test.js         # JS-Mathematik gegen die Python-Ergebnisse
+python tools\selfcheck.py        # überfittet das Netz ein Bild? (dauert)
+```
+
+`data/_teacher_probe.py` und `data/_kernel_probe.py` sind **Prüfskripte**, keine
+Auslieferung – sie liegen in `data/` und nicht in `tools/`, damit `tools/` die Werkzeuge
+bleibt, die der Kaggle-Lauf benutzt.

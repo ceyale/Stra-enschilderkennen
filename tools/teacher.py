@@ -63,6 +63,35 @@ LEHRER_STVO_CSV = "class_descriptions_and_stvo.csv"
 N_LEHRER = 220          # Klassen des Lehrers
 TEMPERATUR = 2.0        # Standard fuer Wissens-Distillation (Hinton u. a.)
 
+# ---------------------------------------------------------------------------
+# Zweiter Lehrer (optional): GTSRB-ViT. Wird mit dem ersten GEMITTELT (je 0,5).
+#
+# Warum ueberhaupt ein zweiter - und warum der erste trotzdem der Hauptlehrer bleibt:
+#
+#                                | Klassen | deckt von unseren 74 | Guete (veroeffentlicht) | Lizenz
+#   vit_gtsign_all_classes       |  220    |        68            | Acc 0,973 / P 0,911     | CC BY-SA 4.0
+#   vit-traffic-sign-GTSRB       |   43    |        36            | Acc 0,985 / F1 0,985    | MIT
+#
+# Auf den ersten Blick ist der GTSRB-ViT der bessere Lehrer: genauere veroeffentlichte Werte,
+# freie Lizenz, und seine Trainingsbilder sind echte Fotos (GTSRB), nicht nur Mapillary. Der
+# entscheidende Punkt ist aber die ABDECKUNG: er kennt nur die 43 GTSRB-Zeichen, also 36
+# unserer 74 Typen - alle uebrigen Tempostufen (5, 10, 40, 90, 110, 130), Zonen, Andreaskreuz,
+# Rad-/Gehwege, Einbahnstrasse, Parken, Autobahn ... kennt er gar nicht. Der GTSIGN-220-Lehrer
+# deckt 68 von 74 ab, weil er nach StVO-Nummer feiner geteilt ist.
+#
+# Deshalb: GTSIGN-220 bleibt der Hauptlehrer. Der GTSRB-ViT kommt als ZWEITER dazu und wird
+# gleichgewichtet gemittelt. Auf den 36 gemeinsamen Klassen entscheidet damit der genauere
+# mit, und fuer die uebrigen 32 gilt allein der Hauptlehrer - die Mittelung verschlechtert
+# dort nichts, weil ein Lehrer, der ein Zeichen nicht kennt, keine Masse beitraegt.
+# Einschalten: tools/teacher.py --zweiter (bzw. LEHRER["zweiter"] im Kaggle-Rezept).
+# ---------------------------------------------------------------------------
+ZWEITLEHRER_REPO = "kelvinandreas/vit-traffic-sign-GTSRB"
+ZWEITLEHRER_NAME = "vit-base-patch16-224-in21k / GTSRB (43 Klassen)"
+ZWEITLEHRER_LIZENZ = "MIT (Kelvin Andreas; feinjustiert von google/vit-base-patch16-224-in21k)"
+ZWEITLEHRER_GUETE = {"accuracy": 0.9846, "precision": 0.9853, "recall": 0.9846, "f1": 0.9846}
+N_ZWEITLEHRER = 43
+ZWEITLEHRER_GEWICHT = 0.5       # Gewicht des zweiten Lehrers in der Mittelung
+
 
 def lehrer_mapping(csv_pfad: Path) -> np.ndarray:
     """Lehrer-Klasse (0..219) -> unsere Klasse (0..73) oder -1.
@@ -85,6 +114,41 @@ def lehrer_mapping(csv_pfad: Path) -> np.ndarray:
         if unser:
             tab[lehrer_id] = signmap.CLASS_ID[unser]
     return tab
+
+
+def zweitlehrer_mapping() -> np.ndarray:
+    """GTSRB-Klasse (0..42) -> unsere Klasse (0..73) oder -1.
+
+    Die Zuordnung steht schon in tools/signmap.py (GTSRB_MAP, Quelle 1) - dort direkt auf
+    unsere NAMEN, nicht ueber die StVO-Nummer. Das ist Absicht: die GTSRB-Namen sind eindeutig
+    englisch, waehrend eine StVO-Zahl hier geraten waere (Z 282 "Ende aller Streckenverbote"
+    gegen Z 280 "Ende des Ueberholverbots" ist genau so ein Fall).
+    """
+    tab = np.full(N_ZWEITLEHRER, -1, dtype=np.int64)
+    for i in range(N_ZWEITLEHRER):
+        name = signmap.label_for_gtsrb(i)
+        if name:
+            tab[i] = signmap.CLASS_ID[name]
+    return tab
+
+
+def zweitlehrer_laden(geraet: str):
+    """Zweiten Lehrer samt Vorverarbeitung laden.
+
+    Anders als beim Hauptlehrer liegt dieser in einem normalen MODELL-Repo - dort gibt es
+    preprocessor_config.json, deshalb genuegt `from_pretrained(repo)` (gemessen: die
+    Dateiliste des Repos enthaelt config.json, model.safetensors, preprocessor_config.json).
+    """
+    from transformers import ViTForImageClassification, ViTImageProcessor
+
+    proc = ViTImageProcessor.from_pretrained(ZWEITLEHRER_REPO)
+    modell = ViTForImageClassification.from_pretrained(ZWEITLEHRER_REPO).to(geraet).eval()
+    return modell, proc
+
+
+def zweitlehrer_klassen(map2: np.ndarray) -> set[int]:
+    """Unsere Klassen, die der zweite Lehrer ueberhaupt kennt (Sonst keine Mittelung)."""
+    return {int(i) for i in map2[map2 >= 0]}
 
 
 def teacher_logits_fuer_boxen(bild_pfad: Path, boxen: list[list[float]], modell, processor,
@@ -187,8 +251,15 @@ def lehrer_laden(geraet: str):
 
 
 def cache_bauen(data: Path, out: Path, split: str, geraet: str = "auto",
-                limit: int = 0, csv_pfad: str = "") -> dict:
-    """Lehrer-Cache fuer einen Split bauen (einmalig, im Training nur noch laden)."""
+                limit: int = 0, csv_pfad: str = "", zweiter: bool = False) -> dict:
+    """Lehrer-Cache fuer einen Split bauen (einmalig, im Training nur noch laden).
+
+    `zweiter=True` mittelt den GTSRB-ViT dazu - aber NUR fuer Boxen, deren Grundwahrheit er
+    ueberhaupt kennt (36 unserer 74 Typen). Warum so eng: ein Lehrer, der ein Zeichen nicht
+    kennt, antwortet trotzdem - er sagt dann z. B. bei "tempo40" (kennt er nicht) "tempo30".
+    Ungefiltert gemittelt wuerde er damit Falsches in den Cache schreiben. Mit dem Filter
+    kann er nur dort mitreden, wo er recht haben KANN.
+    """
     import torch
 
     mapping = lehrer_mapping(stvo_csv(csv_pfad))
@@ -203,6 +274,18 @@ def cache_bauen(data: Path, out: Path, split: str, geraet: str = "auto",
     processor = bild_prozessor()
     modell = lehrer_laden(geraet)
 
+    map2 = None
+    modell2 = proc2 = None
+    bekannt2: set[int] = set()
+    if zweiter:
+        map2 = zweitlehrer_mapping()
+        bekannt2 = zweitlehrer_klassen(map2)
+        print(f"[lehrer] zweiter: {ZWEITLEHRER_NAME} (Gewicht {ZWEITLEHRER_GEWICHT})")
+        print(f"[lehrer] zweiter: Lizenz {ZWEITLEHRER_LIZENZ}")
+        print(f"[lehrer] zweiter: {len(bekannt2)} unserer Klassen mitgemittelt - "
+              f"nur wo er das Zeichen kennt")
+        modell2, proc2 = zweitlehrer_laden(geraet)
+
     manifest = json.loads((data / "manifest.json").read_text(encoding="utf-8"))
     eintraege = [e for e in manifest["images"] if e.get("split", "train") == split]
     if limit:
@@ -210,25 +293,39 @@ def cache_bauen(data: Path, out: Path, split: str, geraet: str = "auto",
     ids: list[str] = []
     zaehler: list[int] = []
     bloecke: list[np.ndarray] = []
+    zweit_zahlen: list[tuple[int, int]] = []      # (gemittelte Boxen, Boxen) je Bild
     for nr, e in enumerate(eintraege, 1):
         stem = e["id"]
         lab, bild = data / "labels" / f"{stem}.txt", data / "images" / f"{stem}.jpg"
         if not lab.exists() or not bild.exists():
             continue
         h, w = e.get("height", 0), e.get("width", 0)
-        boxen = []
+        boxen, gt_klassen = [], []
         for zeile in lab.read_text(encoding="utf-8").splitlines():
             t = zeile.split()
             if len(t) < 5:
                 continue
             _, cx, cy, bw, bh = (float(v) for v in t[:5])
+            # Klassenindex steht in Spalte 0 (YOLO-Format "cls cx cy w h" - genauso liest es
+            # tools/train_det.py). Er wird NUR fuer den Filter gebraucht (kennt der zweite
+            # Lehrer dieses Zeichen?), NICHT als Lernziel - das bleibt die Lehrer-Verteilung.
+            gt_klassen.append(int(float(t[0])))
             boxen.append([(cx - bw / 2) * w, (cy - bh / 2) * h,
                           (cx + bw / 2) * w, (cy + bh / 2) * h])
         ids.append(stem)
         zaehler.append(len(boxen))
         if boxen:
-            bloecke.append(teacher_logits_fuer_boxen(bild, boxen, modell, processor,
-                                                     mapping, geraet))
+            p = teacher_logits_fuer_boxen(bild, boxen, modell, processor, mapping, geraet)
+            if modell2 is not None:
+                p2 = teacher_logits_fuer_boxen(bild, boxen, modell2, proc2, map2, geraet)
+                w2 = ZWEITLEHRER_GEWICHT
+                gemittelt = 0
+                for j, gt in enumerate(gt_klassen):
+                    if gt in bekannt2:
+                        p[j] = (1.0 - w2) * p[j] + w2 * p2[j]
+                        gemittelt += 1
+                zweit_zahlen.append((gemittelt, len(boxen)))
+            bloecke.append(p)
         if nr % 2000 == 0:
             print(f"[lehrer]   {nr}/{len(eintraege)}", flush=True)
 
@@ -243,11 +340,23 @@ def cache_bauen(data: Path, out: Path, split: str, geraet: str = "auto",
         "guete_veroeffentlicht": LEHRER_GUETE, "temperatur": TEMPERATUR,
         "klassen_lehrer": N_LEHRER, "klassen_schueler": signmap.N_LABELS,
         "zuordnung_lehrer_zu_schueler": mapping.tolist(),
+        # Zweiter Lehrer (mittelte mit) - samt Gewicht und der Zahl der Boxen, die er
+        # ueberhaupt bewerten durfte. Ohne diese Zahl waere spaeter nicht nachvollziehbar,
+        # wie viel vom Cache wirklich aus zwei Lehrern stammt.
+        "zweiter": (None if map2 is None else {
+            "name": ZWEITLEHRER_NAME, "repo": ZWEITLEHRER_REPO, "lizenz": ZWEITLEHRER_LIZENZ,
+            "guete_veroeffentlicht": ZWEITLEHRER_GUETE, "gewicht": ZWEITLEHRER_GEWICHT,
+            "klassen": N_ZWEITLEHRER, "bekannte_klassen": sorted(bekannt2),
+            "zuordnung_zweiter_zu_schueler": map2.tolist(),
+            "boxen_gemittelt": int(sum(a for a, _ in zweit_zahlen)),
+            "boxen_gesamt": int(sum(b for _, b in zweit_zahlen)),
+        }),
         "ids": ids, "boxen_gesamt": int(sum(zaehler)), "bilder": len(ids),
         "hinweis": "Reihenfolge der Boxen = Reihenfolge der Zeilen der Labeldatei",
     }, indent=2, ensure_ascii=False), encoding="utf-8")
     return {"bilder": len(ids), "boxen": int(sum(zaehler)),
-            "klassen_belegt": int(len(set(mapping[mapping >= 0].tolist())))}
+            "klassen_belegt": int(len(set(mapping[mapping >= 0].tolist()))),
+            "zweit_boxen": int(sum(a for a, _ in zweit_zahlen))}
 
 
 def main() -> None:
@@ -258,12 +367,15 @@ def main() -> None:
     ap.add_argument("--split", nargs="+", default=["train"])
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     ap.add_argument("--limit", type=int, default=0, help="nur die ersten N Bilder (Test)")
+    ap.add_argument("--zweiter", action="store_true",
+                    help="den GTSRB-ViT dazu mitteln (nur wo er das Zeichen kennt)")
     ap.add_argument("--mapping", action="store_true", help="nur die Zuordnung zeigen")
     args = ap.parse_args()
 
     if args.mapping:
         mapping = lehrer_mapping(stvo_csv(args.csv))
-        print(f"[zuordnung] {(mapping >= 0).sum()} von {N_LEHRER} Lehrer-Klassen zugeordnet")
+        print(f"[zuordnung] Hauptlehrer: {(mapping >= 0).sum()} von {N_LEHRER} Klassen "
+              f"zugeordnet ({LEHRER_NAME})")
         for unser_idx in range(signmap.N_LABELS):
             lehrer = [i for i in range(N_LEHRER) if mapping[i] == unser_idx]
             if lehrer:
@@ -272,13 +384,27 @@ def main() -> None:
         leer = [signmap.LABELS[i] for i in range(signmap.N_LABELS)
                 if not (mapping == i).any()]
         print(f"[zuordnung] ohne Lehrer: {leer if leer else 'keine'}")
+
+        map2 = zweitlehrer_mapping()
+        bekannt = zweitlehrer_klassen(map2)
+        print(f"[zuordnung] Zweitlehrer: {(map2 >= 0).sum()} von {N_ZWEITLEHRER} Klassen "
+              f"zugeordnet ({ZWEITLEHRER_NAME})")
+        for unser_idx in range(signmap.N_LABELS):
+            gtsrb = [i for i in range(N_ZWEITLEHRER) if map2[i] == unser_idx]
+            if gtsrb:
+                print(f"  {signmap.LABELS[unser_idx]:26s} <- {gtsrb}")
+        print(f"[zuordnung] Zweitlehrer deckt {len(bekannt)} unserer {signmap.N_LABELS} "
+              f"ab; ohne ihn bleibt der Hauptlehrer allein")
         return
 
     for split in args.split:
         info = cache_bauen(Path(args.data), Path(args.out), split, args.device, args.limit,
-                           args.csv)
+                           args.csv, args.zweiter)
         print(f"[lehrer] {split}: {info['bilder']} Bilder, {info['boxen']} Boxen, "
               f"{info['klassen_belegt']} unserer Klassen belegt")
+        if args.zweiter:
+            print(f"[lehrer] {split}: zweiter Lehrer bei {info['zweit_boxen']} von "
+                  f"{info['boxen']} Boxen mitgemittelt")
 
 
 if __name__ == "__main__":

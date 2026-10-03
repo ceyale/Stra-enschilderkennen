@@ -426,6 +426,7 @@ die Zuordnung ein **Nachschlagen**, keine Vermutung.
 ```powershell
 # 1. Einmalig: Lehrer-Verteilungen je Grundwahrheitsbox cachen (nur Trainingssplit)
 python tools/teacher.py --data data/det --out data/teacher --split train
+python tools/teacher.py --data data/det --out data/teacher --split train --zweiter  # + GTSRB-ViT
 python tools/teacher.py --mapping      # Zuordnung pruefen, ohne Download
 
 # 2. Training mit Distillation (tools/train_det.py --teacher/--distill/--temperature)
@@ -453,6 +454,35 @@ das Modell liegt in einem **Dataset**-Repo (`hf_hub_download(..., repo_type="dat
 das Repo liefert **keine** Bildvorverarbeitung (`preprocessor_config.json` → 404, Ersatz aus
 dem Basismodell), und ein zu früh gesetztes `continue` in `collate()` übersprang die
 Zielzuweisung, sobald kein Cache vorlag.
+
+#### Zweiter Lehrer: der GTSRB-ViT (optional, `--zweiter`)
+
+Auf den ersten Blick ist ein reiner GTSRB-Lehrer der bessere Lehrer – genauere veröffentlichte
+Werte, freie Lizenz, und seine Bilder sind echte Fotos statt Mapillary. Er scheitert aber an
+der **Abdeckung**: GTSRB hat 43 Klassen.
+
+| | Klassen | deckt von unseren 74 | veröffentlichte Güte | Lizenz |
+|---|---|---|---|---|
+| `vit_gtsign_all_classes` (Hauptlehrer) | 220 | **68** | Acc 0,973 / P 0,911 / R 0,930 | CC BY-SA 4.0 |
+| `kelvinandreas/vit-traffic-sign-GTSRB` | 43 | **36** | Acc 0,985 / P 0,985 / F1 0,985 | **MIT** |
+
+Ohne den GTSRB-Lehrer bleiben 38 Typen – darunter `tempo5/10/40/90/110/130`, `zone20`,
+`zone30`, `andreaskreuz`, `radweg`, `gehweg`, `einbahnstrasse`, `parken`, `autobahn` und
+`sackgasse`. Deshalb bleibt **GTSIGN-220 der Hauptlehrer**, und der GTSRB-ViT kommt als
+**zweiter, gleichgewichtet gemittelt** (0,5/0,5) dazu.
+
+Die Mittelung ist dabei **gefiltert** – und das ist keine Feinheit, sondern der Unterschied
+zwischen Nutzen und Schaden: ein Lehrer, der ein Zeichen nicht kennt, antwortet trotzdem. Beim
+Zeichen „tempo40" (kennt er nicht) sagt er „tempo30" – ungefiltert gemittelt schriebe er damit
+ein **bekannt falsches Lernziel** in den Cache. Mitgemittelt wird er deshalb nur bei Boxen,
+deren **Grundwahrheitsklasse** zu seinen 36 gehört (die Klasse steht in Spalte 0 der
+Labeldatei und dient hier nur als Filter, nicht als Lernziel). Die Begleitdatei hält die Zahl
+fest (`zweiter.boxen_gemittelt`), das Protokoll des Kaggle-Laufs druckt sie.
+
+Nachgeprüft in `data/_teacher_probe.py` (ohne Netz, Lehrer durch feste Zahlen ersetzt): bei
+2 von 4 Boxen gemittelt, `tempo50` → 0,5·0,8 + 0,5·0,9 auf `tempo30`, `tempo40` unverändert.
+Beide Lizenzen sind bei einer Veröffentlichung zu nennen – der Lauf warnt selbst davor, sobald
+zwei Lehrer im Cache stecken.
 
 | Schalter | Wirkung |
 |---|---|
@@ -724,7 +754,7 @@ Fällt dieser Test unter IoU 0,5, ist etwas an Zuweisung oder Dekodierung kaputt
 ## 6. Export, Paritätscheck, Quantisierung
 
 ```
-python tools/export_onnx.py --ckpt models/signs-det.pt --out models/signs-det.onnx --dynamic --int8 --calib-n 200
+python tools/export_onnx.py --ckpt models/signs-det.pt --out models/signs-det.onnx --dynamic --int8 --fp16 --calib-n 200
 python tools/export_fixture.py --ckpt models/signs-det.pt        # Testfixture für tests/model.test.js
 ```
 
@@ -766,6 +796,14 @@ quantisierungsfreundlich umbauen (die Warnungen des Quantisierers zeigen genau d
 
 Warum das wichtig ist: Größe und Latenz sind verlockend (1,47 MB statt 5,23 MB), aber
 ein stillschweigend verschlechtertes Modell wäre im Feld schwer zu finden.
+
+**fp16 ist die Fassung für WebGPU** (`--fp16`, seit 0.8.0). Gemessen am aktuellen Artefakt
+(`models/signs-det.onnx`, 320 px, 5,23 MB): fp16 sind **2,66 MB**, Ein- und Ausgänge bleiben
+fp32 (`keep_io_types`, damit der Browser seine Tensoren nicht selbst umrechnen muss), maximale
+Tensorabweichung **8,9 · 10⁻³**. Auf derselben Maschine ist die fp16-Datei in ONNX Runtime CPU
+langsamer (11,6 gegen 8,3 ms) – deshalb wird sie **nicht** als Ersatz ausgeliefert, sondern
+`src/model.js` probiert sie **nur, wenn `navigator.gpu` existiert** und der Grafiktreiber sie
+nativ rechnen kann. Der WASM-Weg bleibt bei int8 (2,7 MB, schneller) und fällt sonst auf fp32.
 
 ## 7. Browser-Seite
 

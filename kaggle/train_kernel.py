@@ -166,6 +166,13 @@ LEHRER = dict(
                               # kraeftiges, aber nicht uebermaechtiges Signal - mit 1,0
                               # haette er die uebrigen Verluste ueberstimmt.
     temperature=2.0,
+    # Zweiter Lehrer (GTSRB-ViT, MIT) dazu mitteln - tools/teacher.py --zweiter. Er kennt nur
+    # 36 unserer 74 Typen, wird deshalb auch nur bei Boxen mitgemittelt, deren Zeichen er
+    # kennt. Standard AUS: erst muss der Hauptlehrer allein wirken (v8/v9 vergleichbar), und
+    # ein zweites 86-Mio.-Modell verdoppelt die Cachedauer (344 + 330 MB Download, zwei
+    # Durchlaeufe ueber 400 000 Ausschnitte). Einschalten, wenn die Zahlen des Hauptlehrers
+    # stehen - dann ist der Vergleich sauber.
+    zweiter=False,
     limit=0,                # 0 = alle Bilder; >0 nur zum Testen
 )
 # int8-Quantisierung: QDQ mit Kalibrierung auf den ECHTEN Bildern des Datensatzes - die
@@ -487,6 +494,8 @@ def lehrer_cache(p: Protokoll, roh: Path, hat_tr: bool) -> bool:
         return False
     args = ["--data", "data/det", "--out", "data/teacher", "--split", l["split"],
             "--csv", str(csv)]
+    if l.get("zweiter"):
+        args.append("--zweiter")
     if l["limit"]:
         args += ["--limit", str(l["limit"])]
     lauf(p, python("tools/teacher.py", *args),
@@ -497,6 +506,27 @@ def lehrer_cache(p: Protokoll, roh: Path, hat_tr: bool) -> bool:
     da = (WORK / "data" / "teacher" / f"teacher_{l['split']}.npz").exists()
     p.zeile(f"[lehrer] Cache {'bereit' if da else 'FEHLT'} "
             f"(data/teacher/teacher_{l['split']}.npz)")
+    if da:
+        # Was im Cache steckt, wird aus der Begleitdatei gelesen und GEDRUCKT - damit im
+        # Protokoll steht, ob wirklich ein Lehrer oder zwei gemittelt haben (das Rezept allein
+        # belegt das nicht).
+        try:
+            kopf = json.loads((WORK / "data" / "teacher" / f"teacher_{l['split']}.json")
+                              .read_text(encoding="utf-8"))
+            p.zeile(f"[lehrer] {kopf.get('lehrer')}: {kopf.get('bilder')} Bilder, "
+                    f"{kopf.get('boxen_gesamt')} Boxen, "
+                    f"{len(kopf.get('zuordnung_lehrer_zu_schueler', []))} Lehrer-Klassen")
+            zweit = kopf.get("zweiter")
+            if zweit:
+                p.zeile(f"[lehrer] zweiter: {zweit.get('name')} - Gewicht "
+                        f"{zweit.get('gewicht')} bei {zweit.get('boxen_gemittelt')} von "
+                        f"{zweit.get('boxen_gesamt')} Boxen "
+                        f"({len(zweit.get('bekannte_klassen', []))} Klassen)")
+                p.zeile(f"[lizenz] {zweit.get('lizenz')}")
+                p.zeile("[warnung] zwei Lehrer: das Schuelermodell ist eine Ableitung BEIDER "
+                        "Lehrer - beide Lizenzen sind bei einer Veroeffentlichung zu nennen")
+        except Exception as fehler:
+            p.zeile(f"[lehrer] Begleitdatei nicht lesbar ({type(fehler).__name__})")
     return da
 
 
@@ -1332,13 +1362,17 @@ def exportieren(p: Protokoll) -> float:
 
     Das int8-Modell ist das, was ausgeliefert wird (src/model.js nimmt labels.files.int8 zuerst).
     Gemessen an einem Pruefmodell: 8,75 MB -> 2,67 MB (-69 %), max. Tensorabweichung 1,06e-02.
+
+    --fp16 schreibt zusaetzlich eine halbe Fassung fuer den WebGPU-Weg (src/model.js nimmt sie
+    NUR dort, weil der WASM-Treiber fp16 nicht nativ rechnet). Sie kostet ein paar Sekunden
+    Umrechnung und wird - wie int8 - selbst verworfen, wenn die Paritaet nicht haelt.
     """
     q = QUANT
     return lauf(p, python("tools/export_onnx.py", "--ckpt", "models/signs-det.pt",
                           "--out", "models/signs-det.onnx", "--dynamic",
-                          "--int8", "--calib-data", q["calib_data"],
+                          "--int8", "--fp16", "--calib-data", q["calib_data"],
                           "--calib-n", str(q["n_calib"])),
-                "Export nach ONNX (dynamische Hoehe/Breite) + int8", fatal=False)
+                "Export nach ONNX (dynamische Hoehe/Breite) + int8/fp16", fatal=False)
 
 
 def auswerten(p: Protokoll, ein: dict, mit_fixture: bool = True) -> dict:
@@ -1540,8 +1574,9 @@ def main() -> None:
                     f"F1={daten['f1']:.3f}  tp={daten['tp']} fp={daten['fp']} fn={daten['fn']}")
     p.zeile(f"[ergebnis] Modell: models/signs-det.onnx "
             f"{report['modelldateien'].get('signs-det.onnx', 0)/1e6:.2f} MB, "
-            f"int8 {report['modelldateien'].get('signs-det-int8.onnx', 0)/1e6:.2f} MB "
-            f"(das liefert der Browser aus), "
+            f"int8 {report['modelldateien'].get('signs-det-int8.onnx', 0)/1e6:.2f} MB, "
+            f"fp16 {report['modelldateien'].get('signs-det-fp16.onnx', 0)/1e6:.2f} MB "
+            f"(der Browser nimmt int8, mit WebGPU fp16 - sonst fp32), "
             f"Checkpoint {report['modelldateien'].get('signs-det.pt', 0)/1e6:.1f} MB")
     if report.get("lehrer"):
         lr = report["lehrer"]

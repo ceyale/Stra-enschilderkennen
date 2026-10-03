@@ -44,8 +44,15 @@ deutschen StVO-Klassen, veröffentlicht mit Accuracy 0,973) gibt je Schild eine 
 Verteilung vor, die das kleine Netz zusätzlich zur harten Klasse nachbilden muss – genau gegen
 den Fehler des v6-Laufs, in dem die Boxen saßen, die Arten aber nicht. Der Lehrer läuft dabei
 **einmal** über die Trainingsboxen (`tools/teacher.py`, Ergebnis als Cache), nicht in jedem
-Lernschritt. Herkunft und Lizenz (**CC BY-SA 4.0**) stehen in
+Lernschritt. Auf Wunsch mittelt ein **zweiter Lehrer** mit – der GTSRB-ViT
+(`kelvinandreas/vit-traffic-sign-GTSRB`, 43 Klassen, Acc 0,985, **MIT**) –, aber nur bei
+Boxen, deren Zeichen er überhaupt kennt (36 der 74); ein Lehrer, der „tempo40" nicht kennt,
+schriebe sonst „tempo30" als Lernziel in den Cache. Herkunft und Lizenzen stehen in
 [`docs/TRAINING.md` §5.0](docs/TRAINING.md).
+
+Ausgeliefert werden drei Fassungen derselben Gewichte: **INT8** (2,7 MB, WASM-Weg),
+**FP16** (2,7 MB, nur für den WebGPU-Treiber – der WASM-Treiber rechnet fp16 nicht nativ)
+und **FP32** als Rückfall; `src/model.js` wählt sie nach der Ausführungsart des Geräts.
 
 **Aktueller Stand (gemessen, `docs/TRAINING.md` §5):** 1 300 360 Parameter, 878 MFLOPs,
 5,23 MB ONNX – auf 2 000 Validierungsbildern **P = 0,883 / R = 0,796 / F1 = 0,837**,

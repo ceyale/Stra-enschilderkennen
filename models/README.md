@@ -5,9 +5,16 @@ absichtlich nicht im Git (siehe `.gitignore`).
 
 | Datei | erzeugt von | gelesen von |
 |---|---|---|
-| `signs-det.onnx` (oder `signs-det-int8.onnx`) | `tools/export_onnx.py` | `src/model.js` |
-| `labels.json` | `tools/export_onnx.py` | `src/model.js` (Klassen, Eingabegröße, Stufen) |
+| `signs-det.onnx` (fp32) | `tools/export_onnx.py` | `src/model.js` (Rückfall) |
+| `signs-det-int8.onnx` | `tools/export_onnx.py --int8` | `src/model.js` (WASM-Weg) |
+| `signs-det-fp16.onnx` | `tools/export_onnx.py --fp16` | `src/model.js` (**nur** mit WebGPU) |
+| `labels.json` | `tools/export_onnx.py` | `src/model.js` (Klassen, Eingabegröße, Stufen, `files`) |
 | `manifest.json` | `tools/export_onnx.py` | Menschen (Metriken, Parität, sha256) |
+
+Welche Fassung geladen wird, steht in `labels.json → files` und entscheidet sich im Browser
+nach der Ausführungsart: mit `navigator.gpu` zuerst fp16, dann int8, dann fp32; ohne WebGPU
+int8, dann fp32. Fehlt eine Datei, wird die nächste probiert – die Seite läuft weiter.
+`src/model.js` zeigt im Status, was wirklich läuft (`fp16 webgpu`, `int8 wasm ×4`, …).
 
 Fehlen diese Dateien, läuft die App im **Heuristik-Modus** (`src/detector.js`) und zeigt
 das im Status an – sie bricht nicht.

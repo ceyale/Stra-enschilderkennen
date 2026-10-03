@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.8.0 – 2026-10-03
+- **fp16 für WebGPU** (`tools/export_onnx.py --fp16`, im Kaggle-Lauf jetzt mitgeschaltet):
+  halbe Datei für den Weg, der sie nativ rechnen kann. Gemessen am Artefakt (320 px, fp32
+  5,23 MB): fp16 **2,66 MB**, Ein-/Ausgänge bleiben **fp32** (`keep_io_types` – der Browser
+  muss seine Tensoren nicht umrechnen, und die Kanalverträge `os4/os8/os16/os32` bleiben wie
+  erwartet), maximale Tensorabweichung **8,9 · 10⁻³**. Auf ONNX Runtime **CPU** ist fp16
+  langsamer (11,6 gegen 8,3 ms) – genau deshalb wird sie nicht als Ersatz ausgeliefert.
+  Wie bei int8 gilt das **Qualitätstor**: hält die Parität nicht, wird die Datei verworfen
+  und im Log steht der Grund. `models/labels.json`/`manifest.json` führen sie in `files`
+  (mit sha256); `kaggle/train_kernel.py` meldet ihre Größe im Ergebnis.
+- **`src/model.js` wählt die Fassung nach der Ausführungsart, nicht global** – die
+  Reihenfolge ist jetzt begründet und getestet statt „Hauptsache irgendein Rückfall":
+  mit `navigator.gpu` zuerst **fp16/webgpu**, dann **int8**, dann **fp32**; ohne WebGPU
+  direkt **int8 → fp32**. Der Status zeigt den Klartext (`fp16 webgpu`, `int8 wasm ×4`, …).
+- **Zweiter Lehrer (optional): `kelvinandreas/vit-traffic-sign-GTSRB`** – der GTSRB-ViT
+  (43 Klassen, Acc 0,985 / F1 0,985, **MIT**) ist auf seinen Klassen genauer als der
+  Hauptlehrer, deckt aber nur **36 unserer 74** Typen ab (GTSIGN-220: 68). Er bleibt deshalb
+  zweiter Lehrer und wird **0,5/0,5 gemittelt – gefiltert**: nur bei Boxen, deren
+  **Grundwahrheitsklasse** zu seinen 36 gehört. Ungefiltert schriebe ein Lehrer, der
+  „tempo40" nicht kennt, seine Meinung „tempo30" als Lernziel in den Cache.
+  Nachgewiesen in `data/_teacher_probe.py` (Lehrer durch feste Zahlen ersetzt, ohne Netz):
+  2 von 4 Boxen gemittelt, `tempo50` → 0,5·0,8 + 0,5·0,9, `tempo40` unverändert.
+  Rezeptschalter `LEHRER["zweiter"]` (Standard **aus**: erst muss der Hauptlehrer allein
+  messbar wirken; ein zweites 86-Mio.-Modell verdoppelt außerdem die Cachedauer).
+  Lizenz-Hinweis: bei zwei Lehrern sind **beide** Lizenzen zu nennen – der Lauf warnt selbst.
+- **Rezeptprüfung erweitert** (`data/_kernel_probe.py`, Teil 4): der Exportbefehl muss
+  `--int8` **und** `--fp16` tragen, `tools/export_onnx.py` muss beide Flags kennen (ein
+  unbekanntes Flag beendet argparse mit Code 2 – der Lauf hätte danach kein Modell) und
+  `src/model.js` muss beide Fassungen auch **laden** (sonst liegt eine Datei im Ordner, die
+  niemand benutzt). Alle vier Teile grün.
+- **Zwei stille Fehler dabei gefunden** (beide von den neuen Prüfungen aufgedeckt, nicht im
+  Feld): das Klassenfeld der Labeldatei steht in **Spalte 0** (`cls cx cy w h`), nicht ab
+  Spalte 5 – die Filterung hätte sonst nie gegriffen; und der Cache wird als **float16**
+  gespeichert, weshalb ein Vergleich „0,8 exakt" fehlschlägt (0,79980…) – die Prüfung
+  vergleicht jetzt mit passender Toleranz.
+
 ## 0.7.0 – 2026-10-03
 - **Wissens-Distillation von einem ViT-Lehrer** – der wirksamste Einzelhebel gegen den
   eigentlichen Fehler des v6-Laufs (Boxen gelernt, Arten nicht: Klassifikationsverlust blieb

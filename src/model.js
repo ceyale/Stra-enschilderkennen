@@ -154,36 +154,49 @@
     ort.env.wasm.numThreads = faeden;
     if (o.wasmPaths && ort.env.wasm) ort.env.wasm.wasmPaths = o.wasmPaths;
 
-    // Zuerst das quantisierte Modell (int8): gemessen 2,67 MB gegen 8,75 MB und auf schwachen
-    // Geraeten deutlich schneller. Scheitert es - etwa weil eine Laufzeitumgebung die
-    // QDQ-Operationen nicht kennt -, wird auf fp32 zurueckgefallen. Ein fehlendes int8 darf
-    // die Seite nicht lahmlegen, und welche Fassung laeuft, steht im Status.
-    const dateien = [];
+    // Zu ladenen Dateien, in dieser Reihenfolge. Die Reihenfolge ist eine Entscheidung und
+    // deshalb begruendet (nicht "irgendein Rueckfall"):
+    //   * fp16 ist NUR mit WebGPU sinnvoll: der Treiber rechnet fp16 nativ und laedt halb so
+    //     viele Bytes. Der WASM-Treiber kennt fp16 nicht und rechnet es langsam nach - dort
+    //     waere es die schlechteste Wahl.
+    //   * int8 ist die kleinste Datei (2,7 gegen 8,75 MB) und auf beiden Wegen schnell.
+    //   * fp32 ist der Rueckfall, der ohne Zusatz immer geht.
+    // Scheitert eine Fassung (etwa weil eine Laufzeitumgebung die QDQ-Operationen nicht kennt),
+    // wird die naechste versucht. Ein fehlendes int8/fp16 darf die Seite nicht lahmlegen, und
+    // welche Fassung laeuft, steht im Status.
+    const webgpuDa = !!(root.navigator && root.navigator.gpu);
+    const kandidaten = [];      // [Datei, Anzeigename, Ausfuehrungsarten]
+    const dazu = (schluessel, name, eps) => {
+      if (labels.files && labels.files[schluessel]) {
+        kandidaten.push(['models/' + labels.files[schluessel], name, eps]);
+      }
+    };
     if (o.modelUrl) {
-      dateien.push(o.modelUrl);
+      kandidaten.push([o.modelUrl, 'eigene Datei', webgpuDa ? ['webgpu', 'wasm'] : ['wasm']]);
     } else {
-      if (labels.files.int8) dateien.push('models/' + labels.files.int8);
-      if (labels.files.onnx) dateien.push('models/' + labels.files.onnx);
+      if (webgpuDa) dazu('fp16', 'fp16', ['webgpu']);
+      dazu('int8', 'int8', webgpuDa ? ['webgpu', 'wasm'] : ['wasm']);
+      dazu('onnx', 'fp32', webgpuDa ? ['webgpu', 'wasm'] : ['wasm']);
     }
     let session = null, backend = '';
-    for (const datei of dateien) {
-      for (const eps of [['webgpu', 'wasm'], ['wasm']]) {
+    for (const [datei, name, epsListe] of kandidaten) {
+      for (const eps of epsListe) {
         try {
           session = await ort.InferenceSession.create(datei, {
             executionProviders: eps,
             graphOptimizationLevel: 'all',
           });
-          backend = (datei.includes('int8') ? 'int8 ' : 'fp32 ') +
-            eps.join('→') + (faeden > 1 ? ' ×' + faeden : '');
+          backend = name + ' ' + eps.join('→') + (faeden > 1 ? ' ×' + faeden : '');
           break;
         } catch (err) {
-          // naechste Ausfuehrungsart, danach naechste Datei versuchen
+          // naechste Ausfuehrungsart versuchen
         }
       }
       if (session) break;
     }
     if (!session) {
-      return { ok: false, reason: 'Modell nicht ladbar: ' + (dateien.join(', ') || 'keine Datei') };
+      return { ok: false, reason: 'Modell nicht ladbar: ' +
+        (kandidaten.map(k => k[0]).join(', ') || 'keine Datei') };
     }
 
     const size = labels.size;
