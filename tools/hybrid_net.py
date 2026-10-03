@@ -1,4 +1,4 @@
-"""
+﻿"""
 tools/hybrid_net.py - Hybrides Nano-Netz fuer Schildererkennung.
 
 Aufgabe: in EINEM Vorwaertslauf Position (Bounding Box) und Art (9 Schildtypen)
@@ -454,28 +454,49 @@ class TaskCorrelationNetwork(nn.Module):
 
     Umsetzung: jeder Zweig bekommt einen Restzweig vom anderen, gedaempft durch ein
     gelerntes Tor:
-        ort += gate_ort(1x1(art))     - der Ort erfaehrt, WAS dort liegt
-        art += gate_art(1x1(ort))     - die Art erfaehrt, WO sie liegt
+        ort += gate_ort(narrow(art)) * art_to_ort(narrow(art))
+        art += gate_art(narrow(ort)) * ort_to_art(narrow(ort))
     Das Tor startet ueberwiegend geschlossen (Bias -1 -> Sigmoid 0,27), damit der Austausch
     ANFANGSNEUTRAL beginnt und sich erst aufbaut. Ohne diese Daempfung schaukeln sich beide
     Zweige in den ersten Epochen gegenseitig auf.
 
-    Der Zusatz ist ein 1x1 je Richtung - zwei Faltungen. Das ist der Preis dafuer, dass die
-    beiden Teilaufgaben nicht mehr unabhaengig voneinander raten.
+    Die ENGSTELLE ist gemessen (tools/flops_wo.py): in der ersten Fassung standen hier VIER
+    volle 1x1-Faltungen (mid -> mid), und genau die waren der groesste Einzelposten des
+    Kopfes. Jetzt laeuft beides - der Querterm und das Tor - ueber EINE gemeinsame Verengung
+    auf mid/2:
+        Parameter: 4*C^2 -> 2*C^2 + 2*C   (halbiert)
+        Rechnung:  4*C^2 -> 1,5*C^2       (-62 % in diesem Block)
+    Das Tor ist dadurch EINKANALIG (ein raeumlich veraenderlicher Skalar statt C Gewichte je
+    Pixel). Das ist keine Vereinfachung aus Bequemlichkeit: die Frage "wie sehr darf der Ort
+    hier den Art-Merkmalen trauen?" ist eine Frage JE PIXEL, nicht je Kanal - die
+    Kanalauswahl trifft schon die Engstelle.
     """
 
     def __init__(self, dim: int):
         super().__init__()
-        self.art_to_ort = nn.Conv2d(dim, dim, 1, bias=False)
-        self.ort_to_art = nn.Conv2d(dim, dim, 1, bias=False)
-        self.gate_ort = nn.Conv2d(dim, dim, 1)
-        self.gate_art = nn.Conv2d(dim, dim, 1)
+        eng = max(8, dim // 2)
+        # Gemeinsame Verengung je Richtung: sie traegt SOWOHL den Querterm als auch das Tor.
+        # Eine Faltung statt zwei - genau das ist die gemessene Einsparung.
+        self.narrow_art = nn.Conv2d(dim, eng, 1, bias=False)
+        self.narrow_ort = nn.Conv2d(dim, eng, 1, bias=False)
+        self.art_to_ort = nn.Conv2d(eng, dim, 1, bias=False)
+        self.ort_to_art = nn.Conv2d(eng, dim, 1, bias=False)
+        self.gate_ort = nn.Conv2d(eng, 1, 1)
+        self.gate_art = nn.Conv2d(eng, 1, 1)
+        # Tor zu Beginn ueberwiegend geschlossen (Sigmoid(-1) = 0,27): der Austausch ist
+        # anfangs neutral und baut sich erst auf.
         nn.init.constant_(self.gate_ort.bias, -1.0)
         nn.init.constant_(self.gate_art.bias, -1.0)
 
     def forward(self, ort: torch.Tensor, art: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        ort = ort + torch.sigmoid(self.gate_ort(art)) * self.art_to_ort(art)
-        art = art + torch.sigmoid(self.gate_art(ort)) * self.ort_to_art(ort)
+        ha = self.narrow_art(art)
+        ho = self.narrow_ort(ort)
+        # Beide Querterme lesen die EINGANGSmerkmale des jeweils anderen Zweigs (nicht das
+        # bereits aktualisierte): die beiden Richtungen sind damit unabhaengig voneinander und
+        # koennen sich nicht in einer Schleife aufschaukeln - der Grund, aus dem das Tor
+        # ueberhaupt gedaempft startet. Vorher las die zweite Zeile das schon veraenderte ort.
+        ort = ort + torch.sigmoid(self.gate_ort(ha)) * self.art_to_ort(ha)
+        art = art + torch.sigmoid(self.gate_art(ho)) * self.ort_to_art(ho)
         return ort, art
 
 
@@ -605,6 +626,13 @@ class GranularPerception(nn.Module):
     Dreieck, Raute), bei 5x5 dagegen schon Form MIT Umgebung. Beides gleichzeitig zu sehen
     ist genau die Information, die zwischen "roter Kreis" und "rotes Rad am Auto"
     unterscheidet.
+
+    Geprueft und VERWORFEN (tools/gp_messung.py, 384 px): die 5x5 durch eine dilatierte 3x3
+    (d=2, gleiches Empfangsfeld, 9 statt 25 Abtastungen) zu ersetzen. Im Zweig selbst sind das
+    -64 %, im NETZ aber nur **-0,9 % MFLOPs** (1998 statt 2016) - und auf x86 wurde es
+    **+12 % langsamer** (171 statt 153 ms), weil dilatierte Faltungen dort schlechter
+    vektorisieren. Der Zweig ist also zu klein, um sich zu lohnen; gespart wird woanders
+    (siehe `lgp_spanne` / Presets).
 
     Leichtgewichtig ist das, weil beide Zweige TIEFENconvs sind (groups=dim): die Rechnung
     waechst mit der Kernelbreite, nicht mit dim^2. Der 3x3-Zweig ist restverbunden, damit die
