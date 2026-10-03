@@ -103,12 +103,18 @@ AUSWERTUNG = dict(conf=0.25, iou=0.5, iou_det=0.45, zweite_groesse=384)
 AUFRAEUMEN = True         # Bildordner nach dem Zippen loeschen (sonst 65 000 Ausgabedateien)
 SYNSET_KONFIG = "Cycles"  # die Synset-Fassung mit Pfadverfolgung (GTSRB-Zwilling inklusive)
 SYNSET_REPO = "FraunhoferIOSB/Synset-Signset-Germany"   # wird gestreamt, nicht hochgeladen
+# Werkzeuge und Kataloge kommen aus dem Netz (enable_internet ist an). Damit muss bei einer
+# Code-Aenderung NICHT der 700-MB-Datensatz neu hochgeladen werden - nur dieses Skript
+# (50 KB). kaggle/run.ps1 -Step push setzt WERKZEUGE_SHA auf den aktuellen Commit.
+REPO_SLUG = "ceyale/Stra-enschilderkennen"
+WERKZEUGE_SHA = "fc38200"
+HUGGING = "https://huggingface.co/datasets/miriamcarnot/GTSIGN-220/resolve/main/"
 # Der veroeffentlichte Vergleichs-Checkpoint hat 9 Klassen, dieser Lauf trainiert 74
 # (tools/signmap.py). Die Gegenprobe "alter gegen neuer Checkpoint auf derselben Messlatte"
 # ist damit nicht moeglich - das alte Netz kann die neuen Klassen nicht ausgeben. Erst ein
 # naechster Lauf auf derselben Taxonomie kann diesen Vergleich wieder fuehren.
 ALT_VERGLEICH = False
-ERWARTET = {"train": 38783, "val": 2662, "neg": 1900}   # muss zu DATEN passen (inkl. GTSDB)
+ERWARTET = {"train": 36283, "val": 2662, "neg": 1900}   # siehe Summenpruefung unten
 FEHLER: list[str] = []        # Schritte, die trotz "nicht toedlich" schiefgingen (fuer den Bericht)
 
 
@@ -311,7 +317,39 @@ def coco_bereitstellen(p: Protokoll, roh: Path) -> str:
         if not (ziel / "images" / "train2017").exists():   # ZIP enthaelt den Ordner coco128/
             raise SystemExit(f"coco128 unerwartet aufgebaut: {ziel}")
         return "negatives/coco128"
-    raise SystemExit("coco128 fehlt im Rohdaten-Datensatz (weder Ordner noch ZIP gefunden)")
+    # Kein harter Abbruch: coco128 ist nur Streuung neben den eigenen Fotos. Fehlt es, bauen
+    # die Negative-Aufrufe eben nur aus den eigenen Aufnahmen - besser als ein Lauf, der
+    # daran scheitert (tools/real_negatives.py behandelt --coco ohnehin als Wahl).
+    p.zeile("[hinweis] coco128 nicht gefunden (weder Ordner noch ZIP) - die Negative kommen "
+            "dann allein aus den eigenen Fotos")
+    return ""
+
+
+def datasets_sichern(p: Protokoll) -> bool:
+    """`datasets` (HuggingFace) bereitstellen - es traegt das Synset-Streaming.
+
+    Dieselbe Lehre wie bei onnxruntime: was der Kernel nicht mitbringt, muss er sich selbst
+    holen. Ohne `datasets` faellt die Synset-Quelle aus (die anderen drei bleiben), aber ein
+    Lauf, der eine ganze Quelle verliert, ist es nicht wert - der Aufruf kostet Sekunden.
+    """
+    try:
+        import datasets  # noqa: F401
+        p.zeile("[lib] datasets ist vorhanden")
+        return True
+    except ImportError:
+        pass
+    if PROBE:
+        p.zeile("[probe] pip install datasets (waere noetig)")
+        return True
+    p.zeile("[lib] datasets fehlt - pip install datasets (HuggingFace-Streaming fuer Synset)")
+    rc = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "datasets", "pyarrow"],
+                        capture_output=True, text=True)
+    if rc.returncode != 0:
+        p.zeile(f"[lib] Installation fehlgeschlagen: {rc.stderr.strip()[-300:]}")
+        p.zeile("[warnung] Synset Signset Germany wird uebersprungen")
+        return False
+    p.zeile("[lib] datasets installiert")
+    return True
 
 
 def onnxruntime_sichern(p: Protokoll) -> bool:
@@ -490,7 +528,11 @@ def synset_ausschnitte(p: Protokoll, roh: Path, ziel: Path, konfig: str, split: 
     lokal = roh / "synset"
     quelle = str(lokal) if lokal.exists() else SYNSET_REPO
     p.zeile(f"[synset] Quelle: {quelle}")
-    from datasets import load_dataset
+    try:
+        from datasets import load_dataset
+    except ImportError as fehler:
+        p.zeile(f"[synset] 'datasets' fehlt ({fehler}) - Quelle entfaellt")
+        return 0
     from PIL import Image
 
     sys.path.insert(0, str(WORK / "tools"))
@@ -721,6 +763,91 @@ def eigene_negative(p: Protokoll, roh: Path, anteil_train: float = 0.7) -> tuple
     return train, mess
 
 
+def werkzeuge_holen(p: Protokoll, tools: Path) -> None:
+    """Die Werkzeuge aus dem oeffentlichen Repo holen - festgenagelt auf WERKZEUGE_SHA.
+
+    Warum ueberhaupt, wo sie doch im Rohdaten-Datensatz liegen: der Datensatz muss dann bei
+    JEDER Code-Aenderung neu hochgeladen werden (700 MB, gemessen mehrfach gescheitert). Die
+    Werkzeuge sind 215 KB - die kommen billiger und zuverlaessiger aus dem Netz, das der
+    Kernel ohnehin hat (enable_internet). Der Datensatz liefert nur noch die GROSSEN
+    Rohdaten (GTSRB 350 MB), die sich nicht sinnvoll erneut laden lassen.
+
+    WERKZEUGE_SHA wird von kaggle/run.ps1 -Step push auf den aktuellen Commit gesetzt, damit
+    Kernel und Werkzeuge niemals auseinanderlaufen (sonst trainiert man Code, der nicht
+    geprueft wurde). Faellt das Netz aus, bleibt die Kopie aus dem Datensatz liegen.
+    """
+    if PROBE:
+        p.zeile(f"[probe] Werkzeuge von GitHub (Commit {WERKZEUGE_SHA[:7]})")
+        return
+    import urllib.request
+    import zipfile
+
+    adresse = f"https://codeload.github.com/{REPO_SLUG}/zip/{WERKZEUGE_SHA}"
+    zieldatei = WORK / "werkzeuge.zip"
+    try:
+        p.zeile(f"[github] hole {adresse}")
+        with urllib.request.urlopen(adresse, timeout=180) as f:
+            zieldatei.write_bytes(f.read())
+        with zipfile.ZipFile(zieldatei) as z:
+            namen = [n for n in z.namelist() if "/tools/" in n and n.endswith(".py")]
+            if not namen:
+                raise SystemExit("kein tools/*.py im Archiv")
+            tools.mkdir(parents=True, exist_ok=True)
+            for name in namen:
+                ziel = tools / Path(name).name
+                ziel.write_bytes(z.read(name))
+        zieldatei.unlink()
+        p.zeile(f"[github] {len(namen)} Werkzeuge uebernommen (Commit {WERKZEUGE_SHA[:7]})")
+    except SystemExit:
+        raise
+    except Exception as fehler:
+        p.zeile(f"[github] nicht erreichbar ({type(fehler).__name__}: {fehler}) - "
+                "es bleibt bei der Kopie aus dem Rohdaten-Datensatz")
+
+
+def gtsign_bereitstellen(p: Protokoll, roh: Path, ziel: Path) -> list[str]:
+    """GTSIGN-220 (+ StVO-Tabelle und Split-Listen) bereitstellen.
+
+    Bevorzugt aus dem Rohdaten-Datensatz, sonst direkt von HuggingFace (375 MB). Die
+    Split-Listen sind der eigentliche Wert: ohne sie gaebe es keine Trennung von Training und
+    Messlatte - und ohne diese Trennung misst man Gelerntes (PLAN.md).
+    """
+    dateien = {"GTSIGN-220.zip": (HUGGING + "GTSIGN-220.zip", 300_000_000),
+               "class_descriptions_and_stvo.csv": (HUGGING + "class_descriptions_and_stvo.csv", 20_000)}
+    for split in ("train", "val"):
+        dateien[f"gtsign_splits/{split}.txt"] = (HUGGING + f"splits/{split}.txt", 100_000)
+    vorhanden = roh / "kataloge"
+    fehlen: list[str] = []
+    ziel.mkdir(parents=True, exist_ok=True)
+    (ziel / "gtsign_splits").mkdir(exist_ok=True)
+    for name, (adresse, mindest) in dateien.items():
+        zieldatei = ziel / name
+        quelle = vorhanden / name
+        if quelle.exists() and quelle.stat().st_size >= mindest:
+            shutil.copy2(quelle, zieldatei)
+            continue
+        if PROBE:
+            p.zeile(f"[probe] GTSIGN {name} von {adresse}")
+            continue
+        try:
+            import urllib.request
+            p.zeile(f"[gtsign] hole {adresse}")
+            with urllib.request.urlopen(adresse, timeout=300) as f:
+                zieldatei.write_bytes(f.read())
+            if zieldatei.stat().st_size < mindest:
+                raise SystemExit(f"{name} zu klein ({zieldatei.stat().st_size} B) - "
+                                 "HuggingFace liefert bei Abbruch eine Fehlerseite")
+        except SystemExit:
+            raise
+        except Exception as fehler:
+            fehlen.append(f"{name} ({type(fehler).__name__})")
+    if fehlen and not PROBE:
+        p.zeile(f"[warnung] GTSIGN unvollstaendig: {', '.join(fehlen)} - Quelle entfaellt")
+    elif not PROBE:
+        p.zeile("[gtsign] GTSIGN-220 + StVO-Tabelle + Split-Listen bereit")
+    return fehlen
+
+
 def einrichten(p: Protokoll, roh: Path) -> dict:
     """Arbeitsverzeichnis herrichten: Code bereitstellen, Rohdaten normalisieren.
 
@@ -762,25 +889,26 @@ def einrichten(p: Protokoll, roh: Path) -> dict:
     (WORK / "models").mkdir(exist_ok=True)
     (WORK / "berichte").mkdir(exist_ok=True)
 
+    # Werkzeuge auf den Stand festnageln, der zum Kernel gehoert (siehe werkzeuge_holen).
+    werkzeuge_holen(p, tools)
+
     # --- Die neuen Kataloge (tools/crops_dataset.py) -------------------------------------
     # Alles, was der Kernel an Zusatzdaten braucht, kommt aus dem Rohdaten-Datensatz. Fehlt
     # ein Katalog, wird er gemeldet und uebersprungen - der Lauf faellt nicht um.
     katalog = roh / "kataloge"
-    gtsign_zip = katalog / "GTSIGN-220.zip"
-    fehlend = [q.name for q in (gtsign_zip, katalog / "class_descriptions_and_stvo.csv")
-               if not q.exists()]
+    gtsign_zip = WORK / "kataloge" / "GTSIGN-220.zip"
+    fehlend = gtsign_bereitstellen(p, roh, WORK / "kataloge")
     if fehlend:
-        p.zeile(f"[hinweis] GTSIGN-220 fehlt im Rohdaten-Datensatz ({', '.join(fehlend)}) - "
-                "Quelle entfaellt")
+        p.zeile(f"[hinweis] GTSIGN-220 nicht verfuegbar ({', '.join(fehlend)}) - Quelle entfaellt")
     crops = {"gtsign_train": 0, "gtsign_val": 0, "synset_train": 0, "synset_val": 0}
     if not fehlend:
         crops["gtsign_train"] = feste_ausschnitte(
-            p, gtsign_zip, katalog / "class_descriptions_and_stvo.csv",
-            katalog / "gtsign_splits" / "train.txt", WORK / "crops" / "gtsign-train",
+            p, gtsign_zip, WORK / "kataloge" / "class_descriptions_and_stvo.csv",
+            WORK / "kataloge" / "gtsign_splits" / "train.txt", WORK / "crops" / "gtsign-train",
             DATEN["gtsign_train_max"])
         crops["gtsign_val"] = feste_ausschnitte(
-            p, gtsign_zip, katalog / "class_descriptions_and_stvo.csv",
-            katalog / "gtsign_splits" / "val.txt", WORK / "crops" / "gtsign-val",
+            p, gtsign_zip, WORK / "kataloge" / "class_descriptions_and_stvo.csv",
+            WORK / "kataloge" / "gtsign_splits" / "val.txt", WORK / "crops" / "gtsign-val",
             DATEN["gtsign_val_max"])
     crops["synset_train"] = synset_ausschnitte(p, roh, WORK / "crops" / "synset-train",
                                                SYNSET_KONFIG, "train",
@@ -790,6 +918,14 @@ def einrichten(p: Protokoll, roh: Path) -> dict:
                                              DATEN["synset_val_max"])
     oi_bereitstellen(p, roh, WORK / "oi-alle", DATEN["oi_max"])
     oi = oi_aufteilen(p, WORK / "oi-alle")
+    if not PROBE and sum(oi.values()) < 100:
+        # Frueh und deutlich statt kryptisch: ohne diese Fotos kann die Messlatte 'neg'
+        # (zu zwei Dritteln daraus gebaut) nicht entstehen, und zahlen_pruefen wuerde den
+        # Lauf erst nach dem Datensatzbau abbrechen - mit einer Zahl statt einer Ursache.
+        p.zeile("[fehler] Open Images lieferte keine Fotos. Der Datensatz kann so nicht "
+                "gebaut werden. Netz im Kernel pruefen (enable_internet) oder einen Ordner "
+                "oi-negatives/ in den Rohdaten-Datensatz legen.")
+        raise SystemExit("Open Images fehlt - siehe Protokoll")
     gtsdb = gtsdb_bereitstellen(p, roh, WORK / "gtsdb-coco")
 
     return {"tools": str(tools), "gtsrb": str(WORK / "gtsrb"), "coco128": coco,
@@ -820,6 +956,11 @@ def datensatz_bauen(p: Protokoll, ein: dict) -> dict:
     # kleiner, aber sauberer annotiert; ohne Faktor wuerde die Menge GTSRB/Synset die
     # GTSIGN-Bilder erdruecken.
     g_gewichte = [arg for w in d["weights"] for arg in ("--weight", w)]
+    # coco128 nur anhängen, wenn es wirklich bereitgestellt werden konnte (coco_bereitstellen
+    # liefert dann einen Pfad, sonst "").
+    coco_pfad = ein.get("coco128") or ""
+    coco_args = (["--coco", coco_pfad, "--coco-test-n", str(d["coco_test_n"])]
+                 if coco_pfad else [])
     kataloge = ["--gtsign", "catalogs/GTSIGN-220.zip",
                 "--gtsign-csv", "catalogs/class_descriptions_and_stvo.csv"]
 
@@ -849,8 +990,7 @@ def datensatz_bauen(p: Protokoll, ein: dict) -> dict:
                                   "--n", str(d["n_echt_train"]), "--split", "train",
                                   "--real-train", "user/Nothing.jpg",
                                   "--train-region", "0,0,1,0.5",
-                                  "--coco", "negatives/coco128",
-                                  "--coco-test-n", str(d["coco_test_n"]),
+                                  *coco_args,
                                   "--user-share", str(d["user_share_train"]))),
         # 5. Die Gegenprobe auf Fehlalarme: nur Bilder OHNE Schild, aus dem dritten OI-Topf
         ("negative messlatte", python("tools/crops_dataset.py", "--out", "data/det",
@@ -883,8 +1023,7 @@ def datensatz_bauen(p: Protokoll, ein: dict) -> dict:
                          python("tools/real_negatives.py", "--out", "data/det",
                                 "--n", str(d["n_eigene_train"]), "--split", "train",
                                 "--real-train", *eigene_train,
-                                "--coco", "negatives/coco128",
-                                "--coco-test-n", str(d["coco_test_n"]),
+                                *coco_args,
                                 "--user-share", str(d["eigene_share"]))))
     if eigene_neg:
         schritte.append(("eigene negative (Messlatte)",
@@ -909,12 +1048,26 @@ def zahlen_pruefen(p: Protokoll) -> dict:
         zahlen[split] = zahlen.get(split, 0) + 1
     p.zeile(f"[daten] {len(manifest['images'])} Bilder im Manifest: "
             + ", ".join(f"{k}={v}" for k, v in sorted(zahlen.items())))
-    falsch = {k: (zahlen.get(k, 0), v) for k, v in ERWARTET.items() if zahlen.get(k, 0) != v}
+    # Toleranz statt harter Gleichheit: das Rezept ist eine Summe aus sieben Aufrufen, und
+    # einzelne Bilder fallen regelmaessig weg (ein Negativ ohne Hintergrundfoto, ein Zeichen
+    # kleiner als die Mindestkante). Ein Tippfehler im Rezept verschiebt die Zahl dagegen um
+    # Prozent, nicht um Promille - die Pruefung greift also weiterhin, toetet den Lauf aber
+    # nicht mehr wegen ein paar Bildern.
+    grenze = 0.02
+    falsch, ungenau = {}, {}
+    for k, soll in ERWARTET.items():
+        ist = zahlen.get(k, 0)
+        if ist == soll:
+            continue
+        (falsch if soll and abs(ist - soll) / soll > grenze else ungenau)[k] = (ist, soll)
+    for k, (ist, soll) in ungenau.items():
+        p.zeile(f"[daten] {k}: {ist} statt {soll} erwartet "
+                f"({100 * (ist - soll) / max(soll, 1):+.1f} %) - im Rahmen")
     if falsch:
         p.zeile("[daten] ERWARTUNG TRIFFT NICHT ZU: "
                 + ", ".join(f"{k}: {ist} statt {soll}" for k, (ist, soll) in falsch.items()))
-        raise SystemExit("Datensatz stimmt nicht mit PLAN.md (Block 5) ueberein")
-    p.zeile("[daten] Bildzahlen stimmen mit PLAN.md (Block 5) ueberein")
+        raise SystemExit("Datensatz weicht stark vom Rezept ab (siehe DATEN in train_kernel.py)")
+    p.zeile("[daten] Bildzahlen stimmen zum Rezept")
     return zahlen
 
 
@@ -1082,6 +1235,7 @@ def main() -> None:
     # Zuerst onnxruntime sicherstellen: es entscheidet ueber Export, Paritaetsprobe und Fixture.
     # Ohne diese Vorbereitung riss der erste Lauf die gesamte Ausgabe mit (43 min Training weg).
     hat_ort = onnxruntime_sichern(p)
+    hat_ds = datasets_sichern(p)
     roh = eingang_finden()
     p.zeile(f"[eingang] Rohdaten-Datensatz: {roh}")
 

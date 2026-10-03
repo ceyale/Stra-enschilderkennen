@@ -241,6 +241,21 @@ function Set-Datensatz {
 
 function Push-Kernel {
     Schritt "Kernel hochladen und starten: $Kernel"
+    # Den Werkzeug-Stand festnageln: der Kernel holt tools/ aus dem oeffentlichen Repo, und
+    # zwar genau diesen Commit. Ohne diese Zeile koennte er Code trainieren, der nicht
+    # geprueft wurde (oder - schlimmer - gar keinen, wenn der Commit nicht existiert).
+    $sha = (& git -C $Repo rev-parse HEAD).Trim()
+    $datei = Join-Path $PSScriptRoot 'train_kernel.py'
+    $inhalt = Get-Content $datei -Raw
+    $neu = $inhalt -replace 'WERKZEUGE_SHA = "[0-9a-f]*"', "WERKZEUGE_SHA = `"$sha`""
+    if ($neu -ne $inhalt) {
+        Set-Content $datei $neu -NoNewline
+        Write-Host "[ok]    WERKZEUGE_SHA auf $($sha.Substring(0,7)) gesetzt"
+    } elseif ($inhalt -match "WERKZEUGE_SHA = `"$sha`"") {
+        Write-Host "[ok]    WERKZEUGE_SHA steht schon auf $($sha.Substring(0,7))"
+    } else {
+        throw "WERKZEUGE_SHA konnte nicht gesetzt werden - bitte in train_kernel.py pruefen"
+    }
     # -t ist die Obergrenze in Sekunden; 43 200 = 12 h (das Kaggle-Maximum). Der Lauf selbst
     # dauert rund zwei Stunden, die Grenze ist nur die Reissleine.
     & kaggle kernels push -p $PSScriptRoot -t 43200

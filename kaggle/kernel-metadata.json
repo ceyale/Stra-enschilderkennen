@@ -1,6 +1,6 @@
 {
   "id": "raphbre/schilder-scanner-detektor-trainieren-gtsrb",
-  "title": "Schilder-Scanner: Detektor trainieren (GTSRB)",
+  "title": "Schilder-Scanner: Detektor trainieren (74 Klassen, vier Kataloge)",
   "code_file": "train_kernel.py",
   "language": "python",
   "kernel_type": "script",
