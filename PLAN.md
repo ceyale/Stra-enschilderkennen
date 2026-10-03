@@ -145,6 +145,11 @@ ist klein, nicht die Dateizahl.
    * **Ehrlich gemeldet**: von 383 GTSDB-Trainingsbildern hatten 50 nur Zeichen unter 6 px
      nach dem Einpassen auf 320 px. Das Werkzeug schreibt das in den Bericht, statt es zu
      verschweigen.
+   * **Architektur (neu: Preset `breit`)**: 74 Klassen entscheiden sich im Kopf → `mid =
+     Rumpfbreite` (der Kopf beginnt mit einer Tiefenconvolution, `mid` muss die Rumpfbreite
+     teilen, die Rumpfbreite ist der größte zulässige Wert), `depth=(1,2,3,3)`, lokale
+     Attention auf p4 statt global. Gemessen 1,88 Mio. Parameter / 1 180 MFLOPs gegen
+     1,32 Mio. / 916. Die Rechnung ist aus `tools/bench_model.py`, nicht geschätzt.
 
 2. **Kachelmodus in die App**: `src/model.js` + `src/app.js` – Foto in N×N überlappende
    Kacheln, Treffer verschieben, NMS über die Kachelgrenzen, **höhere Schwelle** im Kachelmodus

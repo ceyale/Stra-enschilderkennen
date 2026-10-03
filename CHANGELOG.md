@@ -35,10 +35,20 @@
   beste, aber die Research-Use-Lizenz verbietet den Einbau in ein öffentliches Produkt),
   TT100K und BDD100K (CC BY-**NC**). Begründung und Prüfweg in
   [`docs/DATENSAETZE.md`](docs/DATENSAETZE.md) §3.
-- **Was der Lauf noch nicht zeigt:** ob 74 Klassen die Qualität halten. Der Trainingslauf
-  läuft auf Kaggle; die Zahlen kommen mit `kaggle\run.ps1 -Step pull` und gehören dann in
-  `models/README.md`. Bekannt und gemeldet: von 383 GTSDB-Trainingsbildern hatten **50** nur
-  Zeichen unter 6 px nach dem Einpassen auf 320 px.
+- **Architektur an die Klassenzahl angepasst** (neues Preset `breit` in `tools/hybrid_net.py`):
+  mit 74 statt 9 Klassen entscheidet sich die Art im **Kopf**, also bekommt der
+  Klassenzweig den vollen Merkmalsvorrat. Warum das genau `mid = Rumpfbreite` bedeutet: der
+  Kopf beginnt mit einer **Tiefenconvolution** (`cba(cin, mid, g=mid)`), deshalb muss `mid`
+  die Rumpfbreite *teilen* – und die Rumpfbreite selbst ist der größte zulässige Wert. Dazu
+  ein Block mehr in den tiefen Stufen (`depth=(1,2,3,3)`, dort stehen nur 20×20 und 10×10
+  Zellen, kostet also fast nichts) und **lokale** Attention auf p4 statt der globalen aus
+  `quality` (Fenster 5×5 gegen ~256× teurere globale Attention auf stride 8).
+  Gemessen: **1,88 Mio. Parameter / 1 180 MFLOPs** gegen 1,32 Mio. / 916 bei `balanced`
+  (+42 % / +29 %). Die Zeit ist da: der letzte Lauf brauchte **70 von 540** Kaggle-Minuten.
+- **Was der Lauf noch nicht zeigt:** ob 74 Klassen und das breitere Netz die Qualität halten.
+  Das ist eine Messung, keine Zusage – die Zahlen kommen mit `kaggle\run.ps1 -Step pull` und
+  gehören dann in `models/README.md`. Bekannt und gemeldet: von 383 GTSDB-Trainingsbildern
+  hatten **50** nur Zeichen unter 6 px nach dem Einpassen auf 320 px.
 
 ## 0.4.1 – 2026-10-02
 - **Kaggle-Lauf Block 5 ausgewertet und übernommen** (Tesla T4, 220 Epochen × 150 Schritte,

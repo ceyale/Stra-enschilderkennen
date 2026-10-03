@@ -332,7 +332,7 @@ def main() -> None:
     ap.add_argument("--tr-global", default="p5", help="globale Transformer-Stufen, z.B. p5 oder p4,p5 oder -")
     ap.add_argument("--tr-window", default="-", help="lokale Transformer-Stufen, z.B. p4 oder -")
     ap.add_argument("--act", default="silu", choices=["silu", "hardswish"])
-    ap.add_argument("--preset", default="", choices=["", "fast", "balanced", "quality"],
+    ap.add_argument("--preset", default="", choices=["", "fast", "balanced", "quality", "breit"],
                     help="Größenvariante aus tools/hybrid_net.py (überschreibt Breiten/Tiefen)")
     ap.add_argument("--ffn", type=float, default=2.0, help="FFN-Expansion im Transformer-Block")
     ap.add_argument("--norm", default="gn", choices=["gn", "ln"])

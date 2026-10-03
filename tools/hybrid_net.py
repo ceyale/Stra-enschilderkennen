@@ -87,6 +87,20 @@ PRESETS: dict[str, dict] = {
     # mehr Kontext (p4 zusaetzlich), dafuer teurer
     "quality": dict(width=(32, 64, 128, 256), depth=(1, 2, 2, 2), mid=(32, 32, 64, 128),
                     tr_global=("p5", "p4"), tr_window=("p4",), act="silu"),
+    # Fuer die erweiterte Taxonomie (74 Klassen, tools/signmap.py). Warum genau so:
+    #  * mid = Rumpfbreite. Der Kopf beginnt mit einer TIEFENCONVOLUTION (cba(cin, mid, g=mid)),
+    #    deshalb muss mid die Rumpfbreite TEILEN - und der groesste zulaessige Wert ist die
+    #    Rumpfbreite selbst. Damit bekommt der Klassenzweig den vollen Merkmalsvorrat statt
+    #    der Haelfte. Genau dort faellt die Entscheidung (74 Klassen statt 9).
+    #  * depth=(1,2,3,3): ein Block mehr in den tiefen Stufen. Dort stehen wenige Zellen
+    #    (20x20 und 10x10), ein Block kostet also fast nichts, vergroessert aber das
+    #    receptive Feld - noetig, um ein Schild von seiner Umgebung zu trennen.
+    #  * tr_window=("p4",) statt tr_global=("p5","p4") wie in "quality": lokale Attention ist
+    #    billig (Fenster 5x5), globale auf stride 8 waere rund 256x teurer (siehe Kopf dieser
+    #    Datei). Gemessen: 1,88 Mio. Parameter / 1 180 MFLOPs gegen 1,32 Mio. / 916 bei
+    #    "balanced" (+42 % / +29 %) - der letzte Lauf brauchte 70 von 540 Kaggle-Minuten.
+    "breit": dict(width=(32, 64, 128, 256), depth=(1, 2, 3, 3), mid=(32, 64, 128, 256),
+                  tr_global=("p5",), tr_window=("p4",), act="silu"),
 }
 
 
