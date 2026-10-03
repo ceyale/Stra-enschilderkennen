@@ -30,8 +30,9 @@ import torch
 from PIL import Image
 
 import detmath as dm
+import signmap
 import synth_data as sd
-from hybrid_net import SIGN_LABELS, NetCfg, build_model, n_params
+from hybrid_net import N_CLASSES, SIGN_LABELS, NetCfg, build_model, n_params
 
 
 def load_model(ckpt_path: str):
@@ -244,8 +245,11 @@ def main() -> None:
             q.unlink(missing_ok=True)
 
     labels = {"format": "signs-det/1", "classes": SIGN_LABELS, "size": size, "levels": list(dm.LEVELS),
-              "channels": dm.N_CH, "layout": "tx,ty,tw,th,obj,cls0..cls8",
+              "channels": dm.N_CH, "layout": f"tx,ty,tw,th,obj,cls0..cls{N_CLASSES - 1}",
               "score": "sigmoid(obj)*max(sigmoid(cls))", "dynamic": bool(args.dynamic),
+              # Anzeige-Informationen je Klasse. Ohne sie kennt die Oberflaeche nur die neun
+              # Heuristik-Typen und koennte die uebrigen Klassen nicht benennen.
+              "info": {name: signmap.INFO[name] for name in SIGN_LABELS},
               "files": files}
     (out_path.parent / "labels.json").write_text(json.dumps(labels, indent=2, ensure_ascii=False), encoding="utf-8")
 

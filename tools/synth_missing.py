@@ -31,9 +31,13 @@ SRC = "synthetisch (Lueckenschluss)"
 
 
 def missing_labels() -> list[str]:
-    """Typen, die in GTSRB keine Entsprechung haben (siehe CLASS_MAP)."""
+    """Gezeichnete Typen, die in GTSRB keine Entsprechung haben (siehe CLASS_MAP).
+
+    Nur die neun gezeichneten Kacheln (sd.SYNTH_LABELS) kommen in Frage - die uebrigen
+    Klassen der heutigen Taxonomie kommen aus echten Ausschnitten (tools/crops_dataset.py).
+    """
     covered = set(CLASS_MAP.values())
-    return [name for name in SIGN_LABELS if name not in covered]
+    return [name for name in sd.SYNTH_LABELS if name not in covered]
 
 
 def main() -> None:

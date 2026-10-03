@@ -43,6 +43,7 @@ $Stage = Join-Path $Staging 'schilderdet-raw'
 $Kernel = 'raphbre/schilder-scanner-detektor-trainieren-gtsrb'
 $Datensatz = 'raphbre/schilder-det-raw'
 $Gtsrb = Join-Path $Repo 'data\gtsrb'
+$Gtsign = Join-Path $Repo 'data\gtsign'
 $Negativ = Join-Path $Repo 'data\negatives'
 $Urteile = @{}                                    # Schritt -> Ergebnis, fuer die Schlusszeile
 
@@ -90,6 +91,19 @@ function Hol-Rohdaten {
         if (-not (Test-Path $pfad)) { throw "es fehlt $pfad - siehe README.md (curl fuer GTSRB)" }
         Write-Host ("[ok]    {0}: {1:N1} MB" -f $name, ((Get-Item $pfad).Length / 1MB))
     }
+
+    # GTSIGN-220 (CC BY-SA 4.0, 75 541 echte Schildausschnitte in 220 StVO-Klassen). Der
+    # Datensatz ist nur 375 MB - er passt in den Kaggle-Datensatz. Die StVO-Tabelle und die
+    # SPLIT-LISTEN sind der eigentliche Wert: ohne sie gaebe es keine Trennung von Training
+    # und Messlatte, und ohne diese Trennung misst man Gelerntes (PLAN.md).
+    Hol-Datei 'https://huggingface.co/datasets/miriamcarnot/GTSIGN-220/resolve/main/GTSIGN-220.zip' `
+        (Join-Path $Gtsign 'GTSIGN-220.zip') 300000000 'GTSIGN-220 (Ausschnitte, CC BY-SA 4.0)'
+    Hol-Datei 'https://huggingface.co/datasets/miriamcarnot/GTSIGN-220/resolve/main/class_descriptions_and_stvo.csv' `
+        (Join-Path $Gtsign 'class_descriptions_and_stvo.csv') 20000 'GTSIGN-220 StVO-Tabelle'
+    foreach ($split in 'train', 'val') {
+        Hol-Datei "https://huggingface.co/datasets/miriamcarnot/GTSIGN-220/resolve/main/splits/$split.txt" `
+            (Join-Path $Gtsign "$split.txt") 100000 "GTSIGN-220 Split $split"
+    }
     $Urteile['raw'] = 'Rohdaten vollstaendig'
 }
 
@@ -127,6 +141,22 @@ function Leg-Staging {
     }
     Verlinke (Join-Path $Negativ 'coco128.zip') (Join-Path $Stage 'negatives\coco128.zip')
     Copy-Item (Join-Path $Repo 'Test\Nothing.jpg') (Join-Path $Stage 'user\Nothing.jpg')
+
+    # Die Kataloge (GTSIGN-220 + StVO-Tabelle + Splits) in den Kaggle-Datensatz.
+    # Synset Signset Germany kommt hier absichtlich NICHT mit: 17,6 GB hochzuladen waere
+    # weder zeitlich noch vom Speicher her vertretbar - der Kernel streamt es stattdessen
+    # von HuggingFace (enable_internet ist an, siehe kernel-metadata.json).
+    $katalogZiel = Join-Path $Stage 'kataloge'
+    New-Item -ItemType Directory -Force $katalogZiel, (Join-Path $katalogZiel 'gtsign_splits') | Out-Null
+    Verlinke (Join-Path $Gtsign 'GTSIGN-220.zip') (Join-Path $katalogZiel 'GTSIGN-220.zip')
+    foreach ($name in 'class_descriptions_and_stvo.csv', 'train.txt', 'val.txt') {
+        $quelle = Join-Path $Gtsign $name
+        if (-not (Test-Path $quelle)) { throw "es fehlt $quelle (kaggle\run.ps1 -Step raw)" }
+        $ziel = if ($name -like '*.txt') { Join-Path $katalogZiel "gtsign_splits\$name" } `
+                else { Join-Path $katalogZiel $name }
+        Copy-Item $quelle $ziel -Force
+        Write-Host ("[ok]    kataloge\{0} ({1:N0} KB)" -f (Split-Path $ziel -Leaf), ((Get-Item $ziel).Length / 1KB))
+    }
     Write-Host ("[ok]    Nothing.jpg ({0:N0} KB)" -f `
         ((Get-Item (Join-Path $Stage 'user\Nothing.jpg')).Length / 1KB))
 
@@ -161,7 +191,10 @@ function Probe-Kernel {
     New-Item -ItemType Directory -Force $pruef | Out-Null
     $env:SCHILDER_PROBE = '1'
     $env:SCHILDER_WORK = $pruef
-    $env:SCHILDER_INPUT = $Staging
+    # Wichtig: NICHT $Staging selbst als Eingang, denn dort liegt der Probe-Ordner. Der Kernel
+    # sucht den Datensatz UNTERHALB von input/ und koennte den Probe-Ordner erwischen, in den
+    # er selbst gerade die Werkzeuge kopiert hat (gemessen). Deshalb eine Ebene darueber.
+    $env:SCHILDER_INPUT = (Split-Path $Staging -Parent)
     try {
         & python (Join-Path $PSScriptRoot 'train_kernel.py')
         if ($LASTEXITCODE -ne 0) { throw "Probe des Kernels fehlgeschlagen (Code $LASTEXITCODE)" }

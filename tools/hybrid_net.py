@@ -37,15 +37,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Reihenfolge = Klassenreihenfolge im Modell. Muss identisch zu den Keys in
-# src/detector.js (SIGNS) bleiben; export_onnx.py schreibt sie nach models/labels.json.
-SIGN_LABELS = [
-    "stop", "vorfahrtGewaehren", "warnung", "verbot", "einfahrtVerboten",
-    "gebot", "hinweis", "vorfahrtstrasse", "ortstafel",
-]
-N_CLASSES = len(SIGN_LABELS)          # 9
-# Kanalreihenfolge im Kopf-Ausgang: [tx, ty, tw, th, obj, cls0..cls8]
-N_CH = 4 + 1 + N_CLASSES              # 14
+# Reihenfolge = Klassenreihenfolge im Modell. Sie steht in tools/signmap.py, weil dort auch
+# die Zuordnung der drei Datenquellen liegt (GTSRB-ClassId, StVO-Nummer, Synset-Name) - zwei
+# Listen waeren zwei Wahrheiten. src/detector.js kennt die neun Grundtypen weiterhin als
+# Heuristik; fuer die Anzeige aller Klassen schickt export_onnx.py die Namen in labels.json mit.
+import signmap
+
+SIGN_LABELS = signmap.LABELS
+N_CLASSES = len(SIGN_LABELS)          # 74 (siehe tools/signmap.py)
+# Kanalreihenfolge im Kopf-Ausgang: [tx, ty, tw, th, obj, cls0..cls73]
+N_CH = 4 + 1 + N_CLASSES              # 79
 
 
 @dataclass

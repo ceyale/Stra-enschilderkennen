@@ -81,6 +81,20 @@
     draw();
   }
 
+  /** Anzeige-Informationen zu einem Label.
+
+   * Seit der Klassenerweiterung (74 Klassen) schickt das Modell die Namen in
+   * labels.json mit (`info`). detector.js kennt nur die neun Heuristik-Typen - dort
+   * wird nachgeschlagen, wenn kein Modell geladen ist.
+   */
+  function signInfo(label) {
+    const ausModell = model && model.labels && model.labels.info && model.labels.info[label];
+    const s = ausModell || D.SIGNS[label];
+    if (s) return { name: s.name, zeichen: s.zeichen, note: s.note, hex: s.hex,
+                    text: s.text || '#fff' };
+    return { name: label, zeichen: '', note: '', hex: '#5b6470', text: '#fff' };
+  }
+
   /** Liste unter dem Bild – nur neu aufbauen, wenn sich die Schildtypen ändern. */
   function renderList() {
     const labels = [...new Set(current.map(t => t.label))];
@@ -88,7 +102,7 @@
     if (key === lastKey) return;
     lastKey = key;
     list.innerHTML = labels.length
-      ? labels.map(l => { const s = D.SIGNS[l];
+      ? labels.map(l => { const s = signInfo(l);
           return `<li style="--c:${s.hex}"><b>${s.name}</b><span>${s.zeichen}</span><p>${s.note}</p></li>`; }).join('')
       : '<li class="leer">Noch kein Schild erkannt. Halte ein Schild ruhig und frontal ins Bild.</li>';
   }
@@ -110,7 +124,7 @@
     ctx.lineWidth = 3; ctx.textBaseline = 'top';
     ctx.font = '600 15px Bahnschrift, "DIN Alternate", system-ui, sans-serif';
     for (const t of current) {
-      const s = D.SIGNS[t.label], x = t.x * k, y = t.y * k, w = t.w * k, h = t.h * k;
+      const s = signInfo(t.label), x = t.x * k, y = t.y * k, w = t.w * k, h = t.h * k;
       const txt = s.name + ' ' + Math.round(t.conf * 100) + ' %', tw = ctx.measureText(txt).width + 10;
       const ty = y > 22 ? y - 22 : y + h + 2;
       ctx.strokeStyle = s.hex; ctx.strokeRect(x, y, w, h);

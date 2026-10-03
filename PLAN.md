@@ -122,8 +122,29 @@ ist klein, nicht die Dateizahl.
    **Open Images** (Klasse „Traffic sign", CC BY 2.0 → Szenen und harte Negative).
 1c. **Tempo**: `data/_speed.py` misst, `dist/_headers` + `crossOriginIsolated` in
    `src/model.js` sind gebaut (COOP/COEP live geprüft). Gemessen: 1 Faden 18,6 ms → 4 Fäden
-   9,7 ms je Bild; feste Eingabegröße bringt weitere 18 %. Offen: entscheiden, ob eine zweite
-   statische Datei (384 px fürs Foto) dazukommt.
+   9,7 ms je Bild; feste Eingabegröße bringt weitere 18 %. Dazu die Umrechnung über eine
+   256er-Tabelle statt Division je Pixel: **5,09 → 2,18 ms** je 320-px-Bild (57 %, gemessen).
+   Offen: entscheiden, ob eine zweite statische Datei (384 px fürs Foto) dazukommt.
+
+1d. **Block 6 – Kataloge, 74 Klassen, Upsampling** (in Arbeit, 03.10.). Umgesetzt und lokal
+   gegen echte Daten geprüft (`data/_kaggle_probe.py`):
+   * **Taxonomie** [`tools/signmap.py`](tools/signmap.py): **74 Klassen** statt 9. GTSIGN-220
+     deckt 68 davon ab, Synset 73; nur `ortstafel` fehlt bei Synset. 9 GTSIGN-Katalogzeilen
+     (Absperrschranke, Leitplatte, Grünpfeilschild, Abschleppzone) werden verworfen – das ist
+     Ausstattung, kein Zeichentyp.
+   * **Datenbauer** [`tools/crops_dataset.py`](tools/crops_dataset.py): komponiert echte
+     Ausschnitte aus GTSRB + GTSIGN + Synset in Szenen; `--weight` **uptsampelt je Quelle**
+     (nicht je Bild), `--balance` zieht seltene Klassen häufiger. Dazu
+     [`tools/gtsdb_dataset.py`](tools/gtsdb_dataset.py) für die **einzigen echten Szenen**.
+   * **Messlatte ist jetzt eine andere**: GTSIGN-`val` (7 038 Ausschnitte) + Synset-`validation`
+     + GTSDB `valid`/`test` (162 echte Szenen) – Bilder, die im Training nicht vorkommen
+     (Überschneidung der Split-Listen **geprüft = 0**). Die GTSRB-`val`-Zahl von 0,903 ist
+     damit **nicht** mehr vergleichbar; die alte Vergleichsmessung ist abgeschaltet
+     (`ALT_VERGLEICH = False`), weil der veröffentlichte Checkpoint 9 Klassen hat und die
+     neuen 74 nicht ausgeben kann.
+   * **Ehrlich gemeldet**: von 383 GTSDB-Trainingsbildern hatten 50 nur Zeichen unter 6 px
+     nach dem Einpassen auf 320 px. Das Werkzeug schreibt das in den Bericht, statt es zu
+     verschweigen.
 
 2. **Kachelmodus in die App**: `src/model.js` + `src/app.js` – Foto in N×N überlappende
    Kacheln, Treffer verschieben, NMS über die Kachelgrenzen, **höhere Schwelle** im Kachelmodus

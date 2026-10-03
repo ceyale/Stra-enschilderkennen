@@ -161,11 +161,12 @@ Drei Dinge, die man beim Hosten kennen sollte:
 | `tests/detector.test.js` | Test der Heuristik mit synthetisch gezeichneten Schildern |
 | `tests/model.test.js` | Test der Modell-Mathematik inkl. Gegenprobe gegen die Python-Seite |
 | `tests/fixtures/` | Fixture mit echten ONNX-Ausgaben für diese Gegenprobe |
-| `tools/` | Python-Werkzeuge: Modell, Training (`train_det.py`), Daten (`gtsrb_dataset.py`, `synth_data.py`, `synth_missing.py`), Auswertung (`eval_conditions.py`), Export, Doku-Hilfen (nicht ausgeliefert) |
+| `tools/` | Python-Werkzeuge: Modell, Training (`train_det.py`), Klassen (`signmap.py`), Daten (`crops_dataset.py`, `gtsdb_dataset.py`, `gtsrb_dataset.py`, `synth_data.py`), Auswertung (`eval_conditions.py`), Export, Doku-Hilfen (nicht ausgeliefert) |
 | `kaggle/` | Trainingslauf auf Kaggle (Datensatz bauen + trainieren + exportieren), siehe [`kaggle/README.md`](kaggle/README.md) – nötig, weil die Windows-Anwendungssteuerung PyTorch lokal blockiert |
 | `models/` | Zielort der Modell-Dateien (lokal erzeugt, nicht im Git) |
 | `docs/DOKUMENTATION.md` | Ausführliche Doku: Algorithmus, Schwellwerte, Grenzen, Erweiterungen |
 | `docs/TRAINING.md` | KI-Modus: Architektur, gemessene Kosten, Training, Export, Browser |
-| `docs/DATENSAETZE.md` | Datensatz-Recherche: Umfang, **Lizenz**, StVO-Zuordnung auf die 9 Typen, Tempo-Messung |
+| `docs/DATENSAETZE.md` | Datensatz-Recherche: Umfang, **Lizenz**, StVO-Zuordnung auf die 74 Klassen, was eingebaut wurde, Tempo-Messung |
+| `data/` | Rohdaten und Diagnose-Werkzeuge (`_speed.py`, `_fp_messung.py`, `_dubletten.py`, `_kaggle_probe.py`) – nicht im Git, nicht ausgeliefert |
 
 Lizenz: MIT.

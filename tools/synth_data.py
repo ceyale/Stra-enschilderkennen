@@ -34,9 +34,27 @@ WHITE = (245, 245, 240)
 # Roll-Politik (siehe docs/TRAINING.md 9.4): ein rotes Dreieck ist bei starker Drehung
 # nicht mehr von seinem Gegenstueck zu unterscheiden - die Spitze zeigt dann zur Seite.
 # Solche Bilder waeren widerspruechliche Lernziele, deshalb bleiben Dreiecke mild.
-TRIANGLE_LABELS = ("warnung", "vorfahrtGewaehren")
+TRIANGLE_LABELS = ("warnGefahrstelle", "vorfahrtGewaehren")
 ROLL_MILD = 35.0     # Dreiecke: bis hierher ist "Spitze oben/unten" eindeutig
 ROLL_STARK = 70.0    # Kreise, Rechtecke, Rauten: bleiben auch stark gedreht eindeutig
+
+# Die gezeichneten Kacheln dieser Datei decken nur neun Grundformen ab. Seit der
+# Klassenerweiterung (tools/signmap.py) heissen die Klassen feiner, und die uebrigen kommen
+# als ECHTE Ausschnitte (tools/crops_dataset.py) - 74 Symbole von Hand zu malen waere falsch
+# und unnoetig. Diese Tabelle ist die Bruecke: neuer Klassenname -> gezeichnete Grundform.
+# Links stehen immer Namen aus tools/signmap.LABELS, rechts die Malvorlage weiter unten.
+SYNTH_FORM: dict[str, str] = {
+    "stop": "stop",
+    "vorfahrtGewaehren": "vorfahrtGewaehren",
+    "warnGefahrstelle": "warnung",          # rotes Dreieck mit Symbol
+    "tempo30": "verbot",                    # roter Ring mit Zahl
+    "einfahrtVerboten": "einfahrtVerboten",
+    "gebotGeradeaus": "gebot",              # blauer Kreis mit Pfeil
+    "hinweisSonstiges": "hinweis",           # blaues Rechteck
+    "vorfahrtstrasse": "vorfahrtstrasse",
+    "ortstafel": "ortstafel",
+}
+SYNTH_LABELS: tuple = tuple(SYNTH_FORM)     # Namen, wie sie im Modell gelten
 
 
 def roll_angle(rng: random.Random, label: str) -> float:
@@ -61,7 +79,12 @@ def _poly_regular(cx: float, cy: float, r: float, n: int, rot: float = 0.0) -> l
 
 
 def sign_patch(name: str, size: int = 128) -> Image.Image:
-    """Ein Schild als RGBA-Kachel (transparenter Rand). Geometrie = deutsche Zeichen."""
+    """Ein Schild als RGBA-Kachel (transparenter Rand). Geometrie = deutsche Zeichen.
+
+    `name` ist ein Klassenname aus tools/signmap.LABELS; gezeichnet werden nur die neun
+    Grundformen aus SYNTH_FORM.
+    """
+    name = SYNTH_FORM.get(name, name)
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     c, r = size / 2, size * 0.40
@@ -106,7 +129,9 @@ def sign_patch(name: str, size: int = 128) -> Image.Image:
         for k in range(2):
             d.rectangle([c - r * 0.7, c - r * 0.28 + k * r * 0.42, c + r * 0.7, c - r * 0.12 + k * r * 0.42], fill=(40, 40, 40))
     else:
-        raise ValueError(f"unbekanntes Schild: {name}")
+        raise ValueError(
+            f"unbekanntes Schild: {name!r} - gezeichnet werden nur {', '.join(SYNTH_LABELS)}. "
+            "Alle anderen Klassen kommen als echte Ausschnitte aus tools/crops_dataset.py.")
     return img
 
 
@@ -237,6 +262,44 @@ def place_sign(img: Image.Image, name: str, rng: random.Random, side: int,
             "cy": (py + ys.min() + bh / 2) / h_img, "w": bw / w_img, "h": bh / h_img}
 
 
+def place_crop(img: Image.Image, crop: Image.Image, rng: random.Random, side: int,
+               center: tuple[float, float] | None = None,
+               tags: list[str] | None = None) -> dict | None:
+    """Einen ECHTEN Schildausschnitt einpassen und die Box dazu zurueckgeben (None = verworfen).
+
+    Gegenstueck zu place_sign fuer die grossen Kataloge (GTSIGN-220, Synset Signset Germany,
+    GTSRB): dort ist der Ausschnitt schon das Zeichen, es gibt keine Alphamaske, aus der sich
+    die Form ableiten liesse. Die Box ist deshalb das ganze Rechteck - genau so sind die
+    Quellen annotiert. Die Rechnung steht hier, damit Bild und Label nicht auseinanderlaufen
+    koennen (siehe place_sign).
+    """
+    w_img, h_img = img.size
+    side = int(max(12, side))
+    # Seitenverhaeltnis erhalten: die Ausschnitte sind fast quadratisch, aber nicht ganz.
+    cw, ch = crop.size
+    scale = side / max(cw, ch)
+    nw, nh = max(4, int(round(cw * scale))), max(4, int(round(ch * scale)))
+    if nw >= w_img or nh >= h_img:
+        return None
+    t = crop.resize((nw, nh), Image.LANCZOS)
+    angle = rng.uniform(-8.0, 8.0) if rng.random() < 0.5 else 0.0   # leichte Schieflage
+    if angle:
+        t = t.rotate(angle, resample=Image.BICUBIC, expand=True)
+        if tags is not None:
+            tags.append("roll")
+    tw, th = t.size
+    if tw >= w_img or th >= h_img:
+        return None
+    if center is None:
+        px, py = rng.randrange(w_img - tw), rng.randrange(h_img - th)
+    else:
+        px = min(max(0, int(round(center[0] - tw / 2))), w_img - tw)
+        py = min(max(0, int(round(center[1] - th / 2))), h_img - th)
+    img.paste(t, (px, py))
+    return {"cx": (px + tw / 2) / w_img, "cy": (py + th / 2) / h_img,
+            "w": tw / w_img, "h": th / h_img}
+
+
 def screen_artifacts(arr: np.ndarray, rng: random.Random) -> tuple[np.ndarray, list[str]]:
     """Artefakte einer abfotografierten Anzeige: Moire, Gammaschlag, Kanalversatz, Wackeln.
 
@@ -285,7 +348,7 @@ def screen_panel(rng: random.Random, size: int = 320, labels: list[str] | None =
     15 bis 70 px Kantenlaenge - mit den Anzeige-Artefakten ist das die Bruecke zwischen
     "scharfer Ausschnitt" und "abfotografierte Tafel".
     """
-    pool = labels or SIGN_LABELS
+    pool = labels or SYNTH_LABELS
     canvas = Image.fromarray(random_background(rng, size))
     rand = int(rng.uniform(0.02, 0.2) * size)
     grau = int(rng.uniform(185, 252))
@@ -511,7 +574,7 @@ def compose_sample(rng: random.Random, size: int = 320, n_signs: int | None = No
                                         occlude_prob=occlude_prob)
         if boxes:                      # Rueckfall von screen_panel liefert schon Boxen
             return arr, boxes, tags
-    pool = labels or SIGN_LABELS
+    pool = labels or SYNTH_LABELS
     n = n_signs if n_signs is not None else rng.choice([1, 1, 1, 2, 3])
     names = rng.sample(pool, min(n, len(pool)))
     img = Image.fromarray(random_background(rng, size))

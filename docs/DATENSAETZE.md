@@ -118,3 +118,46 @@ die **Rangfolge** der Varianten überträgt sich.
 * TT100K: Zhu et al., CVPR 2016; Übersicht `docs.ultralytics.com/datasets/detect/tt100k` (CC BY-NC 2.0)
 * RTSD: `graphics.cs.msu.ru/projects/traffic-sign-recognition.html` – Lizenz dort nicht ausgewiesen
 * COOP/COEP für die Auslieferung: `developers.cloudflare.com/workers/static-assets/headers/`
+
+## 8. Was tatsächlich eingebaut wurde (Block 6, 03.10.2026)
+
+Aus der Recherche oben ist ein Trainingslauf geworden. Nicht alles aus dem Katalog ist
+drin - und zwar aus Gründen, die man nachlesen kann:
+
+| Quelle | Wie sie im Training landet | Nachweis |
+|---|---|---|
+| **GTSRB** | 39 209 Ausschnitte, ClassId → `tools/signmap.py` | `python tools/crops_dataset.py --nur-zaehlen` |
+| **GTSIGN-220** | 71 264 Ausschnitte aus 75 541, StVO-Nummer → Label; **Split-rein** in Training (57 006) und Messlatte (7 038) | Probe: `data/_kaggle_probe.py`, Überschneidung der Split-Listen = 0 |
+| **Synset Signset Germany** | **gestreamt** von HuggingFace (nicht hochgeladen): 12 000 Training + 3 000 Messlatte aus `Cycles`, gleichmäßig über die Klassen gesprungen | `[synset] jedes N. Bild` im Protokoll |
+| **GTSDB** (COCO-Fassung, CC BY 4.0) | **die einzigen echten Szenen**: 383 train / 162 valid+test als Messlatte, 72 MB zur Laufzeit geladen | `[gtsdb] 383 echte Szenen, 35 Klassen` |
+| **Open Images** | 4 000 Fotos **ohne** Verkehrszeichen-Annotation, in **drei getrennte Töpfe** (Training/Messlatte/Fehlalarme) - als echte Umgebung und als Fehlalarm-Gegenprobe | `[oi] Fotos getrennt: train/val/neg` |
+| **Mapillary MTSD**, TT100K, BDD100K | **absichtlich nicht** (Lizenz, siehe §3) | - |
+
+### Was dabei gemessen wurde
+
+* **74 Klassen** sind die neue Taxonomie (vorher 9). Beide deutschen Kataloge sind
+  unabhängig voneinander darauf abgebildet: GTSIGN deckt **68** davon ab, Synset **73**, nur
+  `ortstafel` fehlt bei Synset und kommt aus GTSIGN/GTSRB.
+* Der Abgleich ist die eigentliche Prüfung: zwei Kataloge, die ihre Klassen unterschiedlich
+  benennen (StVO-Nummer gegen deutschen Namen), müssen auf denselben Namen landen. Übrig
+  bleiben bei GTSIGN **9 Katalogzeilen** - Absperrschranke, Leitplatte, Grünpfeilschild,
+  Abschleppzone: kein Zeichentyp, sondern Ausstattung. Sie werden verworfen, nicht in einen
+  Sammeltopf geworfen.
+* **Kleine Schilder sind ein gemeldeter Zustand, keine stille Schwäche**: von 383
+  GTSDB-Trainingsbildern hatten **50** nur Zeichen unter 6 px nach dem Einpassen auf 320 px.
+  Das Werkzeug sagt das beim Bauen.
+* Das **Upsampling** sitzt auf der *Quelle*, nicht auf dem Bild: `--weight gtsign=2
+  --weight synset=2` verdoppelt den Anteil dieser beiden Kataloge gegenüber GTSRB. Vorher war
+  ein kleiner, sauber annotierter Katalog in der Menge der großen unsichtbar.
+* **Open Images** liefert nur 19 phrasengleiche „Traffic sign"-Annotationen im
+  Validierungssplit (von 35 925 Fotos). Der Nutzen dieser Quelle liegt deshalb **nicht** in
+  den Labels, sondern in den Fotos: echte Umgebung und eine Gegenprobe, die nicht deutsch ist.
+
+### Wie das Klassenziel zu lesen ist
+
+„Fast alle Verkehrszeichen" heißt hier: **74 Klassen**, die 220 StVO-Katalognummern und 211
+Synset-Klassen abdecken - gruppiert nach Form und Funktion (Tempolimits einzeln nach Zahl,
+Gefahrzeichen nach dem Symbol im Dreieck, Sonstiges in benannte Sammelklassen wie
+`warnSonstiges`). Die Gruppierung ist Absicht: bei 20 px Zeichenhöhe ist das Symbol im
+Inneren oft nicht mehr auflösbar, eine Zahl im roten Ring dagegen schon. Ein Modell mit 220
+Klassen würde dort raten und dabei die sicheren Klassen mit herunterziehen.

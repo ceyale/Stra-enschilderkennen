@@ -56,25 +56,33 @@ import time
 # Negative aus Block 5 (29 600 statt 26 000 Trainingsbilder).
 # ---------------------------------------------------------------------------
 DATEN = dict(
-    n_train=20000,        # GTSRB-Kompositionen, Typen ausgeglichen (--balance)
-    n_val=1800,           # GTSRB-Testbilder als Messlatte (bleibt unausgeglichen)
-    n_fehlend=3000,       # Lueckenschluss: hinweis + ortstafel (GTSRB hat sie nicht)
-    n_fehlend_val=200,    # dieselbe Luecke in der Messlatte (1800 + 200 = 2 000)
-    n_neg_train=3000,     # synthetische Bilder ohne Schild
-    n_neg_neg=500,        # synthetische Negative als Messlatte
-    n_echt_train=3600,    # echte Fotos ohne Schild (coco128 + eigenes Foto)
-    n_echt_neg=600,       # deren gesperrter Teil als Messlatte
-    coco_test_n=12,       # die letzten 12 coco-Fotos sind nur im Split neg
-    user_share_train=0.55,
-    user_share_neg=0.35,
+    # Klassen: 74 statt 9 (tools/signmap.py). Quellen: GTSRB + GTSIGN-220 + Synset Signset
+    # Germany + Open Images. --weight gleicht die Quellen an: GTSIGN und Synset sind kleiner,
+    # aber sauberer annotiert, und ohne den Faktor wuerde die Menge der GTSRB-Bilder sie
+    # erdruecken (siehe tools/crops_dataset.py).
+    n_train=30000,
+    n_val=2500,
+    n_neg=1000,               # echte Negative (Open-Images-Fotos ohne Verkehrszeichen)
+    n_neg_synth=500,          # dazu synthetische Negative als Gegenprobe
+    n_echt_train=3600,        # echte Fotos ohne Schild aus Block 5 (coco128 + eigenes Foto)
+    coco_test_n=12,           # die letzten 12 coco-Fotos bleiben fuer die Messlatte gesperrt
+    user_share_train=0.55,    # Anteil des eigenen Fotos, nur die obere Haelfte
     size=320,
+    weights=("gtsign=2", "synset=2"),
+    gtsign_train_max=24000,   # Ausschnitte aus dem GTSIGN-Trainingssplit
+    gtsign_val_max=6000,      # Ausschnitte aus dem GTSIGN-Validierungssplit (fremde Messlatte)
+    synset_train_max=12000,   # Synset-Ausschnitte (Trainingssplit der Karte)
+    synset_val_max=3000,      # Synset-Ausschnitte (Validierungssplit der Karte)
+    oi_max=4000,              # Open-Images-Fotos ohne Verkehrszeichen
+    neg_share_train=0.12,     # Anteil echter Fotos ohne Schild im Training
+    neg_share_val=0.20,       # derselbe Anteil in der Messlatte
 )
 TRAINING = dict(
     preset="balanced",
     size=320,
     batch=16,
     epochs=220,
-    steps=150,            # 150 x 16 = 2 400 Bilder je Epoche; mehr Abdeckung der 29 600 Bilder
+    steps=150,            # 150 x 16 = 2 400 Bilder je Epoche
     lr=1.5e-3,
     degrade=0.6,
     zoom=0.5,             # Mehrskaligkeit - Grund fuer die freie Eingabegroesse im Browser
@@ -82,12 +90,19 @@ TRAINING = dict(
     eval_every=10,
     save_every=10,
     seed=7,
-    obj_norm="pos",       # "sqrt" waere ruhiger bei so vielen Negativen - ungemessen
+    obj_norm="pos",
     val_split="val",
 )
 AUSWERTUNG = dict(conf=0.25, iou=0.5, iou_det=0.45, zweite_groesse=384)
 AUFRAEUMEN = True         # Bildordner nach dem Zippen loeschen (sonst 65 000 Ausgabedateien)
-ERWARTET = {"train": 29600, "val": 2000, "neg": 1100}   # PLAN.md, Block 5
+SYNSET_KONFIG = "Cycles"  # die Synset-Fassung mit Pfadverfolgung (GTSRB-Zwilling inklusive)
+SYNSET_REPO = "FraunhoferIOSB/Synset-Signset-Germany"   # wird gestreamt, nicht hochgeladen
+# Der veroeffentlichte Vergleichs-Checkpoint hat 9 Klassen, dieser Lauf trainiert 74
+# (tools/signmap.py). Die Gegenprobe "alter gegen neuer Checkpoint auf derselben Messlatte"
+# ist damit nicht moeglich - das alte Netz kann die neuen Klassen nicht ausgeben. Erst ein
+# naechster Lauf auf derselben Taxonomie kann diesen Vergleich wieder fuehren.
+ALT_VERGLEICH = False
+ERWARTET = {"train": 36983, "val": 2662, "neg": 1500}   # muss zu DATEN passen (inkl. GTSDB)
 FEHLER: list[str] = []        # Schritte, die trotz "nicht toedlich" schiefgingen (fuer den Bericht)
 
 
@@ -177,13 +192,22 @@ def eingang_finden() -> Path:
     if not EINGANG.exists():
         raise SystemExit(f"{EINGANG} fehlt - laeuft das hier ueberhaupt auf Kaggle?")
     gesehen: list[Path] = []
+    kandidaten: list[Path] = []
     for tiefe in range(1, 5):
         for kandidat in sorted(EINGANG.glob("/".join(["*"] * tiefe))):
             if not kandidat.is_dir():
                 continue
             gesehen.append(kandidat)
             if (kandidat / "tools" / "train_det.py").exists() or (kandidat / "tools.zip").exists():
-                return kandidat
+                kandidaten.append(kandidat)
+    # Ein Ordner mit `gtsrb` oder `kataloge` ist eindeutig der Datensatz. Ohne diese
+    # Bevorzugung kann ein Arbeitsordner gewinnen, in den nur die Werkzeuge kopiert wurden -
+    # gemessen bei der lokalen Probe, wo der Probe-Ordner alphabetisch vor dem Datensatz lag.
+    for kandidat in kandidaten:
+        if (kandidat / "gtsrb").exists() or (kandidat / "kataloge").exists():
+            return kandidat
+    if kandidaten:
+        return kandidaten[0]
     raise SystemExit("kein Rohdaten-Datensatz gefunden (tools/train_det.py fehlt); in "
                      f"{EINGANG} liegt: "
                      + ", ".join(p.relative_to(EINGANG).as_posix() for p in gesehen[:20]))
@@ -346,6 +370,324 @@ def alt_bereitstellen(p: Protokoll, roh: Path) -> str:
     return "alt/vergleich.pt"
 
 
+def _katalog_split(pfad: Path, split: str) -> list[str]:
+    """Eine Split-Liste eines Katalogs lesen (Kopfzeile wird erkannt und uebersprungen)."""
+    zeilen = [z.strip() for z in pfad.read_text(encoding="utf-8").splitlines() if z.strip()]
+    if zeilen and zeilen[0].lower().startswith("image_path"):
+        zeilen = zeilen[1:]
+    if not zeilen:
+        raise SystemExit(f"{pfad}: leerer Split '{split}'")
+    return zeilen
+
+
+def _stride_plan(gesamt: int, max_bilder: int) -> tuple[int, int]:
+    """Wie oft muss man springen, um aus `gesamt` hoechstens `max_bilder` zu bekommen?
+
+    Der Sprung ist Absicht: eine einfache Grenze ("die ersten 12 000") wuerde bei einer
+    nach Klassen sortierten Liste nur die ersten Klassen liefern. Gleichmaessiges Springer
+    trifft dagegen jede Klasse - auch bei Kleinstklassen mit wenigen Bildern.
+    """
+    if max_bilder <= 0 or max_bilder >= gesamt:
+        return 1, gesamt
+    schritt = max(1, gesamt // max_bilder)
+    return schritt, min(gesamt, len(range(0, gesamt, schritt)))
+
+
+def feste_ausschnitte(p: Protokoll, zip_pfad: Path, csv_pfad: Path, split_datei: Path,
+                      ziel: Path, max_bilder: int, lang: int = 384) -> int:
+    """Schildausschnitte EINES Splits als <ziel>/<label>/*.jpg bereitstellen.
+
+    Wozu ueberhaupt entpacken: tools/crops_dataset.py komponiert Bilder, und aus einem ZIP
+    heraus ist das langsam (jedes Bild einzeln entpacken). Einmal entpackt kostet es
+    Sekunden - dafuer setzt die Trennung von Training und Messlatte auf der SPLIT-LISTE des
+    Katalogs auf. Nur so besteht die Messlatte aus Bildern, die im Training nicht vorkommen
+    (PLAN.md: "getrennte Fotos, sonst betruegt man sich selbst").
+
+    Verkleinert wird auf `lang` px: das Modell sieht 320 px, ein 384-px-Ausschnitt verliert
+    dabei nichts Sichtbares und spart beim Schreiben Stunden.
+    """
+    if PROBE:
+        p.zeile(f"[probe] Ausschnitte {zip_pfad.name} <- {split_datei.name} -> {ziel} "
+                f"(max {max_bilder})")
+        return 0
+    import csv as _csv
+    import zipfile
+
+    from PIL import Image
+
+    sys.path.insert(0, str(WORK / "tools"))
+    import signmap
+
+    tab: dict[str, str] = {}
+    for r in _csv.DictReader(csv_pfad.open(encoding="utf-8")):
+        label = signmap.label_for_stvo(r["StVO_Sign_Number"])
+        if label:
+            tab[f"{int(r['Class_ID']):03d}"] = label
+    if not tab:
+        raise SystemExit(f"{csv_pfad}: keine zuordenbare Klasse gefunden")
+
+    gewuenscht = {z.replace("\\", "/") for z in _katalog_split(split_datei, "split")}
+    ziel.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_pfad) as z:
+        paare: list[tuple[str, str, str]] = []      # (Zip-Eintrag, Klasse, Label)
+        for name in z.namelist():
+            if not name.lower().endswith(".jpg"):
+                continue
+            teile = name.split("/")
+            if len(teile) < 3:
+                continue
+            klasse = teile[-2]
+            rel = "/".join(teile[-2:])
+            if rel not in gewuenscht or klasse not in tab:
+                continue
+            paare.append((name, klasse, tab[klasse]))
+        paare.sort()
+        schritt, erwartet = _stride_plan(len(paare), max_bilder)
+        p.zeile(f"[ausschnitte] {ziel.name}: {len(paare)} Bilder im Split, "
+                f"jedes {schritt}. -> {erwartet}")
+        geschrieben = 0
+        for name, klasse, label in paare[::schritt]:
+            ordner = ziel / label
+            ordner.mkdir(exist_ok=True)
+            with z.open(name) as f:
+                bild = Image.open(f).convert("RGB")
+            if max(bild.size) != lang:
+                bild = bild.resize((lang, lang), Image.BILINEAR)
+            bild.save(ordner / f"{geschrieben:07d}.jpg", quality=88)
+            geschrieben += 1
+            if geschrieben % 5000 == 0:
+                p.zeile(f"[ausschnitte]   {geschrieben}/{erwartet}")
+    leer = [d.name for d in ziel.iterdir() if d.is_dir() and not any(d.iterdir())]
+    if leer:
+        p.zeile(f"[ausschnitte] ohne Bild geblieben: {', '.join(leer)}")
+    return geschrieben
+
+
+def synset_ausschnitte(p: Protokoll, roh: Path, ziel: Path, konfig: str, split: str,
+                       max_bilder: int, lang: int = 384) -> int:
+    """Synset Signset Germany in <ziel>/<label>/*.jpg umwandeln (nur der gewaehlte Split).
+
+    STREAMEND gelesen: die Parquet-Datei enthaelt 105 500 Bilder in EINER Datei - sie
+    vollstaendig zu laden sprengt den Arbeitsspeicher der Kaggle-Maschine. Der Split kommt
+    aus der Karte des Datensatzes (train/validation), damit Trainings- und Messbilder nicht
+    dasselbe Zeichen zeigen. Beim Schreiben wird verkleinert (siehe feste_ausschnitte).
+
+    Woher gelesen wird: liegt im Rohdaten-Datensatz ein Ordner `synset/` (die HuggingFace-
+    Ablage des Datensatzes), wird der genommen - dann braucht der Lauf kein Netz. Sonst
+    wird direkt von HuggingFace gestreamt: 17,6 GB in den Kaggle-Datensatz zu legen waere
+    weder beim Hochladen noch beim Speicher vertretbar, und gestreamt werden nur die
+    Zeilengruppen gelesen, die man wirklich braucht.
+    """
+    if PROBE:
+        p.zeile(f"[probe] Synset {konfig}/{split} -> {ziel} (max {max_bilder})")
+        return 0
+    lokal = roh / "synset"
+    quelle = str(lokal) if lokal.exists() else SYNSET_REPO
+    p.zeile(f"[synset] Quelle: {quelle}")
+    from datasets import load_dataset
+    from PIL import Image
+
+    sys.path.insert(0, str(WORK / "tools"))
+    import signmap
+
+    p.zeile(f"[synset] Durchlauf 1/2: Klassenverzeichnis von {konfig}/{split}")
+    try:
+        kopf = load_dataset(quelle, konfig, split=split, streaming=True)
+        zuordnung: dict[int, str] = {}
+        gesamt = 0
+        for r in kopf.select_columns(["label", "class_name"]):
+            l = int(r["label"])
+            zuordnung.setdefault(l, str(r["class_name"]))
+            gesamt += 1
+    except Exception as fehler:
+        p.zeile(f"[synset] nicht lesbar ({type(fehler).__name__}: {fehler}) - Quelle entfaellt")
+        return 0
+    if not gesamt:
+        p.zeile("[synset] Split leer")
+        return 0
+    schritt, erwartet = _stride_plan(gesamt, max_bilder)
+    p.zeile(f"[synset] {gesamt} Bilder, {len(zuordnung)} Klassen; Durchlauf 2/2: "
+            f"jedes {schritt}. Bild (gleichmaessig ueber alle Klassen)")
+    ziel.mkdir(parents=True, exist_ok=True)
+    daten = load_dataset(str(quelle), konfig, split=split, streaming=True)
+    geschrieben, unbekannt = 0, 0
+    for i, r in enumerate(daten):
+        if i % schritt or geschrieben >= erwartet:
+            continue
+        label = signmap.label_for_synset(zuordnung.get(int(r["label"]), ""))
+        if not label:
+            unbekannt += 1
+            continue
+        ordner = ziel / label
+        ordner.mkdir(exist_ok=True)
+        bild = r["image"]
+        if max(bild.size) != lang:
+            bild = bild.resize((lang, lang), Image.BILINEAR)
+        bild.convert("RGB").save(ordner / f"{i:07d}.jpg", quality=88)
+        geschrieben += 1
+        if geschrieben % 2000 == 0:
+            p.zeile(f"[synset]   {geschrieben}/{erwartet}")
+    if unbekannt:
+        p.zeile(f"[synset] {unbekannt} Bild(er) ohne Label in unserer Liste - uebersprungen")
+    return geschrieben
+
+
+# Open Images V7: die dichte Fassung liegt als "2018_04" weiterhin zum Abruf bereit
+# (die Pfade unter /v7/ antworten mit 403 - gemessen). Verkehrszeichen ist /m/01mqdt.
+OI_BASIS = "https://storage.googleapis.com/openimages/2018_04"
+OI_FOTO = "https://open-images-dataset.s3.amazonaws.com"
+OI_VERKEHRSZEICHEN = "/m/01mqdt"
+
+
+def oi_bereitstellen(p: Protokoll, roh: Path, ziel: Path, max_fotos: int,
+                     split: str = "validation") -> int:
+    """Fotos aus Open Images holen, auf denen KEIN Verkehrszeichen annotiert ist.
+
+    Zwei Aufgaben auf einmal: sie liefern echte Umgebungen fuer die Komposition (statt nur
+    synthetischer Flaechen) und sie sind die ehrliche Gegenprobe auf Fehlalarme - echte
+    Fotos ohne deutsches Schild. Bilder MIT Verkehrszeichen werden uebersprungen: sie waeren
+    als Negativ falsch beschriftet (im Foto steckt ein Zeichen, nur kein deutsches).
+
+    Vorbereitete Fotos (Ordner `oi-negatives/` im Rohdaten-Datensatz) haben Vorrang: dann
+    braucht der Kernel kein Netz fuer die Bilder und der Lauf ist reproduzierbar.
+    """
+    if PROBE:
+        p.zeile(f"[probe] Open Images -> {ziel} (max {max_fotos})")
+        return 0
+    ziel.mkdir(parents=True, exist_ok=True)
+    vorbereitet = roh / "oi-negatives"
+    if vorbereitet.exists():
+        fotos = sorted(q for q in vorbereitet.iterdir()
+                       if q.suffix.lower() in (".jpg", ".jpeg", ".png"))[:max_fotos]
+        for i, f in enumerate(fotos):
+            shutil.copy2(f, ziel / f"{i:05d}.jpg")
+        p.zeile(f"[oi] {len(fotos)} vorbereitete Fotos aus {vorbereitet} uebernommen")
+        return len(fotos)
+
+    import csv as _csv
+    import urllib.request
+
+    p.zeile(f"[oi] hole Annotationen ({split})")
+    mit_zeichen: set[str] = set()
+    alle: set[str] = set()
+    try:
+        adresse = f"{OI_BASIS}/{split}/{split}-annotations-bbox.csv"
+        p.zeile(f"[oi] hole {adresse}")
+        with urllib.request.urlopen(adresse, timeout=120) as antwort:
+            zeilen = (z.decode("utf-8", "replace") for z in antwort)
+            for r in _csv.DictReader(zeilen):
+                bild, label = r["ImageID"], r["LabelName"]
+                alle.add(bild)
+                if label == OI_VERKEHRSZEICHEN:
+                    mit_zeichen.add(bild)
+    except Exception as fehler:
+        p.zeile(f"[oi] Annotationen nicht abrufbar ({type(fehler).__name__}: {fehler}) - "
+                "Quelle entfaellt")
+        return 0
+    kandidaten = sorted(alle - mit_zeichen)
+    p.zeile(f"[oi] {len(alle)} Fotos im Split {split}, davon {len(mit_zeichen)} mit "
+            f"Verkehrszeichen; {len(kandidaten)} ohne")
+    geholt, versuche = 0, 0
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def hole(bild: str) -> bytes | None:
+        try:
+            with urllib.request.urlopen(f"{OI_FOTO}/{split}/{bild}.jpg", timeout=60) as f:
+                return f.read()
+        except Exception:
+            return None                                  # einzelne Ausfaelle sind normal
+
+    # Acht Faehden: bei rund 0,3 s je Foto sind 4 000 Bilder sonst 20 Minuten Wartezeit.
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        auftraege = {pool.submit(hole, bild): bild for bild in kandidaten[: max_fotos * 2]}
+        for auftrag in as_completed(auftraege):
+            versuche += 1
+            if geholt >= max_fotos:
+                for rest in auftraege:              # Schluessel sind die Auftraege selbst
+                    rest.cancel()
+                break
+            rohdaten = auftrag.result()
+            if rohdaten is None:
+                continue
+            (ziel / f"{geholt:05d}.jpg").write_bytes(rohdaten)
+            geholt += 1
+            if geholt % 500 == 0:
+                p.zeile(f"[oi]   {geholt}/{max_fotos}")
+    if geholt < max_fotos:
+        p.zeile(f"[oi] nur {geholt} von {max_fotos} Fotos geladen ({versuche} Versuche)")
+    return geholt
+
+
+def oi_aufteilen(p: Protokoll, quelle: Path, anteile: tuple = (0.60, 0.15, 0.25)) -> dict:
+    """Die Open-Images-Fotos in drei Toepfe trennen (Training / Messlatte / Fehlalarme).
+
+    Das ist die wichtigste Vorsichtsmassnahme dieses Blocks: ein FOTO, dessen Ausschnitte im
+    Training lagen, darf nicht in der Messlatte liegen - sonst misst man Gelerntes. Getrennt
+    werden deshalb die Fotos, nicht die fertigen Bilder.
+    """
+    fotos = sorted(quelle.glob("*.jpg"))
+    if not fotos:
+        return {"train": 0, "val": 0, "neg": 0}
+    g1 = int(len(fotos) * anteile[0])
+    g2 = g1 + int(len(fotos) * anteile[1])
+    toepfe = {"train": fotos[:g1], "val": fotos[g1:g2], "neg": fotos[g2:]}
+    zahlen: dict[str, int] = {}
+    for name, liste in toepfe.items():
+        ziel = WORK / f"oi-{name}"
+        ziel.mkdir(parents=True, exist_ok=True)
+        for i, f in enumerate(liste):
+            shutil.copy2(f, ziel / f"{i:05d}.jpg")
+        zahlen[name] = len(liste)
+    p.zeile("[oi] Fotos getrennt (kein Leck zwischen Training und Messlatte): "
+            + ", ".join(f"{k}={v}" for k, v in zahlen.items()))
+    return zahlen
+
+
+def gtsdb_bereitstellen(p: Protokoll, roh: Path, ziel: Path) -> dict:
+    """GTSDB (echte deutsche Szenen, COCO-Fassung) holen und entpacken.
+
+    Nur 72 MB - deshalb wird zur Laufzeit geladen statt in den Kaggle-Datensatz gelegt.
+    Liegt im Rohdaten-Datensatz schon ein Ordner `gtsdb-coco/`, wird der genommen.
+
+    Das ist die einzige Quelle mit fertigen Szenen (Schild klein im Bild). Sie liefert damit
+    die ehrliche Messlatte, die das Projekt bisher nicht hatte (PLAN.md §1).
+    """
+    if PROBE:
+        p.zeile(f"[probe] GTSDB -> {ziel}")
+        return {"gefunden": True, "teile": {"train": 0, "valid": 0, "test": 0}}
+    vorbereitet = roh / "gtsdb-coco"
+    teile = ("train", "valid", "test")
+    if vorbereitet.exists():
+        for name in teile:
+            if (vorbereitet / name).exists():
+                shutil.copytree(vorbereitet / name, ziel / name, dirs_exist_ok=True)
+        p.zeile(f"[gtsdb] vorbereitete Szenen aus {vorbereitet} uebernommen")
+        return {"gefunden": True, "teile": {n: (ziel / n).exists() for n in teile}}
+
+    import urllib.request
+    import zipfile
+
+    ziel.mkdir(parents=True, exist_ok=True)
+    geholt = {}
+    for name in teile:
+        adresse = (f"https://huggingface.co/datasets/keremberke/"
+                   f"german-traffic-sign-detection/resolve/main/data/{name}.zip")
+        zieldatei = ziel / f"{name}.zip"
+        try:
+            p.zeile(f"[gtsdb] hole {adresse}")
+            with urllib.request.urlopen(adresse, timeout=120) as f:
+                zieldatei.write_bytes(f.read())
+            with zipfile.ZipFile(zieldatei) as z:
+                z.extractall(ziel / name)
+            zieldatei.unlink()
+            geholt[name] = len(list((ziel / name).glob("*.jpg")))
+        except Exception as fehler:
+            p.zeile(f"[gtsdb] {name} nicht ladbar ({type(fehler).__name__}: {fehler})")
+            geholt[name] = 0
+    p.zeile("[gtsdb] Szenen: " + ", ".join(f"{k}={v}" for k, v in geholt.items()))
+    return {"gefunden": False, "teile": geholt}
+
+
 def einrichten(p: Protokoll, roh: Path) -> dict:
     """Arbeitsverzeichnis herrichten: Code bereitstellen, Rohdaten normalisieren.
 
@@ -386,40 +728,89 @@ def einrichten(p: Protokoll, roh: Path) -> dict:
 
     (WORK / "models").mkdir(exist_ok=True)
     (WORK / "berichte").mkdir(exist_ok=True)
+
+    # --- Die neuen Kataloge (tools/crops_dataset.py) -------------------------------------
+    # Alles, was der Kernel an Zusatzdaten braucht, kommt aus dem Rohdaten-Datensatz. Fehlt
+    # ein Katalog, wird er gemeldet und uebersprungen - der Lauf faellt nicht um.
+    katalog = roh / "kataloge"
+    gtsign_zip = katalog / "GTSIGN-220.zip"
+    fehlend = [q.name for q in (gtsign_zip, katalog / "class_descriptions_and_stvo.csv")
+               if not q.exists()]
+    if fehlend:
+        p.zeile(f"[hinweis] GTSIGN-220 fehlt im Rohdaten-Datensatz ({', '.join(fehlend)}) - "
+                "Quelle entfaellt")
+    crops = {"gtsign_train": 0, "gtsign_val": 0, "synset_train": 0, "synset_val": 0}
+    if not fehlend:
+        crops["gtsign_train"] = feste_ausschnitte(
+            p, gtsign_zip, katalog / "class_descriptions_and_stvo.csv",
+            katalog / "gtsign_splits" / "train.txt", WORK / "crops" / "gtsign-train",
+            DATEN["gtsign_train_max"])
+        crops["gtsign_val"] = feste_ausschnitte(
+            p, gtsign_zip, katalog / "class_descriptions_and_stvo.csv",
+            katalog / "gtsign_splits" / "val.txt", WORK / "crops" / "gtsign-val",
+            DATEN["gtsign_val_max"])
+    crops["synset_train"] = synset_ausschnitte(p, roh, WORK / "crops" / "synset-train",
+                                               SYNSET_KONFIG, "train",
+                                               DATEN["synset_train_max"])
+    crops["synset_val"] = synset_ausschnitte(p, roh, WORK / "crops" / "synset-val",
+                                             SYNSET_KONFIG, "validation",
+                                             DATEN["synset_val_max"])
+    oi_bereitstellen(p, roh, WORK / "oi-alle", DATEN["oi_max"])
+    oi = oi_aufteilen(p, WORK / "oi-alle")
+    gtsdb = gtsdb_bereitstellen(p, roh, WORK / "gtsdb-coco")
+
     return {"tools": str(tools), "gtsrb": str(WORK / "gtsrb"), "coco128": coco,
-            "foto": str(nutzer / "Nothing.jpg"), "alt": alt_bereitstellen(p, roh)}
+            "foto": str(nutzer / "Nothing.jpg"),
+            "alt": alt_bereitstellen(p, roh) if ALT_VERGLEICH else "",
+            "crops": crops, "oi": oi, "gtsdb": gtsdb}
 
 
 
-def datensatz_bauen(p: Protokoll) -> dict:
-    """Den Detektor-Datensatz bauen - dieselben acht Aufrufe wie docs/TRAINING.md §4.3/§4.3+.
+def datensatz_bauen(p: Protokoll, ein: dict) -> dict:
+    """Den Detektor-Datensatz bauen - jetzt aus vier Quellen mit Quellen-Upsampling.
 
-    Reihenfolge und Zahlen sind der Block-5-Stand aus PLAN.md §2: 29 600 Trainingsbilder
-    (20 000 GTSRB + 3 000 Lueckenschluss + 3 000 synthetische + 3 600 echte Negative),
-    Messlatte 2 000 (val) und 1 100 (neg). Die Werkzeuge haengen sich an einen BESTEHENDEN
-    Ordner (manifest.json), deshalb ist die Reihenfolge bindend: erst GTSRB, dann alles
-    Synthetische, dann die echten Negative.
+    Aufbau (PLAN.md, Block 6): erst die Kataloge fuer Training und Messlatte getrennt, dann
+    die synthetischen Negative (Negativbilder OHNE Schild sind im Betrieb die halbe Miete),
+    dann die echten Negative aus Open Images. Die Werkzeuge haengen sich an einen
+    BESTEHENDEN Ordner (manifest.json), deshalb ist die Reihenfolge bindend.
+
+    Der entscheidende Unterschied zu Block 5: die Messlatte wird aus den SPLITS der Kataloge
+    gebaut (GTSIGN-val, Synset-validation), nicht nur aus GTSRB. Vorher war sie GTSRB-Material
+    mit grossen Zeichen - dort stand 0,90, waehrend dasselbe Modell auf echten Szenen 0,00
+    lieferte (PLAN.md §1). Ein Split des Katalogs kommt NIE auch ins Training: sonst misst
+    man dasselbe Bild, das man gelernt hat.
     """
-    d, t = DATEN, TRAINING
+    d = DATEN
     dauer: dict[str, float] = {}
+    # Upsampling der Quellen: --weight gilt JE QUELLE, nicht je Bild. GTSIGN und Synset sind
+    # kleiner, aber sauberer annotiert; ohne Faktor wuerde die Menge GTSRB/Synset die
+    # GTSIGN-Bilder erdruecken.
+    g_gewichte = [arg for w in d["weights"] for arg in ("--weight", w)]
+    kataloge = ["--gtsign", "catalogs/GTSIGN-220.zip",
+                "--gtsign-csv", "catalogs/class_descriptions_and_stvo.csv"]
+
     schritte = [
-        ("gtsrb train", python("tools/gtsrb_dataset.py", "--zip", "gtsrb/train.zip",
-                               "--out", "data/det", "--n", str(d["n_train"]),
-                               "--size", str(d["size"]), "--seed", "0", "--balance")),
-        ("gtsrb val", python("tools/gtsrb_dataset.py", "--zip", "gtsrb/test.zip",
-                             "--gt-zip", "gtsrb/test-gt.zip", "--out", "data/det",
-                             "--n", str(d["n_val"]), "--size", str(d["size"]),
-                             "--split", "val", "--seed", "1")),
-        ("lueckenschluss train", python("tools/synth_missing.py", "--out", "data/det",
-                                        "--n", str(d["n_fehlend"]))),
-        ("lueckenschluss val", python("tools/synth_missing.py", "--out", "data/det",
-                                      "--n", str(d["n_fehlend_val"]), "--split", "val")),
+        # 1. Training: die Kataloge + echte Fotos aus Open Images als Umgebung und Negative
+        ("kataloge train", python("tools/crops_dataset.py", "--out", "data/det",
+                                  "--n", str(d["n_train"]), "--split", "train",
+                                  "--size", str(d["size"]), "--seed", "0", "--balance",
+                                  *kataloge,
+                                  "--synset", "crops/synset-train",
+                                  "--scenes", "oi-train",
+                                  "--neg-share", str(d["neg_share_train"]),
+                                  *g_gewichte)),
+        # 2. Messlatte: die SPLITS der Kataloge - Bilder, die im Training nicht vorkommen
+        ("kataloge val", python("tools/crops_dataset.py", "--out", "data/det",
+                                "--n", str(d["n_val"]), "--split", "val",
+                                "--size", str(d["size"]), "--seed", "1",
+                                *kataloge,
+                                "--synset", "crops/synset-val",
+                                "--scenes", "oi-val",
+                                "--neg-share", str(d["neg_share_val"]))),
+        # 3. Synthetische Negative (gezeichnete Stoererflaechen, Anzeigen, Nacht)
         ("synthetische negative", python("tools/synth_negatives.py", "--out", "data/det",
-                                         "--n", str(d["n_neg_train"]), "--split", "train")),
-        ("synthetische negative (Messlatte)", python("tools/synth_negatives.py", "--out", "data/det",
-                                                     "--n", str(d["n_neg_neg"]), "--split", "neg")),
-        # Echte Negative: Trennung ohne Selbstbetrug - vom eigenen Foto nur die obere
-        # Haelfte, die untere bleibt fuer den Split neg gesperrt (PLAN.md §2).
+                                         "--n", str(d["n_neg_synth"]), "--split", "train")),
+        # 4. Echte Negative aus Block 5 (eigenes Foto + coco128) - andere Umgebung als OI
         ("echte negative", python("tools/real_negatives.py", "--out", "data/det",
                                   "--n", str(d["n_echt_train"]), "--split", "train",
                                   "--real-train", "user/Nothing.jpg",
@@ -427,13 +818,24 @@ def datensatz_bauen(p: Protokoll) -> dict:
                                   "--coco", "negatives/coco128",
                                   "--coco-test-n", str(d["coco_test_n"]),
                                   "--user-share", str(d["user_share_train"]))),
-        ("echte negative (Messlatte)", python("tools/real_negatives.py", "--out", "data/det",
-                                              "--n", str(d["n_echt_neg"]), "--split", "neg",
-                                              "--real-test", "user/Nothing.jpg",
-                                              "--test-region", "0,0.5,1,1",
-                                              "--coco", "negatives/coco128",
-                                              "--coco-test-n", str(d["coco_test_n"]),
-                                              "--user-share", str(d["user_share_neg"]))),
+        # 5. Die Gegenprobe auf Fehlalarme: nur Bilder OHNE Schild, aus dem dritten OI-Topf
+        ("negative messlatte", python("tools/crops_dataset.py", "--out", "data/det",
+                                      "--n", str(d["n_neg"]), "--split", "neg",
+                                      "--size", str(d["size"]), "--seed", "2",
+                                      "--scenes", "oi-neg", "--neg-share", "1.0")),
+        ("synthetische negative (Messlatte)", python("tools/synth_negatives.py", "--out", "data/det",
+                                                     "--n", str(d["n_neg_synth"]), "--split", "neg")),
+        # 6. GTSDB: die einzigen ECHTEN Szenen (Schild klein im Bild). Trainingssplit ins
+        #    Training, valid+test in die Messlatte - getrennte Ordner, also kein Leck.
+        ("gtsdb train", python("tools/gtsdb_dataset.py", "--coco", "gtsdb-coco/train",
+                               "--out", "data/det", "--split", "train",
+                               "--size", str(d["size"]))),
+        ("gtsdb val", python("tools/gtsdb_dataset.py", "--coco", "gtsdb-coco/valid",
+                             "--out", "data/det", "--split", "val",
+                             "--size", str(d["size"]))),
+        ("gtsdb test", python("tools/gtsdb_dataset.py", "--coco", "gtsdb-coco/test",
+                              "--out", "data/det", "--split", "val",
+                              "--size", str(d["size"]))),
     ]
     for was, cmd in schritte:
         dauer[was] = lauf(p, cmd, f"Datensatz: {was}")
@@ -631,7 +1033,7 @@ def main() -> None:
 
     dauer: dict[str, float] = {"einrichten": 0.0}
     ein = einrichten(p, roh)
-    dauer.update(datensatz_bauen(p))
+    dauer.update(datensatz_bauen(p, ein))
     zahlen = {} if PROBE else zahlen_pruefen(p)
     dauer["training"] = trainieren(p)
 

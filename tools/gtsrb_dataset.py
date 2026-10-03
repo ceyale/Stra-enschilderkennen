@@ -47,14 +47,24 @@ CLASS_MAP: dict[int, str] = {
 SKIP = {32, 41, 42}
 
 
-def read_rows(zf: zipfile.ZipFile, gt_zf: zipfile.ZipFile | None = None) -> list[dict]:
+def read_rows(zf: zipfile.ZipFile, gt_zf: zipfile.ZipFile | None = None,
+              labeler=None, skip: set | frozenset = None) -> list[dict]:
     """Alle GT-*.csv aus dem Archiv lesen (Spalten: Filename, Roi.X1..Y2, ClassId).
 
     Beide Archivformen von GTSRB werden unterstuetzt: Trainings-Zip mit Klassenordnern
     (…/Images/00000/00000_00000.ppm) und Test-Zip ohne (…/Final_Test/Images/00000.ppm).
     Beim offiziellen Test-Set liegen die Labels in einem SEPARATEN Archiv
     (GTSRB_Final_Test_GT.zip -> GT-final_test.csv); dafuer gt_zf uebergeben (CLI: --gt-zip).
+
+    labeler bildet ClassId -> Label dieses Projekts ab. Vorgabe ist die 9-Typen-Tabelle
+    unten; tools/crops_dataset.py uebergibt stattdessen tools/signmap.label_for_gtsrb, damit
+    beide Werkzeuge dieselbe Datei nicht doppelt auswerten muessen. skip sind ClassIds, die
+    grundsaetzlich draussen bleiben ("Ende von ..." gehoert nicht zu den 9 Typen).
     """
+    if labeler is None:
+        labeler = CLASS_MAP.get
+    if skip is None:
+        skip = SKIP
     names = set(zf.namelist())
     rows: list[dict] = []
 
@@ -92,7 +102,10 @@ def read_rows(zf: zipfile.ZipFile, gt_zf: zipfile.ZipFile | None = None) -> list
             if "ClassId" not in row:          # Test-Zip liefert keine Labels -> unbrauchbar
                 continue
             cls = int(row["ClassId"])
-            if cls in SKIP or cls not in CLASS_MAP:
+            if cls in skip:
+                continue
+            label = labeler(cls)
+            if not label:
                 continue
             path = resolve(folder, row["Filename"])
             if path is None:
@@ -101,7 +114,7 @@ def read_rows(zf: zipfile.ZipFile, gt_zf: zipfile.ZipFile | None = None) -> list
                 "path": path,
                 "x1": int(row["Roi.X1"]), "y1": int(row["Roi.Y1"]),
                 "x2": int(row["Roi.X2"]), "y2": int(row["Roi.Y2"]),
-                "cls": cls, "label": CLASS_MAP[cls],
+                "cls": cls, "label": label,
             })
     return rows
 

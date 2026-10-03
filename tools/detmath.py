@@ -7,7 +7,7 @@ sonst rechnet der Browser anders als das Training.
 
 Konventionen:
   * Boxen intern immer als xyxy in PIXELN des Modell-Eingangs (320x320, nach Letterbox).
-  * Kopf-Ausgang je Zelle: [tx, ty, tw, th, obj, cls0..cls8] (14 Kanaele).
+  * Kopf-Ausgang je Zelle: [tx, ty, tw, th, obj, cls0..clsN-1] (N siehe tools/signmap.py).
   * Decode: cx = (gx + sigmoid(tx)) * stride, w = exp(tw) * stride.
 """
 from __future__ import annotations
@@ -17,7 +17,11 @@ import math
 import numpy as np
 
 LEVELS = (4, 8, 16, 32)       # stride der vier Erkennungsstufen (fein -> grob)
-N_CLASSES = 9
+# Klassenzahl an EINER Stelle: tools/signmap.py. Vorher stand hier eine zweite 9 - die
+# haette nach der Klassenerweiterung stillschweigend falsch weitergerechnet.
+import signmap
+
+N_CLASSES = signmap.N_LABELS
 N_CH = 4 + 1 + N_CLASSES
 LETTERBOX_GREY = 114          # Randfarbe beim Einpassen (muss in JS identisch sein)
 

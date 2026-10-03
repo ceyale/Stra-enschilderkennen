@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.5.0 – 2026-10-03 (in Arbeit)
+- **74 Klassen statt 9** (neu: [`tools/signmap.py`](tools/signmap.py)). Angelpunkt ist die
+  Zuordnung: GTSRB liefert eine `ClassId`, GTSIGN-220 die **StVO-Nummer** (`274-70`), Synset
+  Signset Germany den **deutschen Namen** (`Geschwindigkeit70`), GTSDB englische
+  Kategorienamen – vier Schreibweisen, eine Klassenliste. Geprüft mit
+  `python tools/signmap.py`: **GTSIGN deckt 68 der 74 Klassen ab, Synset 73** (nur
+  `ortstafel` fehlt dort), und die 9 GTSIGN-Katalogzeilen, die übrig bleiben
+  (Absperrschranke, Leitplatte, Grünpfeilschild, Abschleppzone), sind Ausstattung und keine
+  Zeichentypen – sie werden verworfen statt in einen Sammeltopf geworfen.
+- **Vier Kataloge im Training** (neu: [`tools/crops_dataset.py`](tools/crops_dataset.py),
+  [`tools/gtsdb_dataset.py`](tools/gtsdb_dataset.py)): GTSRB (39 209 Ausschnitte),
+  GTSIGN-220 (71 264 von 75 541), Synset Signset Germany (**streamend** von HuggingFace,
+  kein 17,6-GB-Upload) und **GTSDB** (383 echte Szenen zum Training). Dazu **Open Images**:
+  4 000 Fotos *ohne* Verkehrszeichen-Annotation, in **drei getrennte Töpfe** gelegt - als
+  echte Umgebung für die Komposition und als Fehlalarm-Gegenprobe.
+- **Upsampling je Quelle** (`--weight`, z. B. `gtsign=2`): der Anteil wird über die *Quelle*
+  gesteuert, nicht über die Bildzahl. Vorher war ein kleiner, sauber annotierter Katalog in
+  der Menge eines großen unsichtbaren. `--balance` zieht zusätzlich seltene Klassen häufiger.
+- **Ehrliche Messlatte**: die Auswertung läuft jetzt auf Bildern, die im Training **nicht**
+  vorkommen - GTSIGN-`val` (7 038 Ausschnitte), Synset-`validation` und GTSDB
+  `valid`+`test` (162 **echte Szenen**, Schild klein im Bild). Die Überschneidung der
+  GTSIGN-Split-Listen ist **geprüft 0** (`data/_kaggle_probe.py`). Die frühere val-Zahl
+  0,903 stammt aus GTSRB-Material und ist mit dieser Messlatte **nicht vergleichbar**; der
+  Vergleich mit dem alten Checkpoint ist deshalb abgeschaltet (`ALT_VERGLEICH = False`) -
+  ein 9-Klassen-Netz kann die neuen 74 Klassen nicht ausgeben.
+- **Tempo im Browser**, gemessen statt geschätzt:
+  * Die Umrechnung der Bilddaten läuft über eine 256er-Tabelle statt Division je Pixel:
+    **5,09 ms → 2,18 ms** je 320-px-Bild (**57 %**, node-Referenzmessung).
+  * Ausgabenamen werden einmal aufgelöst statt je Bild über `map`.
+  * Was schon stand und jetzt auch dokumentiert ist: COOP/COEP über `dist/_headers` macht
+    `crossOriginIsolated` wahr → 4 Rechenfäden statt 1 (**18,6 ms → 9,7 ms** je Bild).
+- **Absichtlich nicht genommen:** Mapillary MTSD (105 000 Bilder, 400 Klassen - fachlich der
+  beste, aber die Research-Use-Lizenz verbietet den Einbau in ein öffentliches Produkt),
+  TT100K und BDD100K (CC BY-**NC**). Begründung und Prüfweg in
+  [`docs/DATENSAETZE.md`](docs/DATENSAETZE.md) §3.
+- **Was der Lauf noch nicht zeigt:** ob 74 Klassen die Qualität halten. Der Trainingslauf
+  läuft auf Kaggle; die Zahlen kommen mit `kaggle\run.ps1 -Step pull` und gehören dann in
+  `models/README.md`. Bekannt und gemeldet: von 383 GTSDB-Trainingsbildern hatten **50** nur
+  Zeichen unter 6 px nach dem Einpassen auf 320 px.
+
 ## 0.4.1 – 2026-10-02
 - **Kaggle-Lauf Block 5 ausgewertet und übernommen** (Tesla T4, 220 Epochen × 150 Schritte,
   29 600 Trainingsbilder mit 3 600 echten Negativen und den neuen Tafel-Szenen, 70 min):
