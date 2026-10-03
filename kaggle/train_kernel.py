@@ -78,7 +78,10 @@ DATEN = dict(
     neg_share_val=0.20,       # derselbe Anteil in der Messlatte
 )
 TRAINING = dict(
-    preset="balanced",
+    # "breit" statt "balanced": 74 Klassen entscheiden sich im Kopf, deshalb dort mehr
+    # Kapazitaet (mid = Rumpfbreite) und ein Block mehr in den tiefen Stufen. Gemessen
+    # 1,88 Mio. Parameter / 1 180 MFLOPs gegen 1,32 Mio. / 916 (+29 % Rechnung).
+    preset="breit",
     size=320,
     batch=16,
     epochs=220,
