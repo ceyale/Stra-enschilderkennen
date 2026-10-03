@@ -282,12 +282,13 @@ ihn **abholen, solange der Lauf existiert** – ein neuer Push überschreibt den
 ### Lokale Prüfungen (alle grün, ohne Netz und ohne Kaggle lauffähig)
 
 ```powershell
-python data\_kernel_probe.py     # Rezept + Pfade + Distillation + Auslieferung (Teile 1–4)
-python data\_teacher_probe.py    # Lehrer-Mittelung: 2 von 4 Boxen, tempo40 unverändert
-node tests\model.test.js         # JS-Mathematik gegen die Python-Ergebnisse
-python tools\selfcheck.py        # überfittet das Netz ein Bild? (dauert)
+python tests\kernel_probe.py      # Rezept + Pfade + Distillation + Auslieferung (Teile 1–4)
+python tests\teacher_probe.py     # Lehrer-Mittelung: 2 von 4 Boxen, tempo40 unverändert
+node tests\model.test.js          # JS-Mathematik gegen die Python-Ergebnisse
+python tools\selfcheck.py         # überfittet das Netz ein Bild? (dauert)
 ```
 
-`data/_teacher_probe.py` und `data/_kernel_probe.py` sind **Prüfskripte**, keine
-Auslieferung – sie liegen in `data/` und nicht in `tools/`, damit `tools/` die Werkzeuge
-bleibt, die der Kaggle-Lauf benutzt.
+`tests/kernel_probe.py` und `tests/teacher_probe.py` sind **Prüfskripte**, keine
+Auslieferung – sie liegen deshalb in `tests/` (und damit im Git, anders als der frühere Platz
+`data/`, das komplett ignoriert wird) und rufen die Werkzeuge so auf, wie der Kaggle-Lauf sie
+aufruft. Beide brauchen **kein Netz und keine GPU**.
