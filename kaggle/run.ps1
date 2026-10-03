@@ -142,6 +142,22 @@ function Leg-Staging {
     Verlinke (Join-Path $Negativ 'coco128.zip') (Join-Path $Stage 'negatives\coco128.zip')
     Copy-Item (Join-Path $Repo 'Test\Nothing.jpg') (Join-Path $Stage 'user\Nothing.jpg')
 
+    # Die selbst gesammelten Negative des Nutzers (negative-images/). Sie sind der
+    # unmittelbare Grund fuer diesen Block: auf genau solchen Motiven (Anzeigen, Poster,
+    # Produktfotos) hatte die Vorfassung 16 Fehlalarme. Getrennt werden sie IM KERNEL
+    # (erste 70 % Training, Rest Messlatte) - hier wird nur kopiert, damit der Split an einer
+    # Stelle im Rezept steht und nachpruefbar bleibt.
+    $eigene = Join-Path $Repo 'negative-images'
+    if (Test-Path $eigene) {
+        $ziel = Join-Path $Stage 'negatives\eigene'
+        New-Item -ItemType Directory -Force $ziel | Out-Null
+        $fotos = Get-ChildItem $eigene -File | Where-Object { $_.Extension -in '.jpg', '.jpeg', '.png' }
+        foreach ($f in $fotos) { Copy-Item $f.FullName $ziel -Force }
+        Write-Host ("[ok]    negatives\eigene ({0} eigene Fotos des Nutzers)" -f $fotos.Count)
+    } else {
+        Write-Host '[hinweis] negative-images/ fehlt - ohne die eigenen Negative' -ForegroundColor Yellow
+    }
+
     # Die Kataloge (GTSIGN-220 + StVO-Tabelle + Splits) in den Kaggle-Datensatz.
     # Synset Signset Germany kommt hier absichtlich NICHT mit: 17,6 GB hochzuladen waere
     # weder zeitlich noch vom Speicher her vertretbar - der Kernel streamt es stattdessen

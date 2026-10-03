@@ -65,6 +65,9 @@ DATEN = dict(
     n_neg=1000,               # echte Negative (Open-Images-Fotos ohne Verkehrszeichen)
     n_neg_synth=500,          # dazu synthetische Negative als Gegenprobe
     n_echt_train=3600,        # echte Fotos ohne Schild aus Block 5 (coco128 + eigenes Foto)
+    n_eigene_train=1800,      # die selbst gesammelten Negative des Nutzers (70 % der Fotos)
+    n_eigene_neg=400,         # deren gesperrte 30 % als Messlatte
+    eigene_share=0.75,        # davon 75 % eigene Fotos, 25 % coco128 als Streuung
     coco_test_n=12,           # die letzten 12 coco-Fotos bleiben fuer die Messlatte gesperrt
     user_share_train=0.55,    # Anteil des eigenen Fotos, nur die obere Haelfte
     size=320,
@@ -105,7 +108,7 @@ SYNSET_REPO = "FraunhoferIOSB/Synset-Signset-Germany"   # wird gestreamt, nicht 
 # ist damit nicht moeglich - das alte Netz kann die neuen Klassen nicht ausgeben. Erst ein
 # naechster Lauf auf derselben Taxonomie kann diesen Vergleich wieder fuehren.
 ALT_VERGLEICH = False
-ERWARTET = {"train": 36983, "val": 2662, "neg": 1500}   # muss zu DATEN passen (inkl. GTSDB)
+ERWARTET = {"train": 38783, "val": 2662, "neg": 1900}   # muss zu DATEN passen (inkl. GTSDB)
 FEHLER: list[str] = []        # Schritte, die trotz "nicht toedlich" schiefgingen (fuer den Bericht)
 
 
@@ -691,6 +694,33 @@ def gtsdb_bereitstellen(p: Protokoll, roh: Path, ziel: Path) -> dict:
     return {"gefunden": False, "teile": geholt}
 
 
+def eigene_negative(p: Protokoll, roh: Path, anteil_train: float = 0.7) -> tuple:
+    """Die selbst gesammelten Negative des Nutzers in Training und Messlatte teilen.
+
+    Warum das wichtig ist: auf genau diesen Motiven (Anzeigen, Poster, Produktfotos) hatte
+    die Vorfassung ihre Fehlalarme. Sie muessen deshalb ins TRAINING - und ein Teil von
+    ihnen in die Messlatte, sonst hat man fuer diese Bildart gar keine Prufung.
+
+    Getrennt wird nach FOTO, nicht nach Ausschnitt: je Foto entstehen rund 33 Ausschnitte,
+    dieselbe Aufnahme in beiden Toepfen waere Selbstbetrug (PLAN.md).
+    """
+    ordner = roh / "negatives" / "eigene"
+    fotos = sorted(q.name for q in ordner.glob("*.jpg")) if ordner.exists() else []
+    if not fotos:
+        p.zeile(f"[hinweis] keine eigenen Negative in {ordner} - Schritt entfaellt")
+        return [], []
+    grenze = max(1, int(len(fotos) * anteil_train))
+    ziel = WORK / "negatives" / "eigene"
+    ziel.mkdir(parents=True, exist_ok=True)
+    for name in fotos:
+        shutil.copy2(ordner / name, ziel / name)
+    pfad = "negatives/eigene/"
+    train = [pfad + n for n in fotos[:grenze]]
+    mess = [pfad + n for n in fotos[grenze:]]
+    p.zeile(f"[eigene] {len(fotos)} Fotos getrennt: {len(train)} Training, {len(mess)} Messlatte")
+    return train, mess
+
+
 def einrichten(p: Protokoll, roh: Path) -> dict:
     """Arbeitsverzeichnis herrichten: Code bereitstellen, Rohdaten normalisieren.
 
@@ -765,7 +795,8 @@ def einrichten(p: Protokoll, roh: Path) -> dict:
     return {"tools": str(tools), "gtsrb": str(WORK / "gtsrb"), "coco128": coco,
             "foto": str(nutzer / "Nothing.jpg"),
             "alt": alt_bereitstellen(p, roh) if ALT_VERGLEICH else "",
-            "crops": crops, "oi": oi, "gtsdb": gtsdb}
+            "crops": crops, "oi": oi, "gtsdb": gtsdb,
+            "eigene": eigene_negative(p, roh)}
 
 
 
@@ -840,6 +871,26 @@ def datensatz_bauen(p: Protokoll, ein: dict) -> dict:
                               "--out", "data/det", "--split", "val",
                               "--size", str(d["size"]))),
     ]
+
+    # 7. Die selbst gesammelten Negative des Nutzers. Sie sind der unmittelbare Grund fuer
+    #    diesen Block (16 Fehlalarme auf genau solchen Motiven) und brauchen einen EIGENEN
+    #    Aufruf: --train-region oben wuerde sie auf die obere Bildhaelfte beschneiden, und
+    #    das ist nur fuer user/Nothing.jpg gewollt (dort ist die untere Haelfte fuer die
+    #    Messlatte reserviert).
+    eigene_train, eigene_neg = ein.get("eigene", ([], []))
+    if eigene_train:
+        schritte.append(("eigene negative (Training)",
+                         python("tools/real_negatives.py", "--out", "data/det",
+                                "--n", str(d["n_eigene_train"]), "--split", "train",
+                                "--real-train", *eigene_train,
+                                "--coco", "negatives/coco128",
+                                "--coco-test-n", str(d["coco_test_n"]),
+                                "--user-share", str(d["eigene_share"]))))
+    if eigene_neg:
+        schritte.append(("eigene negative (Messlatte)",
+                         python("tools/real_negatives.py", "--out", "data/det",
+                                "--n", str(d["n_eigene_neg"]), "--split", "neg",
+                                "--real-test", *eigene_neg)))
     for was, cmd in schritte:
         dauer[was] = lauf(p, cmd, f"Datensatz: {was}")
     return dauer
